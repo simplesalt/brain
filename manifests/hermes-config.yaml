@@ -1,0 +1,258 @@
+# Hermes config data. This is NOT a manifest: it is the raw config.yaml content
+# rendered into the "hermes-config" ConfigMap by the configMapGenerator in
+# kustomization.yaml (which hash-suffixes the name so any edit here rolls the
+# hermes-agent Deployment and re-seeds /opt/data/config.yaml).
+#
+# Secrets are NOT stored here: they are injected into the Deployment as env vars
+# (secretKeyRef) and may be referenced from this file with ${VAR} syntax.
+# Hermes fills defaults for any keys omitted here.
+
+# Inference: deepseek-v4-flash via OpenRouter. The API key is supplied to the
+# container as the OPENROUTER_API_KEY env var (GENERAL_API_LLM_API_KEY secret).
+model:
+  provider: openrouter
+  default: deepseek/deepseek-v4-flash
+
+# Agent guidance. ${VAR} is substituted from the container env at load time, so
+# the real account id stays in the secret (only the placeholder lives here).
+agent:
+  environment_hint: |-
+    When calling Cloudflare MCP tools that accept an account_id parameter, use
+    account_id "${CLOUDFLARE_ACCOUNT_ID}".
+
+    At the start of every session, call hindsight_recall before giving your
+    first response. Use it to retrieve context about ongoing work, recent
+    decisions, and open tasks. Use hindsight_recall (not gbrain) for personal
+    memory — gbrain is for project knowledge, hindsight is for your own
+    episodic memory across sessions.
+
+  # ── CONTEXT-BLOAT FIX: restrict the tool surface to the approved set ──────
+  # Symptom (upstream issues NousResearch/hermes-agent#10164, #29300, #32235):
+  # the global SKILL index is concatenated into EVERY system prompt, large
+  # monolithic SKILL.md files (e.g. the ~47KB bundled `hermes-agent` skill) get
+  # pulled in via skill_view when only a fraction is needed, and skill_view
+  # output is replayed into transcript history on every turn. Net effect:
+  # wasted context window, higher token cost, and skill misrouting — and the
+  # index even leaks into cron jobs that bound a narrower skill set (#32235).
+  #
+  # Root cause (verified in source, config_version 29): the index is injected
+  # ONLY when a skills tool is live — agent/system_prompt.py gates on
+  #   has_skills_tools = any(t in valid_tool_names
+  #                          for t in ['skills_list','skill_view','skill_manage'])
+  # and emits "" otherwise. So removing the `skills` toolset eliminates the
+  # index injection, the skill_view monolith pulls, AND the per-turn replay in
+  # one move — at the source, for chat AND cron alike.
+  #
+  # Why a denylist and not a budget knob: the proposed budget/dedup/cron-scoping
+  # features are NOT yet user-configurable — PR #10172 (issue #10164) is open and
+  # implements HARDCODED constants (80-char desc truncation, 8KB index cap), and
+  # #29300's skill_view dedup is left as "open questions". config.yaml exposes no
+  # `skills.index_budget`/`max_description`/dedup keys (confirmed in
+  # hermes_cli/config.py), only the `agent.disabled_toolsets` subtraction below.
+  # The effective per-platform allowlist is `platform_toolsets` (set below).
+  # disabled_toolsets is applied as a FINAL subtraction on top of that allowlist.
+  # Both levers are needed: platform_toolsets admits what is approved;
+  # disabled_toolsets removes anything still leaking in from composite toolsets
+  # (e.g. hermes-cli includes skills via the auto coding posture).
+  #
+  # APPROVED TOOLS -> toolsets kept ENABLED (everything not listed is removed):
+  #   web_extract, web_search           -> web
+  #   terminal, process                 -> terminal
+  #   execute_code                      -> code_execution
+  #   clarify                           -> clarify
+  #   cronjob                           -> cronjob
+  #   delegate_task                     -> delegation
+  #   memory (recall/save)              -> memory   (drives the hindsight provider's
+  #                                        agent-facing tools; file backend stays off
+  #                                        via memory.memory_enabled: false below)
+  # (read_terminal is also approved but is HERMES_DESKTOP-gated — it has no
+  #  standalone toolset and is auto-hidden in a headless pod, so it is moot here.)
+  #
+  # SIDE EFFECTS — disabling these leaf toolsets also removes their tools. Notable
+  # losses to re-add (by removing the toolset from this list) if a workflow needs
+  # them: file (read_file/write_file/patch/search_files — the agent must use the
+  # terminal/execute_code for file edits instead), session_search, todo, kanban, and
+  # send_message (the `messaging` tool — final webhook/gateway replies are
+  # unaffected, but the agent can no longer proactively push messages).
+  disabled_toolsets:
+    - skills          # ← the bloat source: removes the global skill index entirely
+    - search          # web_search already provided by the `web` toolset
+    - x_search
+    - vision
+    - video
+    - image_gen
+    - video_gen
+    - computer_use
+    - browser
+    - file
+    - tts
+    - todo
+    # `memory` is intentionally NOT in this list. The inject_memory_provider_tools()
+    # gate checks memory_provider_tools_enabled(agent.enabled_toolsets). The TUI calls
+    # _load_enabled_toolsets() → _get_platform_tools() which subtracts disabled_toolsets
+    # BEFORE returning the list — so if "memory" is here it gets removed from
+    # agent.enabled_toolsets, memory_provider_tools_enabled() returns False, and
+    # hindsight tools (hindsight_recall/retain/reflect) are never injected.
+    # The built-in "memory" tool schema is therefore visible to the model, but
+    # memory_enabled: false (below) means MemoryStore is never initialized — if the
+    # model calls it, memory_tool() returns "Memory is not available." Writes are blocked.
+    - context_engine
+    - session_search
+    - project
+    - homeassistant
+    - kanban
+    - discord
+    - discord_admin
+    - yuanbao
+    - feishu_doc
+    - feishu_drive
+    - spotify
+
+# Per-platform toolset allowlist. This is the primary gate; disabled_toolsets
+# above subtracts from it as a final pass. Seed wins over the live PVC value
+# (list replacement on deep-merge) so this is authoritative. `memory` is
+# included here to admit the hindsight recall/save tools — the prior live value
+# lacked it because it was set before hindsight was approved.
+# NOTE: this must be a TOP-LEVEL key (not nested under agent:) — load_config()
+# reads the top-level platform_toolsets; the one inside agent: is ignored.
+platform_toolsets:
+  cli:
+    - clarify
+    - code_execution
+    - cronjob
+    - delegation
+    - memory
+    - messaging
+    - terminal
+    - web
+
+# Terminal: run shell + coding commands directly in this pod. The default
+# "docker" backend would try to spawn a container (no Docker-in-pod here), so
+# use local. The install-cli-tools init container puts three CLIs on PATH
+# (/opt/data/.local/bin):
+#   - claude (Claude Code) — authenticates via CLAUDE_CODE_OAUTH_TOKEN; ask
+#     Hermes to "use Claude Code" to delegate coding (`claude -p '<task>'`).
+#   - gh (GitHub CLI) — auto-authenticates from GITHUB_TOKEN; used in place of
+#     the (removed) GitHub MCP. Ask Hermes to run `gh ...`.
+#   - gws (Google Workspace CLI) — auth configured separately.
+terminal:
+  backend: local
+  # SECURITY BLOCKLIST BYPASS: execute_code and the local terminal backend strip
+  # "sensitive" env vars from spawned child processes by default (execute_code
+  # drops any var whose NAME contains KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL/
+  # PASSWD/AUTH; the local terminal drops Hermes infra/tool tokens) to stop
+  # LLM-generated code from exfiltrating credentials. The vars are still present
+  # in the gateway process (s6 with-contenv) — they are just removed from the
+  # shell, so CLIs invoked via the terminal can't authenticate. Listing a var
+  # here bypasses the blocklist for terminal + execute_code. Only CLIs run
+  # through the terminal need this; MCP server auth is unaffected (Hermes injects
+  # those tokens into request headers itself, not via the shell).
+  #   GITHUB_TOKEN            -> gh CLI
+  #   CLAUDE_CODE_OAUTH_TOKEN -> claude CLI (bundled Claude Code skill)
+  # Google Workspace credentials are NOT passed through: all Google operations
+  # go via the google-workspace-mcp MCP server, not the terminal.
+  env_passthrough:
+    - GITHUB_TOKEN
+    - CLAUDE_CODE_OAUTH_TOKEN
+    - GBRAIN_REMOTE_TOKEN
+
+# Memory: use the self-hosted, in-cluster hindsight instance. The connection
+# details (HINDSIGHT_MODE / HINDSIGHT_API_URL / HINDSIGHT_API_KEY) are set as
+# env vars on the Deployment; this selects hindsight as the active provider.
+memory:
+  provider: hindsight
+  # memory_enabled: false — the memory tool schema is removed from the model by
+  # having `memory` in disabled_toolsets above, so the model cannot call it at
+  # all. The MemoryStore (file backend) never initializes and MEMORY.md is never
+  # written. memory_enabled has no effect on hindsight_recall/retain/reflect,
+  # which are injected via inject_memory_provider_tools() independently.
+  memory_enabled: false
+  user_profile_enabled: false
+
+# Web search via Firecrawl (FIRECRAWL_API_KEY env on the Deployment).
+web:
+  backend: firecrawl
+
+# Auxiliary (side-task) models: pin to the main provider/model instead of the
+# default "auto" fallback chain, which probes the Nous Portal and spams
+# "no Nous authentication found" warnings when we have no Nous credentials.
+auxiliary:
+  vision:
+    provider: main
+  web_extract:
+    provider: main
+  compression:
+    provider: main
+  session_search:
+    provider: main
+
+# Messaging platforms. The gateway (run as the container's long-lived process,
+# `gateway run`) connects every enabled adapter on startup. Enable the webhook
+# adapter so external systems can drive Hermes over HTTP (HMAC-validated). The
+# port + WEBHOOK_ENABLED are also set as env vars on the Deployment (the env
+# path is the reliable one upstream); a global HMAC secret can be added later
+# via the WEBHOOK_SECRET env var, and per-route secrets/handlers go under
+# extra.routes here. The OpenAI-compatible API server is enabled purely via env
+# vars on the Deployment (API_SERVER_*), as config.yaml support for it does not
+# exist yet.
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      port: 8644
+
+# MCP servers exposed to the agent. The in-cluster Flux Operator MCP
+# (flux-system namespace) speaks streamable HTTP at /mcp on port 9090.
+# NOTE: this instance runs with --read-only=false, so the agent can modify
+# cluster/Flux state through it.
+mcp_servers:
+  flux:
+    enabled: true
+    # No .svc.cluster.local suffix: the cluster domain is k.famevans.win, and
+    # the short form resolves via the pod's resolv.conf search list regardless.
+    url: http://mcp-flux.flux-system:9090/mcp
+    timeout: 180
+    # Allow read + reconciliation-adjacent actions (reconcile, suspend, resume,
+    # delete) but block config injection: apply_kubernetes_resource is the only
+    # Flux MCP tool that can create/update arbitrary resources — including
+    # repointing a GitRepository to another branch or applying manifests not
+    # present in the source branch. Excluded so the agent can unstick deploys
+    # without becoming a config source of its own. (apply_kubernetes_manifest
+    # listed defensively in case of a name diff; excluding a non-existent tool
+    # is a no-op.)
+    tools:
+      exclude:
+        - apply_kubernetes_resource
+        - apply_kubernetes_manifest
+
+  # GitHub MCP removed: the hosted GitHub MCP was problematic, so GitHub access
+  # is provided via the `gh` CLI instead (installed on PATH by the
+  # install-cli-tools init container; gh auto-authenticates from the GITHUB_TOKEN
+  # env var, which it reads natively). Ask Hermes to run `gh ...` through the
+  # local terminal backend.
+  # Google Workspace (Gmail, Calendar, Drive, Docs, etc.) is handled by the
+  # google-workspace-mcp MCP server (see ai.yaml); added below once deployed.
+
+  # gbrain knowledge graph MCP (garrytan/gbrain), backed by the in-cluster
+  # gbrain-pg CNPG PostgreSQL instance. Bearer auth via GBRAIN_REMOTE_TOKEN.
+  gbrain:
+    enabled: true
+    url: http://gbrain:3131/mcp
+    headers:
+      Authorization: "Bearer ${GBRAIN_REMOTE_TOKEN}"
+    timeout: 60
+
+  # Unified outbound messaging: email (Gmail DWD), LinkedIn (Dux Soup), SMS (Quo), invite (cal.diy)
+  hermes-msg:
+    enabled: true
+    url: http://hermes-msg.ssint-main-msg.svc.cluster.local:8080/mcp
+    timeout: 60
+
+  # Cloudflare hosted (remote) MCP. Bearer auth with a Cloudflare API token
+  # (CLOUDFLARE_API_TOKEN secret).
+  cloudflare:
+    enabled: true
+    url: https://mcp.cloudflare.com/mcp
+    headers:
+      Authorization: "Bearer ${CLOUDFLARE_API_TOKEN}"
+    timeout: 180

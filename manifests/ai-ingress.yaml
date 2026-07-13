@@ -1,0 +1,111 @@
+---
+# Strip /webhook prefix so the hermes webhook server sees routes at their
+# configured paths (e.g. /my-handler) rather than /webhook/my-handler.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-webhook
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  stripPrefix:
+    prefixes:
+      - /webhook
+---
+# Rewrite /gbrain-ingestion to /ingest so gbrain sees its expected path.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: gbrain-ingestion-rewrite
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  replacePathRegex:
+    regex: ^/gbrain-ingestion
+    replacement: /ingest
+---
+# Standard Ingress retained so k8s-gateway (resources: Service Ingress) keeps
+# the ai.famevans.win DNS A record alive. Traefik's IngressRoute below takes
+# routing priority for /v1 and /webhook; this handles the catch-all / path
+# (dashboard) and serves as the DNS anchor.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hermes-agent-web
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - ai.famevans.win
+      secretName: ai-tls
+  rules:
+    - host: ai.famevans.win
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: big-agi
+                port:
+                  number: 3000
+---
+# Route ai.famevans.win traffic to three backend services via a single TLS
+# host. The IngressRoute takes routing priority over the standard Ingress above
+# for /v1 and /webhook; the standard Ingress handles / (dashboard) and DNS.
+#   /v1      → api_server (OpenAI-compatible; no path rewrite — /v1/... is correct)
+#   /webhook → webhook    (StripPrefix strips /webhook before forwarding)
+#   /        → dashboard  (catch-all, also covered by the standard Ingress)
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: hermes-agent-web
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`ai.famevans.win`) && PathPrefix(`/v1`)
+      kind: Rule
+      services:
+        - name: hermes-agent-web
+          port: 8642
+    - match: Host(`ai.famevans.win`) && PathPrefix(`/webhook`)
+      kind: Rule
+      middlewares:
+        - name: strip-webhook
+      services:
+        - name: hermes-agent-web
+          port: 8644
+    - match: Host(`ai.famevans.win`) && PathPrefix(`/gbrain-ingestion`)
+      kind: Rule
+      middlewares:
+        - name: gbrain-ingestion-rewrite
+      services:
+        - name: gbrain
+          port: 3131
+    - match: Host(`ai.famevans.win`)
+      kind: Rule
+      services:
+        - name: big-agi
+          port: 3000
+  tls:
+    secretName: ai-tls

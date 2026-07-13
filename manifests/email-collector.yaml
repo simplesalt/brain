@@ -1,0 +1,719 @@
+# Email-to-brain: deterministic Gmail collector for the ssint-main-ai namespace.
+# Architecture: a CronJob (every 30 min) pulls Gmail for the work account via the
+# existing service-account DWD credential and writes structured JSON + a markdown
+# digest to a shared PVC, then deterministically pushes each (non-noise) message into
+# gbrain via the MCP server (put_page). gbrain self-wires entities/links/timeline
+# server-side, so ingestion no longer depends on the Hermes agent loop. The hermes-agent
+# still mounts the PVC read-only for higher-order judgment (triage, replies).
+# A companion Deployment (email-ingestion-health) exposes a k8s readiness probe over the
+# pipeline heartbeat so ingestion health shows up in `kubectl get pods` like every other
+# workload's probe.
+#
+# PREREQUISITE (one-time, manual): In Google Admin Console → Security → API Controls
+# → Domain-wide Delegation, ensure the service account client-ID
+# (hermes-agent-access@internalapps-481018.iam.gserviceaccount.com) is authorized
+# with these scopes:
+#   https://mail.google.com/,
+#   https://www.googleapis.com/auth/drive,
+#   https://www.googleapis.com/auth/documents,
+#   https://www.googleapis.com/auth/spreadsheets,
+#   https://www.googleapis.com/auth/calendar,
+#   https://www.googleapis.com/auth/contacts
+# Without DWD authorization the collector fails 403 on first run; all other k8s
+# resources below are inert until that step is done.
+#
+# Personal Gmail: stubbed (disabled). Full RW on a personal @gmail.com account
+# requires an External OAuth app with restricted scopes (https://mail.google.com/,
+# drive, etc.), which triggers Google's OAuth verification + CASA security audit
+# before production tokens are issued. Add a second account entry here once that
+# OAuth client + refresh token is obtained and stored in hermes-secrets.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: email-collector-data
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: email-collector-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  email-collector.mjs: |
+    #!/usr/bin/env bun
+    // Deterministic Gmail collector — gbrain email-to-brain recipe v0.7.0 (+enrich v0.8.0)
+    // Code handles: auth, dedup, links, noise/sig detection, state, atomic writes, AND
+    //   deterministic ingestion into gbrain (put_page over MCP). gbrain does the
+    //   server-side self-wiring (entities, links, timeline). Hermes may still add
+    //   higher-order judgment (urgency, replies) on top, but ingestion no longer
+    //   depends on the agent loop.
+    // Usage: bun email-collector.mjs collect | digest | enrich | healthcheck | diagnose
+
+    import { createSign } from 'crypto';
+    import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, appendFileSync, readdirSync } from 'fs';
+    import { join } from 'path';
+
+    const DATA_DIR    = process.env.DATA_DIR ?? '/data';
+    const MESSAGES    = join(DATA_DIR, 'messages');
+    const DIGESTS     = join(DATA_DIR, 'digests');
+    const STATE_FILE  = join(DATA_DIR, 'state.json');
+    const WORK_EMAIL  = process.env.WORK_EMAIL ?? 'dylan.evans@simplesalt.company';
+    const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL
+      ?? 'hermes-agent-access@internalapps-481018.iam.gserviceaccount.com';
+
+    // ---------- gbrain ingestion config ----------
+    const INGESTED_FILE = join(DATA_DIR, 'ingested.json');
+    const HEARTBEAT_JSON = join(DATA_DIR, 'heartbeat.json');
+    const HEARTBEAT_LOG  = join(DATA_DIR, 'heartbeat.jsonl');
+    const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain:3131/mcp';
+    const GBRAIN_TOKEN   = process.env.GBRAIN_REMOTE_TOKEN ?? '';
+    const SOURCE_VERSION = '0.8.0';
+    const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 4200);
+
+    // Personal account stub — disabled until OAuth client + refresh token added.
+    // const PERSONAL_EMAIL = process.env.PERSONAL_EMAIL ?? '';
+
+    const GMAIL_SCOPES = [
+      'https://www.googleapis.com/auth/gmail.modify',
+      'https://www.googleapis.com/auth/drive',
+      'https://www.googleapis.com/auth/documents',
+      'https://www.googleapis.com/auth/spreadsheets',
+      'https://www.googleapis.com/auth/calendar.events',
+      'https://www.googleapis.com/auth/calendar.calendars',
+    ];
+
+    // ---------- Google service-account JWT (DWD) ----------
+
+    function b64url(s) { return Buffer.from(s).toString('base64url'); }
+
+    function makeJWT(privKey, kid, subject) {
+      const now = Math.floor(Date.now() / 1000);
+      const hdr = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid }));
+      const pay = b64url(JSON.stringify({
+        iss: CLIENT_EMAIL, sub: subject,
+        scope: GMAIL_SCOPES.join(' '),
+        aud: 'https://oauth2.googleapis.com/token',
+        iat: now, exp: now + 3600,
+      }));
+      const unsigned = `${hdr}.${pay}`;
+      const sig = createSign('RSA-SHA256').update(unsigned).sign(privKey, 'base64url');
+      return `${unsigned}.${sig}`;
+    }
+
+    async function getToken(privKey, kid, subject) {
+      const jwt = makeJWT(privKey, kid, subject);
+      const r = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          assertion: jwt,
+        }),
+      });
+      if (!r.ok) {
+        const body = await r.text();
+        throw new Error(`Token exchange failed ${r.status}: ${body}`);
+      }
+      return (await r.json()).access_token;
+    }
+
+    // ---------- State (atomic writes) ----------
+
+    function loadState() {
+      if (!existsSync(STATE_FILE)) return { knownIds: {}, lastCollect: null };
+      try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')); }
+      catch { return { knownIds: {}, lastCollect: null }; }
+    }
+
+    function saveState(st) {
+      const tmp = `${STATE_FILE}.tmp`;
+      writeFileSync(tmp, JSON.stringify(st, null, 2));
+      renameSync(tmp, STATE_FILE);
+    }
+
+    // ---------- Noise / signature detection (deterministic) ----------
+
+    const NOISE_SENDERS = [
+      'noreply', 'no-reply', 'notifications@', 'calendar-notification',
+      'mailer-daemon', 'postmaster', 'donotreply',
+    ];
+    const SIG_PATTERNS = [
+      /docusign/i, /dropbox sign/i, /hellosign/i, /pandadoc/i,
+      /please sign/i, /signature needed/i, /ready for your signature/i,
+      /everyone has signed/i, /you just signed/i,
+    ];
+
+    const isNoise = from => NOISE_SENDERS.some(p => (from ?? '').toLowerCase().includes(p));
+    const isSig   = (from, subj) => SIG_PATTERNS.some(r => r.test(`${from ?? ''} ${subj ?? ''}`));
+
+    // Gmail deep-link with authuser=email (correct account even if not the default)
+    const gmailLink = (id, email) =>
+      `https://mail.google.com/mail/u/?authuser=${encodeURIComponent(email)}#inbox/${id}`;
+
+    // ---------- Gmail API ----------
+
+    async function gmailList(token, query, max = 100) {
+      const msgs = [];
+      let pageToken = null;
+      do {
+        const p = new URLSearchParams({ q: query, maxResults: String(Math.min(max - msgs.length, 100)) });
+        if (pageToken) p.set('pageToken', pageToken);
+        const r = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages?${p}`,
+          { headers: { Authorization: `Bearer ${token}` } },
+        );
+        if (!r.ok) throw new Error(`gmail.list ${r.status}: ${await r.text()}`);
+        const d = await r.json();
+        msgs.push(...(d.messages ?? []));
+        pageToken = d.nextPageToken ?? null;
+      } while (pageToken && msgs.length < max);
+      return msgs;
+    }
+
+    async function gmailGet(token, id) {
+      const r = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}` +
+        `?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!r.ok) throw new Error(`gmail.get ${id} ${r.status}: ${await r.text()}`);
+      return r.json();
+    }
+
+    const hdr = (msg, name) =>
+      msg.payload?.headers?.find(h => h.name.toLowerCase() === name.toLowerCase())?.value ?? '';
+
+    // ---------- collect ----------
+
+    async function collect() {
+      const keyB64 = process.env.GOOGLE_PRIVATE_KEY_B64;
+      const privKey = keyB64
+        ? Buffer.from(keyB64, 'base64').toString('utf8')
+        : process.env.GOOGLE_PRIVATE_KEY;
+      const kid = process.env.GOOGLE_PRIVATE_KEY_ID ?? '';
+
+      if (!privKey) {
+        console.error('FATAL: GOOGLE_PRIVATE_KEY_B64 (or GOOGLE_PRIVATE_KEY) must be set');
+        process.exit(1);
+      }
+
+      const token = await getToken(privKey, kid, WORK_EMAIL);
+      const state = loadState();
+
+      // Query window: since last collect + 1h buffer; fall back to 25h on first run.
+      const sinceH = state.lastCollect
+        ? Math.ceil((Date.now() - new Date(state.lastCollect).getTime()) / 3_600_000) + 1
+        : 25;
+      const q = `newer_than:${sinceH}h`;
+
+      const [inbox, sent] = await Promise.all([
+        gmailList(token, `in:inbox ${q}`),
+        gmailList(token, `in:sent ${q}`),
+      ]);
+
+      // Sent thread IDs → mark replied-to inbox threads
+      const sentThreads = new Set(sent.map(m => m.threadId));
+      for (const m of sent) state.knownIds[m.id] = { sent: true };
+
+      const today = new Date().toISOString().slice(0, 10);
+      mkdirSync(MESSAGES, { recursive: true });
+      mkdirSync(DIGESTS,  { recursive: true });
+
+      const dayFile = join(MESSAGES, `${today}.json`);
+      const existing = existsSync(dayFile) ? JSON.parse(readFileSync(dayFile, 'utf8')) : [];
+      const seenIds  = new Set(existing.map(m => m.id));
+
+      let added = 0;
+      for (const ref of inbox) {
+        if (state.knownIds[ref.id]) continue;
+        const msg = await gmailGet(token, ref.id);
+        const from = hdr(msg, 'From'), subj = hdr(msg, 'Subject'), date = hdr(msg, 'Date');
+        const rec = {
+          id: ref.id, threadId: ref.threadId,
+          from, subject: subj, date,
+          snippet: (msg.snippet ?? '').slice(0, 200),
+          is_noise: isNoise(from),
+          is_signature: isSig(from, subj),
+          is_replied: sentThreads.has(ref.threadId),
+          gmail_link: gmailLink(ref.id, WORK_EMAIL),
+          account: WORK_EMAIL,
+        };
+        state.knownIds[ref.id] = { collected: today };
+        if (!seenIds.has(ref.id)) { existing.push(rec); seenIds.add(ref.id); added++; }
+        // Small delay to stay well within Gmail API quota (250 units/user/sec)
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      const tmp = `${dayFile}.tmp`;
+      writeFileSync(tmp, JSON.stringify(existing, null, 2));
+      renameSync(tmp, dayFile);
+
+      state.lastCollect = new Date().toISOString();
+      saveState(state);
+      console.log(`collect [${WORK_EMAIL}]: +${added} new (${inbox.length} inbox, ${sent.length} sent checked)`);
+    }
+
+    // ---------- digest ----------
+
+    async function digest() {
+      const today = new Date().toISOString().slice(0, 10);
+      const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+      mkdirSync(DIGESTS, { recursive: true });
+
+      const all = [];
+      for (const d of [today, yesterday]) {
+        const f = join(MESSAGES, `${d}.json`);
+        if (existsSync(f)) all.push(...JSON.parse(readFileSync(f, 'utf8')));
+      }
+
+      // Dedup by message ID across the two-day window
+      const msgs = [...new Map(all.map(m => [m.id, m])).values()];
+
+      const signatures = msgs.filter(m =>  m.is_signature && !m.is_noise);
+      const triage     = msgs.filter(m => !m.is_noise && !m.is_signature);
+      const noise      = msgs.filter(m =>  m.is_noise);
+
+      const fmt = m => [
+        `- **${m.from}** — ${m.subject || '(no subject)'}${m.is_replied ? ' ✓replied' : ''}`,
+        `  *${m.date || ''}*`,
+        `  ${m.snippet ? m.snippet.slice(0, 140) + (m.snippet.length > 140 ? '…' : '') : ''}`,
+        `  [Open in Gmail](${m.gmail_link})`,
+      ].join('\n');
+
+      const lines = [
+        `# Email Digest: ${today}`,
+        ``,
+        `> Account: ${WORK_EMAIL} (work) | Personal: disabled (see email-collector.yaml)`,
+        `> Generated: ${new Date().toISOString()}`,
+        ``,
+        `## Signatures Pending (${signatures.length})`,
+        signatures.length ? signatures.map(fmt).join('\n\n') : '_None_',
+        ``,
+        `## Messages to Triage (${triage.length})`,
+        triage.length ? triage.map(fmt).join('\n\n') : '_None_',
+        ``,
+        `## Noise (${noise.length})`,
+        noise.length ? noise.map(m => `- ${m.from} — ${m.subject}`).join('\n') : '_None_',
+      ];
+
+      const out = join(DIGESTS, `${today}.md`);
+      const tmp = `${out}.tmp`;
+      writeFileSync(tmp, lines.join('\n') + '\n');
+      renameSync(tmp, out);
+      console.log(`digest: ${triage.length} triage, ${signatures.length} sig, ${noise.length} noise → ${out}`);
+    }
+
+    // ---------- enrich: deterministic ingestion into gbrain ----------
+    // Reads every collected message (all day-files, dedup by id), skips noise, and
+    // pushes each not-yet-ingested message into gbrain via the MCP put_page tool.
+    // gbrain self-wires entities/links/timeline server-side. Idempotent: ingested IDs
+    // are tracked in ingested.json so re-runs only push new mail (and the first run
+    // backfills whatever the collector already accumulated). A run NEVER exits non-zero
+    // on a gbrain outage — that would fail the Job and re-pull Gmail. Instead the outage
+    // is recorded in the heartbeat and surfaced by the readiness probe (NotReady).
+
+    function loadIngested() {
+      if (!existsSync(INGESTED_FILE)) return {};
+      try { return JSON.parse(readFileSync(INGESTED_FILE, 'utf8')); }
+      catch { return {}; }
+    }
+
+    function saveIngested(obj) {
+      const tmp = `${INGESTED_FILE}.tmp`;
+      writeFileSync(tmp, JSON.stringify(obj, null, 2));
+      renameSync(tmp, INGESTED_FILE);
+    }
+
+    // Step 6 of the recipe: heartbeat. One overwrite file (for the probe) + an append
+    // log (for history/audit). Atomic write on the point-in-time file.
+    function writeHeartbeat(status, extra = {}) {
+      const rec = { ts: new Date().toISOString(), status, source_version: SOURCE_VERSION, ...extra };
+      const tmp = `${HEARTBEAT_JSON}.tmp`;
+      writeFileSync(tmp, JSON.stringify(rec, null, 2));
+      renameSync(tmp, HEARTBEAT_JSON);
+      try { appendFileSync(HEARTBEAT_LOG, JSON.stringify(rec) + '\n'); } catch { /* best-effort */ }
+    }
+
+    // gbrain serves the MCP Streamable-HTTP transport in STATELESS mode
+    // (serve-http.ts: sessionIdGenerator undefined) — each POST is independent, no
+    // initialize/session handshake needed — BUT it requires the dual Accept header and
+    // replies as an SSE frame ("event: message\ndata: {json}"), not plain JSON. Parse
+    // the frame out; fall back to plain JSON for enableJsonResponse-style servers.
+    function parseMcpResponse(text) {
+      let msg = null;
+      for (const block of text.split('\n\n')) {
+        const data = block.split('\n')
+          .filter(l => l.startsWith('data:'))
+          .map(l => l.slice(5).trim())
+          .join('\n');
+        if (!data) continue;
+        try { const o = JSON.parse(data); if (o.result || o.error) msg = o; } catch { /* keep scanning */ }
+      }
+      if (msg) return msg;
+      try { return JSON.parse(text); } catch { return null; }
+    }
+
+    async function gbrainPutPage(slug, content) {
+      const r = await fetch(GBRAIN_MCP_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          'Authorization': `Bearer ${GBRAIN_TOKEN}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name: 'put_page', arguments: { slug, content } },
+        }),
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0, 160)}`);
+      const msg = parseMcpResponse(text);
+      if (!msg) throw new Error(`unparseable MCP response: ${text.slice(0, 160)}`);
+      if (msg.error) throw new Error(`rpc: ${JSON.stringify(msg.error).slice(0, 160)}`);
+      if (msg.result?.isError) {
+        const t = (msg.result.content ?? []).map(c => c.text ?? '').join(' ');
+        throw new Error(`tool: ${t.slice(0, 160)}`);
+      }
+      return msg.result;
+    }
+
+    // Provenance/source attribution baked in code (the recipe stresses: links + metadata
+    // are always code-generated, never LLM-generated). Remote put_page server-stamps its
+    // own source_kind, so we carry ours in the frontmatter for the audit trail.
+    function emailToMarkdown(m) {
+      const subj = m.subject || '(no subject)';
+      const q = s => String(s ?? '').replace(/"/g, "'");
+      return [
+        '---',
+        `title: "${q(subj).slice(0, 120)}"`,
+        'type: email',
+        'source: gmail',
+        `account: "${q(m.account)}"`,
+        `from: "${q(m.from)}"`,
+        `date: "${q(m.date)}"`,
+        `message_id: "${m.id}"`,
+        `thread_id: "${m.threadId ?? ''}"`,
+        `url: "${m.gmail_link}"`,
+        `is_signature: ${!!m.is_signature}`,
+        `replied: ${!!m.is_replied}`,
+        'tags: [email, inbox]',
+        '---',
+        '',
+        `# ${subj}`,
+        '',
+        `**From:** ${m.from}`,
+        `**Date:** ${m.date}`,
+        `**Account:** ${m.account}`,
+        '',
+        m.snippet || '',
+        '',
+        `[Open in Gmail](${m.gmail_link})`,
+        '',
+      ].join('\n');
+    }
+
+    async function enrich() {
+      try {
+        if (!GBRAIN_TOKEN) {
+          writeHeartbeat('error', { error: 'GBRAIN_REMOTE_TOKEN not set', pushed_this_run: 0 });
+          console.error('enrich: GBRAIN_REMOTE_TOKEN not set — recorded in heartbeat, health will report NotReady');
+          return;
+        }
+        mkdirSync(MESSAGES, { recursive: true });
+        const files = existsSync(MESSAGES) ? readdirSync(MESSAGES).filter(f => f.endsWith('.json')) : [];
+        const all = [];
+        for (const f of files) {
+          try { all.push(...JSON.parse(readFileSync(join(MESSAGES, f), 'utf8'))); } catch { /* skip bad file */ }
+        }
+        const byId = new Map(all.filter(m => m && m.id).map(m => [m.id, m]));
+        const ingested = loadIngested();
+        const pending = [...byId.values()].filter(m => !m.is_noise && !ingested[m.id]);
+
+        let pushed = 0; const errors = [];
+        for (const m of pending) {
+          try {
+            await gbrainPutPage(`email/${m.id}`, emailToMarkdown(m));
+            ingested[m.id] = { at: new Date().toISOString() };
+            pushed++;
+            saveIngested(ingested); // persist incrementally so a mid-run crash never re-pushes
+          } catch (e) {
+            errors.push(`${m.id}: ${e.message}`);
+            // If the very first calls all fail, gbrain is likely down/misconfigured —
+            // stop early rather than grinding through the whole backlog against a dead endpoint.
+            if (pushed === 0 && errors.length >= 3) break;
+          }
+          await new Promise(r => setTimeout(r, 1100)); // < 55/min, under gbrain's 60/min token limit
+        }
+
+        const total = Object.keys(ingested).length;
+        const status = errors.length ? 'error' : 'ok';
+        writeHeartbeat(status, {
+          pushed_this_run: pushed,
+          ingested_total: total,
+          pending_remaining: pending.length - pushed,
+          errors: errors.slice(0, 5),
+        });
+        console.log(`enrich: pushed ${pushed}/${pending.length} new → gbrain (total ${total})${errors.length ? `, ${errors.length} error(s)` : ''}`);
+      } catch (e) {
+        writeHeartbeat('error', { error: e.message, pushed_this_run: 0 });
+        console.error(`enrich: unexpected failure recorded in heartbeat: ${e.message}`);
+      }
+      // Always exit 0: ingestion health lives in the heartbeat/probe, not the Job status.
+    }
+
+    // ---------- healthcheck: k8s readiness probe target ----------
+    // Exit 0 = ingestion healthy (fresh heartbeat + last run ok). Exit 1 = NotReady.
+    function healthcheck() {
+      if (!existsSync(HEARTBEAT_JSON)) {
+        console.error('UNHEALTHY: no heartbeat yet (pipeline has not completed a run)');
+        process.exit(1);
+      }
+      let hb;
+      try { hb = JSON.parse(readFileSync(HEARTBEAT_JSON, 'utf8')); }
+      catch (e) { console.error(`UNHEALTHY: heartbeat unreadable: ${e.message}`); process.exit(1); }
+      const ageSec = (Date.now() - new Date(hb.ts).getTime()) / 1000;
+      if (!Number.isFinite(ageSec) || ageSec > HEARTBEAT_MAX_AGE_SEC) {
+        console.error(`UNHEALTHY: heartbeat stale (${Math.round(ageSec)}s > ${HEARTBEAT_MAX_AGE_SEC}s max)`);
+        process.exit(1);
+      }
+      if (hb.status !== 'ok') {
+        console.error(`UNHEALTHY: last run status=${hb.status} — ${(hb.errors ?? []).join('; ') || hb.error || 'see heartbeat'}`);
+        process.exit(1);
+      }
+      console.log(`OK: status=ok ingested_total=${hb.ingested_total ?? '?'} age=${Math.round(ageSec)}s`);
+    }
+
+    // ---------- diagnose ----------
+    // Tests SA-only auth first (no sub/DWD), then DWD impersonation.
+    // Differentiates: bad credentials vs DWD not enabled in GCP Console.
+
+    async function diagnose() {
+      const keyB64 = process.env.GOOGLE_PRIVATE_KEY_B64;
+      const privKey = keyB64
+        ? Buffer.from(keyB64, 'base64').toString('utf8')
+        : process.env.GOOGLE_PRIVATE_KEY;
+      const kid = process.env.GOOGLE_PRIVATE_KEY_ID ?? '';
+
+      if (!privKey) {
+        console.error('FATAL: GOOGLE_PRIVATE_KEY_B64 not set'); process.exit(1);
+      }
+      console.log(`SA client email: ${CLIENT_EMAIL}`);
+      console.log(`Private key ID:  ${kid}`);
+      console.log(`Impersonate:     ${WORK_EMAIL}`);
+      console.log('');
+
+      // Test 1: SA-only token (no sub, no DWD) — use cloud-platform scope which a SA can
+      // self-request. Validates that the private key and client_email are correct.
+      console.log('Test 1: SA-only token (no DWD impersonation, scope=cloud-platform)...');
+      try {
+        const now = Math.floor(Date.now() / 1000);
+        const hdr = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid }));
+        const pay = b64url(JSON.stringify({
+          iss: CLIENT_EMAIL,
+          scope: 'https://www.googleapis.com/auth/cloud-platform',
+          aud: 'https://oauth2.googleapis.com/token',
+          iat: now, exp: now + 3600,
+        }));
+        const unsigned = `${hdr}.${pay}`;
+        const sig = createSign('RSA-SHA256').update(unsigned).sign(privKey, 'base64url');
+        const jwt = `${unsigned}.${sig}`;
+        const r = await fetch('https://oauth2.googleapis.com/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: jwt }),
+        });
+        const body = await r.json();
+        if (r.ok) console.log('  PASS: SA credentials valid, got access token');
+        else      console.log(`  FAIL ${r.status}: ${JSON.stringify(body)}`);
+      } catch(e) { console.log(`  ERROR: ${e.message}`); }
+
+      // Test 2: DWD token (with sub = work email, gmail.modify scope)
+      console.log('Test 2: DWD token (sub=work email, scope=gmail.modify)...');
+      try {
+        const token = await getToken(privKey, kid, WORK_EMAIL);
+        console.log('  PASS: DWD token exchange succeeded');
+      } catch(e) { console.log(`  FAIL: ${e.message}`); }
+    }
+
+    // ---------- main ----------
+
+    const cmd = process.argv[2];
+    if      (cmd === 'collect')     await collect();
+    else if (cmd === 'digest')      await digest();
+    else if (cmd === 'enrich')      await enrich();
+    else if (cmd === 'healthcheck') healthcheck();
+    else if (cmd === 'diagnose')    await diagnose();
+    else { console.error('Usage: email-collector.mjs collect|digest|enrich|healthcheck|diagnose'); process.exit(1); }
+---
+# CronJob runs the deterministic collector every 30 minutes.
+# concurrencyPolicy: Forbid ensures no overlapping runs (safe for state.json and atomic digest writes).
+# The pod uses the same SA credentials already in hermes-secrets (GOOGLE_PRIVATE_KEY_B64 +
+# GOOGLE_PRIVATE_KEY_ID), so no new Secrets are required.
+#
+# If hermes-secrets does not yet have GOOGLE_PRIVATE_KEY_B64 populated (i.e. the Google
+# service account hasn't been configured), the Job will fail with a clear error message
+# and back off. It will not crashloop the Hermes pod.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: email-collector
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  # Every minute for near-realtime ingestion; concurrencyPolicy: Forbid keeps
+  # runs from overlapping if one exceeds a minute.
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: email-collector
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: collector
+              image: oven/bun:1-alpine
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  bun /scripts/email-collector.mjs collect \
+                    && bun /scripts/email-collector.mjs digest \
+                    && bun /scripts/email-collector.mjs enrich
+              env:
+                - name: DATA_DIR
+                  value: /data
+                - name: WORK_EMAIL
+                  value: dylan.evans@simplesalt.company
+                # gbrain MCP endpoint + bearer for the enrich step. The token is an inline
+                # literal (matches the gbrain + hermes Deployments); the only security
+                # boundary is the in-cluster network, and the sent bearer and the
+                # DB-hashed value both derive from this same literal.
+                - name: GBRAIN_MCP_URL
+                  value: http://gbrain:3131/mcp
+                - name: GBRAIN_REMOTE_TOKEN
+                  value: "gbrain-mcp"
+                # Service-account identity (not secret — it's a public identifier).
+                - name: GOOGLE_CLIENT_EMAIL
+                  value: hermes-agent-access@internalapps-481018.iam.gserviceaccount.com
+                # Private key from hermes-secrets (same keys the seed-google-token init uses).
+                # optional: true → pod still schedules when keys are absent; script exits 1 with
+                # a clear FATAL message so the Job history shows why it failed.
+                - name: GOOGLE_PRIVATE_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: hermes-secrets
+                      key: GOOGLE_PRIVATE_KEY_ID
+                      optional: true
+                - name: GOOGLE_PRIVATE_KEY_B64
+                  valueFrom:
+                    secretKeyRef:
+                      name: hermes-secrets
+                      key: GOOGLE_PRIVATE_KEY_B64
+                      optional: true
+              volumeMounts:
+                - name: email-data
+                  mountPath: /data
+                - name: collector-script
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: email-data
+              persistentVolumeClaim:
+                claimName: email-collector-data
+            - name: collector-script
+              configMap:
+                name: email-collector-script
+---
+# K8s-native ingestion healthcheck. A minimal always-on pod that mounts the shared
+# PVC read-only and runs the collector script's `healthcheck` mode as a readinessProbe.
+# The probe passes only when the pipeline heartbeat is fresh (updated within
+# HEARTBEAT_MAX_AGE_SEC — 70 min = ~2 missed 30-min cycles) AND the last enrich run
+# reported status=ok. Result: `kubectl get pods` shows this pod 1/1 Ready when Gmail→gbrain
+# ingestion is healthy and 0/1 NotReady when it stalls — the same probe-based signal every
+# other Deployment in the cluster uses. No liveness probe: restarting this pod can't fix a
+# stalled pipeline, so ingestion failure must not churn it; readiness carries the signal.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: email-ingestion-health
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  replicas: 1
+  # Recreate: the RWO PVC is fine to co-mount on this single node, but avoid keeping two
+  # health pods around across rollouts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: email-ingestion-health
+  template:
+    metadata:
+      labels:
+        app: email-ingestion-health
+    spec:
+      containers:
+        - name: health
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: HEARTBEAT_MAX_AGE_SEC
+              value: "4200"
+          readinessProbe:
+            exec:
+              command: ["bun", "/scripts/email-collector.mjs", "healthcheck"]
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 15
+            successThreshold: 1
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: email-data
+              mountPath: /data
+              readOnly: true
+            - name: collector-script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: email-data
+          persistentVolumeClaim:
+            claimName: email-collector-data
+        - name: collector-script
+          configMap:
+            name: email-collector-script

@@ -1,0 +1,609 @@
+# Calendar-to-brain: deterministic Google Calendar collector for ssint-main-ai.
+# Sibling of email-collector.yaml — same design (deterministic code for data, gbrain for
+# self-wiring) and the SAME service-account DWD credential (hermes-secrets:
+# GOOGLE_PRIVATE_KEY_B64 + GOOGLE_PRIVATE_KEY_ID, impersonating WORK_EMAIL). The Gmail
+# collector's token request already includes calendar.events + calendar.calendars scopes
+# and succeeds, so those scopes are proven DWD-authorized — no new Google Admin step.
+#
+# Pipeline (CronJob, every 6h): `sync` pulls a rolling window of events (default 90 days
+# back, 180 forward) for the primary calendar, writes structured per-day JSON + daily
+# markdown files to a PVC, then `enrich` pushes each event into gbrain via the MCP
+# put_page tool (SSE Streamable-HTTP transport). gbrain stores/searches the pages; entity
+# self-wiring is server-side-local-only (remote put_page reports auto_links: skipped), so
+# this populates searchable pages but not the graph — same tradeoff as email ingestion.
+#
+# A companion Deployment (calendar-ingestion-health) runs the script's `healthcheck` mode
+# as a k8s readinessProbe over the pipeline heartbeat, so ingestion health shows up in
+# `kubectl get pods` like every other workload.
+#
+# NOT implemented (documented simplifications vs the upstream calendar-to-brain v0.7.0
+# recipe): multi-year historical backfill (bounded to the rolling window — widen via
+# CAL_DAYS_BACK), multiple calendar accounts (primary only), and manual-note merge in
+# daily files (files are generated-only and overwritten each run).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: calendar-collector-data
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: calendar-collector-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  calendar-collector.mjs: |
+    #!/usr/bin/env bun
+    // Deterministic Google Calendar collector — gbrain calendar-to-brain (recipe v0.7.0),
+    // ingest variant v0.1.0. Code handles: auth, pagination, attendee filtering, daily
+    // files, state, atomic writes, AND deterministic ingestion into gbrain (put_page over
+    // MCP). gbrain does server-side self-wiring. Mirrors email-collector.mjs.
+    // Usage: bun calendar-collector.mjs sync | enrich | healthcheck | diagnose
+
+    import { createSign, createHash } from 'crypto';
+    import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, appendFileSync, readdirSync } from 'fs';
+    import { join } from 'path';
+
+    const DATA_DIR     = process.env.DATA_DIR ?? '/data';
+    const EVENTS       = join(DATA_DIR, 'events');   // structured per-day JSON (for enrich)
+    const DAILY        = join(DATA_DIR, 'daily');     // human/agent-readable markdown
+    const RAW          = join(DATA_DIR, '.raw');
+    const STATE_FILE   = join(DATA_DIR, 'state.json');
+    const WORK_EMAIL   = process.env.WORK_EMAIL ?? 'dylan.evans@simplesalt.company';
+    const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL
+      ?? 'hermes-agent-access@internalapps-481018.iam.gserviceaccount.com';
+    const CALENDAR_ID  = process.env.CALENDAR_ID ?? 'primary';
+    const DAYS_BACK    = Number(process.env.CAL_DAYS_BACK ?? 90);
+    const DAYS_FWD     = Number(process.env.CAL_DAYS_FWD ?? 180);
+
+    // Proven-authorized DWD scopes (identical calendar scopes the Gmail collector already
+    // exchanges successfully). events.list is satisfied by calendar.events.
+    const CAL_SCOPES = [
+      'https://www.googleapis.com/auth/calendar.events',
+      'https://www.googleapis.com/auth/calendar.calendars',
+    ];
+
+    // ---------- gbrain ingestion config ----------
+    const INGESTED_FILE = join(DATA_DIR, 'ingested.json');
+    const HEARTBEAT_JSON = join(DATA_DIR, 'heartbeat.json');
+    const HEARTBEAT_LOG  = join(DATA_DIR, 'heartbeat.jsonl');
+    const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain:3131/mcp';
+    const GBRAIN_TOKEN   = process.env.GBRAIN_REMOTE_TOKEN ?? '';
+    const SOURCE_VERSION = 'cal-0.1.0';
+    const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 50400); // ~14h (>2 six-hour cycles)
+
+    // ---------- Google service-account JWT (DWD) ----------
+
+    function b64url(s) { return Buffer.from(s).toString('base64url'); }
+
+    function makeJWT(privKey, kid, subject) {
+      const now = Math.floor(Date.now() / 1000);
+      const hdr = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid }));
+      const pay = b64url(JSON.stringify({
+        iss: CLIENT_EMAIL, sub: subject,
+        scope: CAL_SCOPES.join(' '),
+        aud: 'https://oauth2.googleapis.com/token',
+        iat: now, exp: now + 3600,
+      }));
+      const unsigned = `${hdr}.${pay}`;
+      const sig = createSign('RSA-SHA256').update(unsigned).sign(privKey, 'base64url');
+      return `${unsigned}.${sig}`;
+    }
+
+    async function getToken(privKey, kid, subject) {
+      const jwt = makeJWT(privKey, kid, subject);
+      const r = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          assertion: jwt,
+        }),
+      });
+      if (!r.ok) throw new Error(`Token exchange failed ${r.status}: ${await r.text()}`);
+      return (await r.json()).access_token;
+    }
+
+    function loadPrivKey() {
+      const keyB64 = process.env.GOOGLE_PRIVATE_KEY_B64;
+      const privKey = keyB64
+        ? Buffer.from(keyB64, 'base64').toString('utf8')
+        : process.env.GOOGLE_PRIVATE_KEY;
+      if (!privKey) {
+        console.error('FATAL: GOOGLE_PRIVATE_KEY_B64 (or GOOGLE_PRIVATE_KEY) must be set');
+        process.exit(1);
+      }
+      return { privKey, kid: process.env.GOOGLE_PRIVATE_KEY_ID ?? '' };
+    }
+
+    // ---------- State (atomic writes) ----------
+
+    function loadState() {
+      if (!existsSync(STATE_FILE)) return { lastSync: null };
+      try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')); }
+      catch { return { lastSync: null }; }
+    }
+    function saveJson(path, obj) {
+      const tmp = `${path}.tmp`;
+      writeFileSync(tmp, JSON.stringify(obj, null, 2));
+      renameSync(tmp, path);
+    }
+
+    // ---------- Calendar API ----------
+
+    async function calList(token, calId, timeMin, timeMax) {
+      const events = [];
+      let pageToken = null;
+      do {
+        const p = new URLSearchParams({
+          timeMin, timeMax, singleEvents: 'true', orderBy: 'startTime',
+          maxResults: '250', showDeleted: 'false',
+        });
+        if (pageToken) p.set('pageToken', pageToken);
+        const r = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events?${p}`,
+          { headers: { Authorization: `Bearer ${token}` } },
+        );
+        if (!r.ok) throw new Error(`calendar.list ${r.status}: ${await r.text()}`);
+        const d = await r.json();
+        events.push(...(d.items ?? []));
+        pageToken = d.nextPageToken ?? null;
+      } while (pageToken);
+      return events;
+    }
+
+    // Real attendees only (drop conference rooms + mailing lists), names not emails.
+    function attendeeNames(ev) {
+      return (ev.attendees ?? [])
+        .filter(a => !a.resource
+          && a.email
+          && !a.email.includes('@resource.calendar.google.com')
+          && !a.email.includes('@group.calendar.google.com'))
+        .map(a => a.displayName || a.email.split('@')[0])
+        .filter(Boolean);
+    }
+
+    const isAllDay = ev => !ev.start?.dateTime && !!ev.start?.date;
+    const eventDate = ev => (ev.start?.dateTime || ev.start?.date || '').slice(0, 10);
+    const eventTime = ev => (ev.start?.dateTime ? ev.start.dateTime.slice(11, 16) : 'all-day');
+    const endTime   = ev => (ev.end?.dateTime ? ev.end.dateTime.slice(11, 16) : '');
+    const WEEKDAYS  = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const stripHtml = s => String(s ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+    function toRecord(ev) {
+      return {
+        id: ev.id,
+        status: ev.status,
+        summary: ev.summary || '(no title)',
+        start: ev.start?.dateTime || ev.start?.date || '',
+        end: ev.end?.dateTime || ev.end?.date || '',
+        all_day: isAllDay(ev),
+        location: ev.location || '',
+        description: stripHtml(ev.description).slice(0, 600),
+        attendees: attendeeNames(ev),
+        organizer: ev.organizer?.displayName || ev.organizer?.email || '',
+        calendar: WORK_EMAIL,
+        html_link: ev.htmlLink || '',
+        updated: ev.updated || '',
+        date: eventDate(ev),
+      };
+    }
+
+    // ---------- sync ----------
+
+    async function sync() {
+      const { privKey, kid } = loadPrivKey();
+      const token = await getToken(privKey, kid, WORK_EMAIL);
+
+      const now = Date.now();
+      const timeMin = new Date(now - DAYS_BACK * 86_400_000).toISOString();
+      const timeMax = new Date(now + DAYS_FWD * 86_400_000).toISOString();
+
+      const raw = await calList(token, CALENDAR_ID, timeMin, timeMax);
+      const events = raw
+        .filter(ev => ev.status !== 'cancelled' && (ev.start?.dateTime || ev.start?.date))
+        .map(toRecord);
+
+      mkdirSync(EVENTS, { recursive: true });
+      mkdirSync(DAILY, { recursive: true });
+      mkdirSync(RAW, { recursive: true });
+
+      // Raw snapshot for provenance.
+      saveJson(join(RAW, 'events-latest.json'), raw);
+
+      // Group by day → structured per-day JSON (enrich source) + daily markdown.
+      const byDay = new Map();
+      for (const e of events) {
+        if (!e.date) continue;
+        if (!byDay.has(e.date)) byDay.set(e.date, []);
+        byDay.get(e.date).push(e);
+      }
+
+      for (const [date, evs] of byDay) {
+        // All-day first, then timed sorted by start time.
+        evs.sort((a, b) => (a.all_day === b.all_day ? String(a.start).localeCompare(String(b.start)) : (a.all_day ? -1 : 1)));
+        saveJson(join(EVENTS, `${date}.json`), evs);
+
+        const year = date.slice(0, 4);
+        mkdirSync(join(DAILY, year), { recursive: true });
+        const dow = WEEKDAYS[new Date(`${date}T00:00:00Z`).getUTCDay()];
+        const lines = [`# ${date} (${dow})`, ''];
+        for (const e of evs) {
+          const when = e.all_day ? 'all-day' : `${eventTimeFromRec(e)}${e.end ? '-' + endTimeFromRec(e) : ''}`;
+          const loc = e.location ? ` 📍 ${e.location}` : '';
+          const who = e.attendees.length ? ` — with ${e.attendees.join(', ')}` : '';
+          lines.push(`- ${when} **${e.summary}**${loc}${who}`);
+        }
+        lines.push('');
+        const out = join(DAILY, year, `${date}.md`);
+        const tmp = `${out}.tmp`;
+        writeFileSync(tmp, lines.join('\n'));
+        renameSync(tmp, out);
+      }
+
+      saveJson(STATE_FILE, { lastSync: new Date().toISOString(), window: { timeMin, timeMax }, events: events.length, days: byDay.size });
+      console.log(`sync [${CALENDAR_ID}]: ${events.length} events across ${byDay.size} days (${timeMin.slice(0,10)}..${timeMax.slice(0,10)})`);
+    }
+
+    // Time helpers operating on stored records (start/end are ISO or date strings).
+    const eventTimeFromRec = e => (e.all_day ? 'all-day' : String(e.start).slice(11, 16));
+    const endTimeFromRec   = e => (String(e.end).includes('T') ? String(e.end).slice(11, 16) : '');
+
+    // ---------- gbrain ingestion (shared with email-collector pattern) ----------
+
+    function loadIngested() {
+      if (!existsSync(INGESTED_FILE)) return {};
+      try { return JSON.parse(readFileSync(INGESTED_FILE, 'utf8')); }
+      catch { return {}; }
+    }
+    function saveIngested(obj) { saveJson(INGESTED_FILE, obj); }
+
+    function writeHeartbeat(status, extra = {}) {
+      const rec = { ts: new Date().toISOString(), status, source_version: SOURCE_VERSION, ...extra };
+      saveJson(HEARTBEAT_JSON, rec);
+      try { appendFileSync(HEARTBEAT_LOG, JSON.stringify(rec) + '\n'); } catch { /* best-effort */ }
+    }
+
+    // gbrain MCP Streamable-HTTP transport (stateless): dual Accept header required,
+    // reply is an SSE frame (event: message\ndata: {json}); plain-JSON fallback kept.
+    function parseMcpResponse(text) {
+      let msg = null;
+      for (const block of text.split('\n\n')) {
+        const data = block.split('\n')
+          .filter(l => l.startsWith('data:'))
+          .map(l => l.slice(5).trim())
+          .join('\n');
+        if (!data) continue;
+        try { const o = JSON.parse(data); if (o.result || o.error) msg = o; } catch { /* keep scanning */ }
+      }
+      if (msg) return msg;
+      try { return JSON.parse(text); } catch { return null; }
+    }
+
+    async function gbrainPutPage(slug, content) {
+      const r = await fetch(GBRAIN_MCP_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          'Authorization': `Bearer ${GBRAIN_TOKEN}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name: 'put_page', arguments: { slug, content } },
+        }),
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0, 160)}`);
+      const msg = parseMcpResponse(text);
+      if (!msg) throw new Error(`unparseable MCP response: ${text.slice(0, 160)}`);
+      if (msg.error) throw new Error(`rpc: ${JSON.stringify(msg.error).slice(0, 160)}`);
+      if (msg.result?.isError) {
+        const t = (msg.result.content ?? []).map(c => c.text ?? '').join(' ');
+        throw new Error(`tool: ${t.slice(0, 160)}`);
+      }
+      return msg.result;
+    }
+
+    function eventToMarkdown(e) {
+      const q = s => String(s ?? '').replace(/"/g, "'");
+      const when = e.all_day ? `${e.date} (all-day)` : `${e.date} ${eventTimeFromRec(e)}${e.end ? '–' + endTimeFromRec(e) : ''}`;
+      return [
+        '---',
+        `title: "${q(e.summary).slice(0, 120)}"`,
+        'type: calendar_event',
+        'source: google_calendar',
+        `calendar: "${q(e.calendar)}"`,
+        `event_id: "${e.id}"`,
+        `start: "${q(e.start)}"`,
+        `end: "${q(e.end)}"`,
+        `all_day: ${!!e.all_day}`,
+        `location: "${q(e.location)}"`,
+        `organizer: "${q(e.organizer)}"`,
+        `attendees: [${e.attendees.map(a => `"${q(a)}"`).join(', ')}]`,
+        `url: "${e.html_link}"`,
+        'tags: [calendar, meeting]',
+        '---',
+        '',
+        `# ${e.summary}`,
+        '',
+        `**When:** ${when}`,
+        e.location ? `**Location:** ${e.location}` : '',
+        `**Calendar:** ${e.calendar}`,
+        e.attendees.length ? `**Attendees:** ${e.attendees.join(', ')}` : '',
+        '',
+        e.description || '',
+        '',
+        e.html_link ? `[Open in Google Calendar](${e.html_link})` : '',
+        '',
+      ].filter(l => l !== '').join('\n');
+    }
+
+    const contentHash = s => createHash('sha256').update(s).digest('hex').slice(0, 16);
+
+    // gbrain lowercases the stored page slug but its tag-reconciliation step looks the
+    // page up with the ORIGINAL-case slug → "addTag failed: page not found" for any slug
+    // with uppercase. Calendar recurring-instance IDs carry an uppercase `_YYYYMMDDTHHMMSSZ`
+    // suffix (from singleEvents expansion), so pre-normalize to lowercase + safe charset.
+    const eventSlug = id => `calendar/${String(id).toLowerCase().replace(/[^a-z0-9_.-]/g, '-')}`;
+
+    async function enrich() {
+      try {
+        if (!GBRAIN_TOKEN) {
+          writeHeartbeat('error', { error: 'GBRAIN_REMOTE_TOKEN not set', pushed_this_run: 0 });
+          console.error('enrich: GBRAIN_REMOTE_TOKEN not set — recorded in heartbeat, health will report NotReady');
+          return;
+        }
+        mkdirSync(EVENTS, { recursive: true });
+        const files = existsSync(EVENTS) ? readdirSync(EVENTS).filter(f => f.endsWith('.json')) : [];
+        const all = [];
+        for (const f of files) {
+          try { all.push(...JSON.parse(readFileSync(join(EVENTS, f), 'utf8'))); } catch { /* skip bad file */ }
+        }
+        const byId = new Map(all.filter(e => e && e.id).map(e => [e.id, e]));
+        const ingested = loadIngested();
+
+        // Push new OR changed events (hash of the rendered page detects edits/reschedules).
+        const work = [];
+        for (const e of byId.values()) {
+          const md = eventToMarkdown(e);
+          const h = contentHash(md);
+          if (ingested[e.id]?.hash !== h) work.push({ e, md, h });
+        }
+
+        let pushed = 0; const errors = [];
+        for (const { e, md, h } of work) {
+          try {
+            await gbrainPutPage(eventSlug(e.id), md);
+            ingested[e.id] = { hash: h, at: new Date().toISOString() };
+            pushed++;
+            saveIngested(ingested);
+          } catch (err) {
+            errors.push(`${e.id}: ${err.message}`);
+            if (pushed === 0 && errors.length >= 3) break; // gbrain likely down — stop early
+          }
+          await new Promise(r => setTimeout(r, 1100)); // < 55/min, under gbrain's 60/min token limit
+        }
+
+        const total = Object.keys(ingested).length;
+        const status = errors.length ? 'error' : 'ok';
+        writeHeartbeat(status, {
+          pushed_this_run: pushed,
+          changed_pending: work.length,
+          ingested_total: total,
+          errors: errors.slice(0, 5),
+        });
+        console.log(`enrich: pushed ${pushed}/${work.length} new-or-changed → gbrain (total ${total})${errors.length ? `, ${errors.length} error(s)` : ''}`);
+      } catch (e) {
+        writeHeartbeat('error', { error: e.message, pushed_this_run: 0 });
+        console.error(`enrich: unexpected failure recorded in heartbeat: ${e.message}`);
+      }
+      // Always exit 0: ingestion health lives in the heartbeat/probe, not the Job status.
+    }
+
+    // ---------- healthcheck: k8s readiness probe target ----------
+    function healthcheck() {
+      if (!existsSync(HEARTBEAT_JSON)) {
+        console.error('UNHEALTHY: no heartbeat yet (pipeline has not completed a run)');
+        process.exit(1);
+      }
+      let hb;
+      try { hb = JSON.parse(readFileSync(HEARTBEAT_JSON, 'utf8')); }
+      catch (e) { console.error(`UNHEALTHY: heartbeat unreadable: ${e.message}`); process.exit(1); }
+      const ageSec = (Date.now() - new Date(hb.ts).getTime()) / 1000;
+      if (!Number.isFinite(ageSec) || ageSec > HEARTBEAT_MAX_AGE_SEC) {
+        console.error(`UNHEALTHY: heartbeat stale (${Math.round(ageSec)}s > ${HEARTBEAT_MAX_AGE_SEC}s max)`);
+        process.exit(1);
+      }
+      if (hb.status !== 'ok') {
+        console.error(`UNHEALTHY: last run status=${hb.status} — ${(hb.errors ?? []).join('; ') || hb.error || 'see heartbeat'}`);
+        process.exit(1);
+      }
+      console.log(`OK: status=ok ingested_total=${hb.ingested_total ?? '?'} age=${Math.round(ageSec)}s`);
+    }
+
+    // ---------- diagnose ----------
+
+    async function diagnose() {
+      const { privKey, kid } = loadPrivKey();
+      console.log(`SA client email: ${CLIENT_EMAIL}`);
+      console.log(`Impersonate:     ${WORK_EMAIL}`);
+      console.log(`Calendar:        ${CALENDAR_ID}`);
+      try {
+        const token = await getToken(privKey, kid, WORK_EMAIL);
+        console.log('PASS: DWD token exchange (calendar scopes) succeeded');
+        const now = Date.now();
+        const evs = await calList(token, CALENDAR_ID,
+          new Date(now - 7 * 86_400_000).toISOString(), new Date(now + 7 * 86_400_000).toISOString());
+        console.log(`PASS: events.list returned ${evs.length} events in ±7d window`);
+      } catch (e) { console.log(`FAIL: ${e.message}`); }
+    }
+
+    // ---------- main ----------
+
+    const cmd = process.argv[2];
+    if      (cmd === 'sync')        await sync();
+    else if (cmd === 'enrich')      await enrich();
+    else if (cmd === 'healthcheck') healthcheck();
+    else if (cmd === 'diagnose')    await diagnose();
+    else { console.error('Usage: calendar-collector.mjs sync|enrich|healthcheck|diagnose'); process.exit(1); }
+---
+# CronJob: sync + enrich every 6 hours. Forbid overlap (safe for state + atomic writes).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: calendar-collector
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  # Every 15 min: calendar changes slowly, so this avoids hammering the Google
+  # Calendar API for little gain. (Email + other channels stay every-minute for
+  # near-realtime digestion.) concurrencyPolicy: Forbid prevents overlap.
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: calendar-collector
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: collector
+              image: oven/bun:1-alpine
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  bun /scripts/calendar-collector.mjs sync \
+                    && bun /scripts/calendar-collector.mjs enrich
+              env:
+                - name: DATA_DIR
+                  value: /data
+                - name: WORK_EMAIL
+                  value: dylan.evans@simplesalt.company
+                - name: CALENDAR_ID
+                  value: primary
+                - name: CAL_DAYS_BACK
+                  value: "90"
+                - name: CAL_DAYS_FWD
+                  value: "180"
+                - name: GOOGLE_CLIENT_EMAIL
+                  value: hermes-agent-access@internalapps-481018.iam.gserviceaccount.com
+                # gbrain MCP endpoint + inline bearer (matches gbrain + hermes Deployments).
+                - name: GBRAIN_MCP_URL
+                  value: http://gbrain:3131/mcp
+                - name: GBRAIN_REMOTE_TOKEN
+                  value: "gbrain-mcp"
+                # Same service-account key the Gmail collector uses (optional so the pod
+                # still schedules if absent; script exits with a clear FATAL otherwise).
+                - name: GOOGLE_PRIVATE_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: hermes-secrets
+                      key: GOOGLE_PRIVATE_KEY_ID
+                      optional: true
+                - name: GOOGLE_PRIVATE_KEY_B64
+                  valueFrom:
+                    secretKeyRef:
+                      name: hermes-secrets
+                      key: GOOGLE_PRIVATE_KEY_B64
+                      optional: true
+              volumeMounts:
+                - name: calendar-data
+                  mountPath: /data
+                - name: collector-script
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: calendar-data
+              persistentVolumeClaim:
+                claimName: calendar-collector-data
+            - name: collector-script
+              configMap:
+                name: calendar-collector-script
+---
+# K8s-native ingestion healthcheck (see email-collector.yaml for the rationale). Readiness
+# passes only when the heartbeat is fresh (< HEARTBEAT_MAX_AGE_SEC — 14h ≈ 2 missed 6h
+# cycles) AND the last enrich reported status=ok. No liveness probe (restart can't fix a
+# stalled pipeline).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: calendar-ingestion-health
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: calendar-ingestion-health
+  template:
+    metadata:
+      labels:
+        app: calendar-ingestion-health
+    spec:
+      containers:
+        - name: health
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: HEARTBEAT_MAX_AGE_SEC
+              value: "50400"
+          readinessProbe:
+            exec:
+              command: ["bun", "/scripts/calendar-collector.mjs", "healthcheck"]
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 15
+            successThreshold: 1
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: calendar-data
+              mountPath: /data
+              readOnly: true
+            - name: collector-script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: calendar-data
+          persistentVolumeClaim:
+            claimName: calendar-collector-data
+        - name: collector-script
+          configMap:
+            name: calendar-collector-script

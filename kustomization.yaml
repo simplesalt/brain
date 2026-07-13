@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - manifests/ai.yaml
+  - manifests/hindsight-chart.yaml
+  - manifests/big-agi.yaml
+  - manifests/hermes-proxy.yaml
+  - manifests/gbrain-embedding-secret.yaml
+  - manifests/email-collector.yaml
+  - manifests/calendar-collector.yaml
+  - manifests/hermes-msg.yaml
+  # manifests/ai-ingress.yaml intentionally NOT listed yet — the old
+  # ssint-named-ai stack in base-stack still owns the public ai.famevans.win
+  # Ingress/IngressRoute. Add this during the coordinated cutover (see the
+  # migration plan, Part 3) once data migration is verified.
+configMapGenerator:
+  - name: hermes-config
+    namespace: ssint-main-ai
+    files:
+      - config.yaml=manifests/hermes-config.yaml
+      # Hand-authored `build` skill — seeded to /opt/data/skills/build/SKILL.md
+      # by the init container. Lives in git so curator re-bundles can't wipe it.
+      - build-skill.md=manifests/build-skill.md
+      # Non-repo CLAUDE.md for Claude Code sub-processes spawned by /build.
+      # Seeded to /opt/data/.claude/CLAUDE.md; provides workflow, tool context,
+      # and GitOps conventions so the per-call prompt only carries intent+repo+criteria.
+      - hermes-claude.md=manifests/hermes-claude.md
+      # Hermes' own identity + project context. Seeded to /opt/data (= HERMES_HOME):
+      #   SOUL.md   -> $HERMES_HOME/SOUL.md, always loaded as the agent identity.
+      #   AGENTS.md -> loaded as project context from the session cwd (pinned to
+      #               /opt/data via the HERMES_ORIG_CWD env var in ai.yaml).
+      - SOUL.md=manifests/SOUL.md
+      - AGENTS.md=manifests/AGENTS.md
+generatorOptions:
+  labels:
+    entity: ssint
+    env: main
+    capability: ai

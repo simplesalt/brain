@@ -1,0 +1,730 @@
+# hermes-msg: unified outbound messaging service.
+# Channels: email (Gmail DWD), linkedin (Dux Soup Remote), sms (Quo), invite (cal.diy)
+# Endpoints:
+#   POST /mcp            — MCP JSON-RPC 2.0 (tools: send_message, get_thread)
+#   POST /api/v1/messages — REST (same unified schema as MCP)
+#   GET  /healthz        — liveness/readiness probe
+#
+# Cluster-local only (no ingress). Consumed by hermes-agent via MCP at
+# http://hermes-msg.ssint-main-msg.svc.cluster.local:8080/mcp
+# and by webapps/n8n via the REST API at http://hermes-msg.ssint-main-msg.svc:8080.
+#
+# Secrets (all optional: pod starts even if absent, tools return clear error):
+#   google-dwd-key:   private_key_b64  (base64-encoded PEM private key; operator-populated)
+#   google-private-key-id: private_key_id  (DWD JWT kid field; operator-populated)
+#   duxsoup-api-key:  api_key          (Remote Control auth key; operator-populated)
+#   duxsoup-user-id:  user_id          (Remote Control URL user segment; operator-populated)
+#   quo-api-key:      api_key          (Quo API key; operator-populated)
+#   quo-from-number:  from_number      (E.164 outbound number; operator-populated)
+#   calcom-api-key:   api_key          (auto-managed by cal-seed-users Job; lives in ssint-named-cal)
+#
+# DWD prerequisite: hermes-agent-access@ already has Domain-wide Delegation enabled
+# in Google Admin Console with scopes:
+#   https://www.googleapis.com/auth/gmail.send
+#   https://www.googleapis.com/auth/gmail.readonly
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+---
+# Secret placeholders — one secret string per object (operator-populated).
+# SSA merge ensures Flux never overwrites manually populated values.
+# calcom-api-key lives in ssint-named-cal (auto-managed by cal-seed-users Job);
+# fetched by the hermes-msg pod's fetch-calcom-key init container.
+#
+# kubectl patch secret google-dwd-key  -n ssint-main-msg --type=merge -p '{"stringData":{"private_key_b64":"<base64-pem>"}}'
+# kubectl patch secret duxsoup-api-key -n ssint-main-msg --type=merge -p '{"stringData":{"api_key":"<remote-control-auth-key>"}}'
+# kubectl patch secret duxsoup-user-id -n ssint-main-msg --type=merge -p '{"stringData":{"user_id":"<user-id-from-remote-control-url>"}}'
+# kubectl patch secret quo-api-key     -n ssint-main-msg --type=merge -p '{"stringData":{"api_key":"<quo-api-key>"}}'
+# kubectl patch secret quo-from-number      -n ssint-main-msg --type=merge -p '{"stringData":{"from_number":"+1XXXXXXXXXX"}}'
+# kubectl patch secret google-private-key-id -n ssint-main-msg --type=merge -p '{"stringData":{"private_key_id":"<key-id-from-service-account-json>"}}'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: google-dwd-key
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: google-private-key-id
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: duxsoup-api-key
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: quo-api-key
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: duxsoup-user-id
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: quo-from-number
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+# ServiceAccount used by hermes-msg pods to fetch calcom-api-key cross-namespace
+# at startup (via the fetch-calcom-key init container).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hermes-msg
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-msg-script
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+data:
+  server.mjs: |
+    #!/usr/bin/env bun
+    // hermes-msg server v1.0.0
+    // Unified outbound messaging: email (Gmail DWD), LinkedIn (Dux Soup), SMS (Quo), invite (cal.diy)
+
+    import { createSign, createHmac } from 'crypto';
+
+    // ── Config ────────────────────────────────────────────────────────────────
+    const PORT = Number(process.env.PORT ?? 8080);
+    const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL
+      ?? 'hermes-agent-access@internalapps-481018.iam.gserviceaccount.com';
+    const DEFAULT_IMPERSONATE = process.env.GOOGLE_IMPERSONATE_EMAIL ?? '';
+    const EMAIL_SIG_BLOCK = process.env.EMAIL_SIG_BLOCK ?? '';
+
+    const DUXSOUP_USER_ID = process.env.DUXSOUP_USER_ID ?? '';
+    const DUXSOUP_API_KEY = process.env.DUXSOUP_API_KEY ?? '';
+    const DUXSOUP_BASE_URL = process.env.DUXSOUP_BASE_URL ?? 'https://app.dux-soup.com';
+
+    const QUO_API_KEY = process.env.QUO_API_KEY ?? '';
+    const QUO_FROM_NUMBER = process.env.QUO_FROM_NUMBER ?? '';
+    const QUO_USER_ID = process.env.QUO_USER_ID ?? '';
+
+    const CALCOM_API_KEY = process.env.CALCOM_API_KEY ?? '';
+    const CALCOM_BASE_URL = process.env.CALCOM_BASE_URL
+      ?? 'http://cal.ssint-named-cal.svc.cluster.local';
+
+    // ── Google JWT auth (DWD) ─────────────────────────────────────────────────
+    // Same pattern as email-collector.mjs: crypto RSA-SHA256, no npm packages.
+
+    function b64url(s) { return Buffer.from(s).toString('base64url'); }
+
+    const GMAIL_SCOPES = [
+      'https://www.googleapis.com/auth/gmail.send',
+      'https://www.googleapis.com/auth/gmail.readonly',
+    ];
+
+    const _privKey = (() => {
+      const b64 = process.env.GOOGLE_PRIVATE_KEY_B64;
+      if (b64) return Buffer.from(b64, 'base64').toString('utf8');
+      return process.env.GOOGLE_PRIVATE_KEY ?? '';
+    })();
+    const _kid = process.env.GOOGLE_PRIVATE_KEY_ID ?? '';
+    const _tokenCache = new Map(); // impersonate-email -> { token, expiresAt }
+
+    async function getGmailToken(impersonate) {
+      const sub = impersonate || DEFAULT_IMPERSONATE;
+      if (!sub) throw new Error('GOOGLE_IMPERSONATE_EMAIL not configured');
+      if (!_privKey) throw new Error('GOOGLE_PRIVATE_KEY_B64 not configured');
+      const cached = _tokenCache.get(sub);
+      if (cached && Date.now() < cached.expiresAt) return cached.token;
+      const now = Math.floor(Date.now() / 1000);
+      const hdr = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: _kid }));
+      const pay = b64url(JSON.stringify({
+        iss: CLIENT_EMAIL, sub,
+        scope: GMAIL_SCOPES.join(' '),
+        aud: 'https://oauth2.googleapis.com/token',
+        iat: now, exp: now + 3600,
+      }));
+      const unsigned = `${hdr}.${pay}`;
+      const sig = createSign('RSA-SHA256').update(unsigned).sign(_privKey, 'base64url');
+      const jwt = `${unsigned}.${sig}`;
+      const r = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          assertion: jwt,
+        }),
+      });
+      if (!r.ok) throw new Error(`Google token exchange ${r.status}: ${await r.text()}`);
+      const token = (await r.json()).access_token;
+      _tokenCache.set(sub, { token, expiresAt: Date.now() + 3_540_000 });
+      return token;
+    }
+
+    // ── Gmail helpers ─────────────────────────────────────────────────────────
+
+    function gmailHeader(msg, name) {
+      return msg.payload?.headers?.find(
+        h => h.name.toLowerCase() === name.toLowerCase()
+      )?.value ?? '';
+    }
+
+    function decodeGmailBody(payload) {
+      if (!payload) return '';
+      if (payload.mimeType === 'text/plain' && payload.body?.data) {
+        return Buffer.from(payload.body.data, 'base64url').toString('utf8');
+      }
+      for (const part of payload.parts ?? []) {
+        const text = decodeGmailBody(part);
+        if (text) return text;
+      }
+      return '';
+    }
+
+    function buildRawEmail({ from, to, cc, subject, body, inReplyTo, references }) {
+      const hdrs = [
+        `From: ${from}`,
+        `To: ${to}`,
+        ...(cc?.length ? [`Cc: ${cc.join(', ')}`] : []),
+        `Subject: ${subject}`,
+        ...(inReplyTo ? [`In-Reply-To: ${inReplyTo}`] : []),
+        ...(references ? [`References: ${references}`] : []),
+        'MIME-Version: 1.0',
+        'Content-Type: text/plain; charset=UTF-8',
+      ];
+      return Buffer.from(hdrs.join('\r\n') + '\r\n\r\n' + body).toString('base64url');
+    }
+
+    // ── Email adapter ─────────────────────────────────────────────────────────
+
+    const emailAdapter = {
+      async send(verb, { to, message, subject, thread_id, sig_block = true, cc, from_email }) {
+        const from = from_email || DEFAULT_IMPERSONATE;
+        const token = await getGmailToken(from);
+        const sig = sig_block && EMAIL_SIG_BLOCK ? `\n\n-- \n${EMAIL_SIG_BLOCK}` : '';
+        let raw, threadId;
+
+        if (verb === 'new') {
+          if (!subject) throw new Error('subject required for email verb=new');
+          raw = buildRawEmail({ from, to, cc, subject, body: message + sig });
+        } else if (verb === 'reply') {
+          if (!thread_id) throw new Error('thread_id required for email verb=reply');
+          const tr = await fetch(
+            `https://gmail.googleapis.com/gmail/v1/users/me/threads/${thread_id}?format=full`,
+            { headers: { Authorization: `Bearer ${token}` } },
+          );
+          if (!tr.ok) throw new Error(`threads.get ${tr.status}: ${await tr.text()}`);
+          const thread = await tr.json();
+          const msgs = thread.messages ?? [];
+          if (!msgs.length) throw new Error(`Thread ${thread_id} has no messages`);
+          const last = msgs[msgs.length - 1];
+          const origSubject = gmailHeader(last, 'Subject');
+          const origFrom    = gmailHeader(last, 'From');
+          const origDate    = gmailHeader(last, 'Date');
+          const origMsgId   = gmailHeader(last, 'Message-ID');
+          const allRefs     = msgs.map(m => gmailHeader(m, 'Message-ID')).filter(Boolean).join(' ');
+          const quotedBody  = decodeGmailBody(last.payload);
+          const replySubj   = origSubject.startsWith('Re:') ? origSubject : `Re: ${origSubject}`;
+          const quote       = quotedBody.split('\n').map(l => `> ${l}`).join('\n');
+          const fullBody    = `${message}${sig}\n\nOn ${origDate}, ${origFrom} wrote:\n${quote}`;
+          raw = buildRawEmail({
+            from,
+            to: to || origFrom,
+            cc,
+            subject: replySubj,
+            body: fullBody,
+            inReplyTo: origMsgId,
+            references: allRefs,
+          });
+          threadId = thread_id;
+        } else {
+          throw new Error(`Unknown verb: ${verb}`);
+        }
+
+        const sr = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ raw, ...(threadId ? { threadId } : {}) }),
+        });
+        if (!sr.ok) throw new Error(`gmail.send ${sr.status}: ${await sr.text()}`);
+        const sent = await sr.json();
+        return {
+          message_id: sent.id,
+          channel: 'email',
+          status: 'sent',
+          url: `https://mail.google.com/mail/u/?authuser=${encodeURIComponent(from)}#sent/${sent.id}`,
+        };
+      },
+
+      async getThread(thread_id) {
+        const token = await getGmailToken();
+        const r = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/threads/${thread_id}?format=full`,
+          { headers: { Authorization: `Bearer ${token}` } },
+        );
+        if (!r.ok) throw new Error(`threads.get ${r.status}: ${await r.text()}`);
+        const thread = await r.json();
+        return {
+          thread_id,
+          message_count: (thread.messages ?? []).length,
+          messages: (thread.messages ?? []).map(m => ({
+            id: m.id,
+            message_id_header: gmailHeader(m, 'Message-ID'),
+            from:    gmailHeader(m, 'From'),
+            date:    gmailHeader(m, 'Date'),
+            subject: gmailHeader(m, 'Subject'),
+            body:    decodeGmailBody(m.payload),
+          })),
+        };
+      },
+    };
+
+    // ── LinkedIn adapter (Dux Soup Remote Control) ────────────────────────────
+
+    const linkedinAdapter = {
+      async send(verb, { to, message, conversation_id }) {
+        if (!DUXSOUP_USER_ID || !DUXSOUP_API_KEY) {
+          throw new Error('DUXSOUP_USER_ID / DUXSOUP_API_KEY not configured');
+        }
+        if (!to) throw new Error('to (LinkedIn profile URL) required');
+        // Dux Soup Remote API has no thread-reply primitive; verb=reply sends a new DM.
+        if (verb === 'reply') {
+          console.warn(`linkedin verb=reply: conversation_id=${conversation_id} noted; Dux Soup sends as new DM to ${to}`);
+        }
+        const targeturl = `${DUXSOUP_BASE_URL}/xapi/remote/control/${DUXSOUP_USER_ID}/queue`;
+        const body = JSON.stringify({
+          targeturl,
+          timestamp: Date.now(),
+          userid: DUXSOUP_USER_ID,
+          command: 'message',
+          params: { profile: to, messagetext: message, campaignid: 'integrated' },
+        });
+        // Auth: HMAC-SHA1(body, api_key), base64-encoded, per X-Dux-Signature.
+        const signature = createHmac('sha1', DUXSOUP_API_KEY).update(body).digest('base64');
+        const r = await fetch(targeturl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': signature },
+          body,
+        });
+        if (!r.ok) throw new Error(`Dux Soup ${r.status}: ${await r.text()}`);
+        const data = await r.json().catch(() => ({}));
+        return {
+          message_id: data.id ?? data.messageid ?? 'queued',
+          channel: 'linkedin',
+          status: 'queued',
+          url: to,
+        };
+      },
+    };
+
+    // ── SMS adapter (Quo / formerly OpenPhone) ────────────────────────────────
+    // Quo API does not support MMS programmatically. media_url is silently stripped.
+
+    const smsAdapter = {
+      async send(_verb, { to, message, media_url }) {
+        if (!QUO_API_KEY || !QUO_FROM_NUMBER) {
+          throw new Error('QUO_API_KEY / QUO_FROM_NUMBER not configured');
+        }
+        if (media_url) {
+          console.warn('sms: media_url provided but Quo API supports SMS only; stripping media_url and sending plain SMS');
+        }
+        const body = { content: message, from: QUO_FROM_NUMBER, to: [to] };
+        if (QUO_USER_ID) body.userId = QUO_USER_ID;
+        // Authorization header: no Bearer prefix per Quo API spec
+        const r = await fetch('https://api.quo.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: QUO_API_KEY },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) throw new Error(`Quo ${r.status}: ${await r.text()}`);
+        const data = await r.json();
+        return { message_id: data.id ?? data.data?.id ?? 'sent', channel: 'sms', status: 'sent' };
+      },
+    };
+
+    // ── Invite adapter (cal.diy / cal.com v2) ─────────────────────────────────
+
+    const inviteAdapter = {
+      async send({ to, message: notes, event_type_id, scheduled_at, duration_minutes = 30 }) {
+        if (!CALCOM_API_KEY) throw new Error('CALCOM_API_KEY not configured');
+        if (!event_type_id) throw new Error('event_type_id required for invite');
+        if (!scheduled_at) throw new Error('scheduled_at required for invite');
+        const r = await fetch(`${CALCOM_BASE_URL}/api/v2/bookings`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${CALCOM_API_KEY}`,
+            'cal-api-version': '2024-08-13',
+          },
+          body: JSON.stringify({
+            eventTypeId: Number(event_type_id),
+            start: scheduled_at,
+            lengthInMinutes: duration_minutes,
+            attendee: { name: to, email: to, timeZone: 'America/New_York' },
+            ...(notes ? { metadata: { notes } } : {}),
+          }),
+        });
+        if (!r.ok) throw new Error(`cal.diy ${r.status}: ${await r.text()}`);
+        const data = await r.json();
+        const booking = data.data ?? data;
+        return {
+          message_id: String(booking.id ?? booking.uid ?? 'created'),
+          channel: 'invite',
+          status: 'created',
+          url: booking.meetingUrl ?? undefined,
+        };
+      },
+    };
+
+    // ── Dispatch ──────────────────────────────────────────────────────────────
+
+    async function sendMessage(args) {
+      const { verb, channel, to, message, ...rest } = args;
+      if (!verb)    throw new Error('verb required (new|reply)');
+      if (!channel) throw new Error('channel required (email|linkedin|sms|invite)');
+      switch (channel) {
+        case 'email':    return emailAdapter.send(verb, { to, message, ...rest });
+        case 'linkedin': return linkedinAdapter.send(verb, { to, message, ...rest });
+        case 'sms':      return smsAdapter.send(verb, { to, message, ...rest });
+        case 'invite':   return inviteAdapter.send({ to, message, ...rest });
+        default:         throw new Error(`Unknown channel: ${channel}`);
+      }
+    }
+
+    async function getThread({ channel, thread_id }) {
+      if (!thread_id) throw new Error('thread_id required');
+      if (channel === 'email') return emailAdapter.getThread(thread_id);
+      throw new Error(`get_thread not supported for channel: ${channel}`);
+    }
+
+    // ── MCP tool schemas ──────────────────────────────────────────────────────
+
+    const TOOLS = [
+      {
+        name: 'send_message',
+        description: 'Send an outbound message via email, LinkedIn DM, SMS, or calendar invite.',
+        inputSchema: {
+          type: 'object',
+          required: ['verb', 'channel', 'to', 'message'],
+          properties: {
+            verb:             { type: 'string', enum: ['new', 'reply'],
+                                description: 'new = compose fresh; reply = respond in existing thread' },
+            channel:          { type: 'string', enum: ['email', 'linkedin', 'sms', 'invite'] },
+            to:               { type: 'string',
+                                description: 'Recipient: email address | LinkedIn profile URL | E.164 phone | email (invite)' },
+            message:          { type: 'string', description: 'Message body text' },
+            subject:          { type: 'string', description: 'Email subject line (email verb=new only)' },
+            thread_id:        { type: 'string', description: 'Gmail thread ID (email verb=reply)' },
+            sig_block:        { type: 'boolean', default: true,
+                                description: 'Append email signature block (email only; requires EMAIL_SIG_BLOCK env)' },
+            cc:               { type: 'array', items: { type: 'string' }, description: 'CC addresses (email only)' },
+            from_email:       { type: 'string',
+                                description: 'Override sender address (email only; defaults to GOOGLE_IMPERSONATE_EMAIL)' },
+            conversation_id:  { type: 'string',
+                                description: 'LinkedIn conversation ID (verb=reply; informational — Dux Soup sends as new DM)' },
+            event_type_id:    { type: 'string', description: 'cal.diy event type ID (invite only)' },
+            scheduled_at:     { type: 'string', description: 'ISO8601 start time (invite only)' },
+            duration_minutes: { type: 'integer', default: 30, description: 'Meeting length in minutes (invite only)' },
+            notes:            { type: 'string', description: 'Booking notes (invite only)' },
+          },
+        },
+      },
+      {
+        name: 'get_thread',
+        description: 'Fetch thread messages for context before composing a reply. Currently supports email only.',
+        inputSchema: {
+          type: 'object',
+          required: ['channel', 'thread_id'],
+          properties: {
+            channel:   { type: 'string', enum: ['email'] },
+            thread_id: { type: 'string', description: 'Gmail thread ID' },
+          },
+        },
+      },
+    ];
+
+    // ── MCP handler ───────────────────────────────────────────────────────────
+
+    function mcpErr(id, code, message) {
+      return Response.json({ jsonrpc: '2.0', id, error: { code, message } });
+    }
+
+    async function handleMcp(req) {
+      let body;
+      try { body = await req.json(); }
+      catch { return mcpErr(null, -32700, 'Parse error'); }
+      const { id, method, params } = body;
+      try {
+        if (method === 'initialize') {
+          return Response.json({
+            jsonrpc: '2.0', id,
+            result: {
+              protocolVersion: '2024-11-05',
+              capabilities: { tools: {} },
+              serverInfo: { name: 'hermes-msg', version: '1.0.0' },
+            },
+          });
+        }
+        if (method === 'notifications/initialized') return new Response(null, { status: 204 });
+        if (method === 'tools/list') {
+          return Response.json({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
+        }
+        if (method === 'tools/call') {
+          const { name, arguments: args = {} } = params ?? {};
+          let result;
+          if      (name === 'send_message') result = await sendMessage(args);
+          else if (name === 'get_thread')   result = await getThread(args);
+          else return mcpErr(id, -32601, `Unknown tool: ${name}`);
+          return Response.json({
+            jsonrpc: '2.0', id,
+            result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] },
+          });
+        }
+        return mcpErr(id, -32601, `Method not found: ${method}`);
+      } catch (e) {
+        return Response.json({
+          jsonrpc: '2.0', id,
+          result: { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true },
+        });
+      }
+    }
+
+    // ── REST handler ──────────────────────────────────────────────────────────
+
+    async function handleMessages(req) {
+      let body;
+      try { body = await req.json(); }
+      catch { return Response.json({ error: 'Invalid JSON' }, { status: 400 }); }
+      try {
+        return Response.json(await sendMessage(body));
+      } catch (e) {
+        return Response.json({ error: e.message }, { status: 400 });
+      }
+    }
+
+    // ── Server ────────────────────────────────────────────────────────────────
+
+    Bun.serve({
+      port: PORT,
+      async fetch(req) {
+        const { pathname } = new URL(req.url);
+        if (pathname === '/healthz') return Response.json({ ok: true });
+        if (pathname === '/mcp'               && req.method === 'POST') return handleMcp(req);
+        if (pathname === '/api/v1/messages'   && req.method === 'POST') return handleMessages(req);
+        return new Response('Not Found', { status: 404 });
+      },
+      error(e) { return Response.json({ error: e.message }, { status: 500 }); },
+    });
+
+    console.log(`hermes-msg listening on :${PORT}`);
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-msg
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hermes-msg
+  template:
+    metadata:
+      labels:
+        app: hermes-msg
+        entity: ssint
+        env: main
+        capability: msg
+    spec:
+      serviceAccountName: hermes-msg
+      initContainers:
+        - name: fetch-calcom-key
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: calcom-env
+              mountPath: /calcom-env
+          command:
+            - sh
+            - -c
+            - |
+              VAL=$(kubectl get secret calcom-api-key -n ssint-named-cal \
+                -o jsonpath='{.data.api_key}' 2>/dev/null || true)
+              if [ -n "$VAL" ]; then
+                printf '%s' "$VAL" | base64 -d > /calcom-env/api_key
+                echo "calcom-api-key fetched."
+              else
+                echo "calcom-api-key not yet populated — CALCOM_API_KEY will be empty."
+                touch /calcom-env/api_key
+              fi
+      containers:
+        - name: hermes-msg
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              export CALCOM_API_KEY=$(cat /calcom-env/api_key 2>/dev/null || true)
+              exec bun /scripts/server.mjs
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: GOOGLE_CLIENT_EMAIL
+              value: hermes-agent-access@internalapps-481018.iam.gserviceaccount.com
+            - name: GOOGLE_IMPERSONATE_EMAIL
+              value: dylan.evans@simplesalt.company
+            - name: EMAIL_SIG_BLOCK
+              value: ""
+            - name: GOOGLE_PRIVATE_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: google-private-key-id
+                  key: private_key_id
+                  optional: true
+            - name: DUXSOUP_BASE_URL
+              value: https://app.dux-soup.com
+            - name: DUXSOUP_USER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-user-id
+                  key: user_id
+                  optional: true
+            - name: QUO_FROM_NUMBER
+              valueFrom:
+                secretKeyRef:
+                  name: quo-from-number
+                  key: from_number
+                  optional: true
+            - name: QUO_USER_ID
+              value: ""
+            - name: CALCOM_BASE_URL
+              value: http://cal.ssint-named-cal.svc.cluster.local
+            - name: GOOGLE_PRIVATE_KEY_B64
+              valueFrom:
+                secretKeyRef:
+                  name: google-dwd-key
+                  key: private_key_b64
+                  optional: true
+            - name: DUXSOUP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-api-key
+                  key: api_key
+                  optional: true
+            - name: QUO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: quo-api-key
+                  key: api_key
+                  optional: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: calcom-env
+              mountPath: /calcom-env
+              readOnly: true
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: calcom-env
+          emptyDir:
+            medium: Memory
+        - name: script
+          configMap:
+            name: hermes-msg-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-msg
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  selector:
+    app: hermes-msg
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

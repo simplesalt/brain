@@ -1,0 +1,186 @@
+---
+# Tiny SSE-filtering proxy that sits between big-AGI and the Hermes API server.
+# Hermes emits non-standard tool-status streaming events alongside the normal
+# OpenAI SSE stream; big-AGI fails to parse them. This proxy drops any SSE
+# data line whose JSON payload lacks a "choices" key (i.e. not an OpenAI
+# chat.completion.chunk) before forwarding the stream to the caller.
+#
+# Pure Python stdlib — no custom image build needed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-proxy-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  proxy.py: |
+    #!/usr/bin/env python3
+    import json, os, http.client, http.server
+    from urllib.parse import urlparse
+
+    HERMES_URL = os.environ.get('HERMES_URL', 'http://hermes-agent-web:8642')
+    PORT = int(os.environ.get('PORT', '8000'))
+    _u = urlparse(HERMES_URL)
+    _HOST = _u.hostname
+    _PORT = _u.port or (443 if _u.scheme == 'https' else 80)
+
+    _SKIP_REQ = {'host', 'transfer-encoding', 'connection'}
+    _SKIP_RESP_BASE = {'transfer-encoding', 'connection'}
+
+    class ProxyHandler(http.server.BaseHTTPRequestHandler):
+        timeout = 300
+        def do_GET(self): self._proxy()
+        def do_POST(self): self._proxy()
+        def do_PUT(self): self._proxy()
+        def do_DELETE(self): self._proxy()
+        def log_message(self, *a): pass
+
+        def _proxy(self):
+            n = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(n) if n else b''
+            is_stream = False
+            try:
+                if body:
+                    is_stream = bool(json.loads(body).get('stream'))
+            except Exception:
+                pass
+            fwd = {k: v for k, v in self.headers.items() if k.lower() not in _SKIP_REQ}
+            try:
+                conn = http.client.HTTPConnection(_HOST, _PORT, timeout=300)
+                conn.request(self.command, self.path, body=body, headers=fwd)
+                r = conn.getresponse()
+                self.send_response(r.status)
+                skip = _SKIP_RESP_BASE | ({'content-length'} if is_stream else set())
+                for k, v in r.getheaders():
+                    if k.lower() not in skip:
+                        self.send_header(k, v)
+                self.end_headers()
+                if is_stream:
+                    self._stream(r)
+                else:
+                    self.wfile.write(r.read())
+            except Exception as e:
+                try: self.send_error(502, str(e))
+                except Exception: pass
+            finally:
+                try: conn.close()
+                except Exception: pass
+
+        def _stream(self, r):
+            buf = b''
+            prev_dropped = False
+            while True:
+                chunk = r.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    i = buf.find(b'\n')
+                    if i == -1:
+                        break
+                    line, buf = buf[:i+1], buf[i+1:]
+                    prev_dropped = self._sse_line(line, prev_dropped)
+            if buf:
+                self._sse_line(buf, prev_dropped)
+
+        def _sse_line(self, line, prev_dropped):
+            """Return True if this line was dropped (suppresses following blank line)."""
+            s = line.decode('utf-8', errors='replace')
+            if s.startswith('data: '):
+                payload = s[6:].strip()
+                if payload != '[DONE]':
+                    try:
+                        d = json.loads(payload)
+                        if 'choices' not in d:
+                            return True  # drop Hermes tool-status events
+                    except json.JSONDecodeError:
+                        pass
+            elif s.strip() == '' and prev_dropped:
+                return False  # suppress the blank-line separator after a dropped event
+            self.wfile.write(line)
+            self.wfile.flush()
+            return False
+
+    if __name__ == '__main__':
+        srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), ProxyHandler)
+        print(f'hermes-proxy :{PORT} → {HERMES_URL}', flush=True)
+        srv.serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-proxy
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hermes-proxy
+  template:
+    metadata:
+      labels:
+        app: hermes-proxy
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      containers:
+        - name: hermes-proxy
+          image: python:3.12-slim
+          command: ["python", "/scripts/proxy.py"]
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: HERMES_URL
+              value: "http://hermes-agent-web:8642"
+            - name: PORT
+              value: "8000"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: script
+          configMap:
+            name: hermes-proxy-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-proxy
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  selector:
+    app: hermes-proxy
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

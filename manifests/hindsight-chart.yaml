@@ -1,0 +1,74 @@
+# Hindsight memory API — consumed from the OCI Helm chart published by
+# simplesalt/oci to ghcr.io/simplesalt/charts/hindsight.
+#
+# Source mechanism: OCIRepository (source.toolkit.fluxcd.io/v1beta2) + HelmRelease
+# spec.chartRef. Chosen over HelmRepository(type:oci) because chartRef avoids the
+# intermediate HelmChart object and lets Flux pull directly from the OCI artifact.
+# Requires Flux >= v2.3; cluster runs v2.6.4.
+#
+# The OCIRepository is unauthenticated. ghcr.io/simplesalt/charts packages are
+# public (the package visibility on GHCR must be set to Public after first push;
+# see PR body). If the package is private, uncomment the secretRef below and
+# create a ghcr-pull-secret in flux-system with a PAT that has packages:read.
+#
+# Values kept here: ONLY what is env-specific.
+#   image.digest — the sha256 of ghcr.io/vectorize-io/hindsight:latest currently
+#     running in production. Auto-bumped by .github/workflows/bump-image-digests.yml
+#     (which rewrites this file, once ported into this repo — see migration plan Part 4).
+#
+# The CNPG cluster (hindsight-pg) and the hermes-secrets Secret live in ai.yaml
+# and are untouched by this chart. The chart's database env wires to hindsight-pg-app
+# (the CNPG-generated secret) and hermes-secrets — chart defaults must use those names.
+#
+# Named hindsight-main (not bare "hindsight") because base-stack's own
+# OCIRepository/HelmRelease pair of the same kind also lives in flux-system —
+# object names aren't namespaced by ssint-main-ai/ssint-named-ai the way
+# everything else in this migration is, so the "named"->"main" rename lands on
+# the object name itself to avoid colliding with the still-live old objects
+# during the migration/soak window. Safe to rename back to "hindsight" once
+# the old base-stack copy is decommissioned, if desired.
+---
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: OCIRepository
+metadata:
+  name: hindsight-main
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  interval: 12h
+  url: oci://ghcr.io/simplesalt/charts/hindsight
+  ref:
+    tag: "0.1.0"
+  # Uncomment if ghcr.io/simplesalt/charts is a private package:
+  # secretRef:
+  #   name: ghcr-pull-secret
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: hindsight-main
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  interval: 5m
+  chartRef:
+    kind: OCIRepository
+    name: hindsight-main
+    namespace: flux-system
+  targetNamespace: ssint-main-ai
+  install:
+    createNamespace: false
+  values:
+    # Pin the upstream image digest. Tracks ghcr.io/vectorize-io/hindsight:latest.
+    # Auto-bumped by .github/workflows/bump-image-digests.yml (commits to main, once
+    # ported into this repo).
+    # Digest-pinned = reproducible rollouts; a changing digest + IfNotPresent rolls
+    # the pod cleanly on each new build without the stuck-pull risk of :latest+Always.
+    image:
+      digest: "sha256:7c069db2d7aeeae82d3d3917292b87b14d6547f979c8b1335a42c94d09d57213"

@@ -1,0 +1,67 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: big-agi
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: big-agi
+  template:
+    metadata:
+      labels:
+        app: big-agi
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      containers:
+        - name: big-agi
+          image: ghcr.io/enricoros/big-agi:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: HERMES_BEARER_TOKEN
+            - name: OPENAI_API_HOST
+              value: "http://hermes-proxy:8000"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: big-agi
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  selector:
+    app: big-agi
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
