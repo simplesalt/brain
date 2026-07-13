@@ -243,9 +243,12 @@ mcp_servers:
     timeout: 60
 
   # Unified outbound messaging: email (Gmail DWD), LinkedIn (Dux Soup), SMS (Quo), invite (cal.diy)
+  # No .svc.cluster.local suffix (see flux entry above): this cluster's domain
+  # is k.famevans.win, not the standard cluster.local, so a literal
+  # ".svc.cluster.local" FQDN never resolves. Short cross-namespace form only.
   hermes-msg:
     enabled: true
-    url: http://hermes-msg.ssint-main-msg.svc.cluster.local:8080/mcp
+    url: http://hermes-msg.ssint-main-msg:8080/mcp
     timeout: 60
 
   # Cloudflare hosted (remote) MCP. Bearer auth with a Cloudflare API token

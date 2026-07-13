@@ -417,6 +417,12 @@ spec:
         entity: ssint
         env: main
         capability: ai
+      annotations:
+        # Bump to force a rollout when an out-of-band change (ConfigMap fix,
+        # secret rotation) needs picking up but the pod spec itself is
+        # unchanged — Kubernetes only re-reads env/config-mounted secrets at
+        # container start. Same pattern as gbrain's restart-epoch above.
+        simplesalt.company/restart-epoch: "1"
     spec:
       # fsGroup ensures the hermes-home PVC is mounted with GID 10000 ownership
       # so the hermes user (UID 10000) can write to it. fsGroupChangePolicy
