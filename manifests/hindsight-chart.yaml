@@ -64,6 +64,7 @@ spec:
   targetNamespace: ssint-main-ai
   install:
     createNamespace: false
+    timeout: 10m
   values:
     # Pin the upstream image digest. Tracks ghcr.io/vectorize-io/hindsight:latest.
     # Auto-bumped by .github/workflows/bump-image-digests.yml (commits to main, once
