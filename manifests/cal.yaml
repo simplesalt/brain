@@ -10,8 +10,8 @@
 #   * Redis runs with emptyDir (ephemeral) on purpose: this is a local-testing
 #     deploy. Swap emptyDir for a PVC if durable Redis is later required.
 #   * SMTP is not configured.
-#   * Published at https://cal.famevans.win via a standard Ingress (DNS anchor
-#     for k8s-gateway) plus a Traefik IngressRoute.
+#   * Not exposed via Ingress. Internal-only (http://cal.ssint-main-cal.svc.cluster.local);
+#     will be surfaced via Cloudflare Access later (tracked in simplesalt/cloud-basis).
 #   * Secrets (NEXTAUTH_SECRET, CALENDSO_ENCRYPTION_KEY) are SSA-merge
 #     placeholders populated by the cal-secret-bootstrap Job on first deploy.
 #
@@ -313,7 +313,11 @@ spec:
             - sh
             - -c
             - |
-              HASH='$2b$12$H8n6.mF6pwGOZ8qZADfjSOB2C7QVAWBIuEAO/uyO6h8c23/t1hkhO'
+              # Dummy bcrypt hash for the local-login password "dummy" (bcrypt, cost 12).
+              # This is intentionally a throwaway password: the whole auth story needs to be
+              # moved to CASB / Cloudflare Access anyway. It only exists to bypass Cal.com's
+              # local-login requirement if the user doesn't want to pay for SSO licensing.
+              HASH='$2b$12$VKvZJWh0icenTgrXTU.rEuXUb27FJ4mOfDx0dxTU489IeoZUfhLLa'
               TL=/dev/termination-log
               ERR=0
               psql "$DATABASE_URL" -c "INSERT INTO users (uuid,username,name,email,role,\"emailVerified\",\"completedOnboarding\") VALUES (gen_random_uuid(),'dylan-evans','Dylan Evans','dylan.evans@simplesalt.company','ADMIN'::\"UserPermissionRole\",NOW(),true) ON CONFLICT (email) DO NOTHING" 2>>"$TL" || ERR=1
@@ -535,76 +539,3 @@ spec:
     - name: http
       port: 80
       targetPort: 3000
----
-# TLS certificate for cal.famevans.win — issued by the famevans ClusterIssuer.
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: cal-tls
-  namespace: ssint-main-cal
-  labels:
-    entity: ssint
-    env: main
-    capability: cal
-spec:
-  secretName: cal-tls
-  issuerRef:
-    name: famevans
-    kind: ClusterIssuer
-  commonName: cal.famevans.win
-  dnsNames:
-    - cal.famevans.win
----
-# Standard Ingress: anchors the cal.famevans.win DNS A record via k8s-gateway
-# and provides the catch-all route to the Cal.diy service.
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: cal
-  namespace: ssint-main-cal
-  labels:
-    entity: ssint
-    env: main
-    capability: cal
-  annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
-    traefik.ingress.kubernetes.io/router.tls: "true"
-spec:
-  ingressClassName: traefik
-  tls:
-    - hosts:
-        - cal.famevans.win
-      secretName: cal-tls
-  rules:
-    - host: cal.famevans.win
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: cal
-                port:
-                  number: 80
----
-# Traefik IngressRoute routing cal.famevans.win to the Cal.diy backend.
-apiVersion: traefik.io/v1alpha1
-kind: IngressRoute
-metadata:
-  name: cal
-  namespace: ssint-main-cal
-  labels:
-    entity: ssint
-    env: main
-    capability: cal
-spec:
-  entryPoints:
-    - websecure
-  routes:
-    - match: Host(`cal.famevans.win`)
-      kind: Rule
-      services:
-        - name: cal
-          port: 80
-  tls:
-    secretName: cal-tls
