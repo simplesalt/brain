@@ -9,6 +9,8 @@ resources:
   - manifests/email-collector.yaml
   - manifests/calendar-collector.yaml
   - manifests/hermes-msg.yaml
+  - manifests/coding.yaml
+  - manifests/cal.yaml
   # manifests/ai-ingress.yaml intentionally NOT listed yet — the old
   # ssint-named-ai stack in base-stack still owns the public ai.famevans.win
   # Ingress/IngressRoute. Add this during the coordinated cutover (see the

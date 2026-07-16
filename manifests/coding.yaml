@@ -1,0 +1,607 @@
+# Claude Code coding pods — namespace-scoped credentials.
+#
+# Migrated from base-stack/4.ss/coding.yaml (ssint-named-coding) to brain repo
+# (ssint-main-coding). The structure, secrets, and deployment blocks are
+# identical to the base-stack version; only the namespace and env label differ.
+#
+# `claude-auth`/`gh-auth`/`cf-secret`/`cf-id` are SSA-merge placeholders shared
+# across every coding pod in this namespace — Flux creates the empty shells,
+# real values are patched in OUT-OF-BAND (kubectl), never committed to git.
+#
+# Each `claude-rc-<repo>` Deployment gets its OWN `claude-oauth-<repo>` Secret
+# (never shared) — Anthropic's OAuth refresh tokens are single-use/rotating, so
+# two holders of the same token race and invalidate each other on refresh.
+# Adding a repo means copying the Secret/ServiceAccount/Role/RoleBinding/
+# Deployment block below with a new `-<repo-slug>` suffix.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ssint-main-coding
+  labels:
+    name: ssint-main-coding
+    entity: ssint
+    env: main
+    capability: coding
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: claude-auth
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gh-auth
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cf-secret
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cf-id
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+# Retained deliberately: the claude-rc-base-stack Deployment that used this
+# credential has been removed, but its stored OAuth credential is kept here
+# (SSA-merge placeholder) so Flux does NOT prune it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: claude-oauth-base-stack
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+# Skel override shared by the claude-rc-<repo> Deployments: injects extra MCP
+# servers into the Claude Code config without rebuilding the image. entrypoint.sh
+# does `cp -a /etc/claude-code/skel/. $HOME/` on every boot, so mounting a
+# single file here (subPath) is enough — the rest of skel is unaffected.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: claude-rc-skel-override
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+data:
+  claude.json.tmpl: |
+    {
+      "mcpServers": {
+        "flux": {
+          "type": "http",
+          "url": "http://mcp-flux.flux-system:9090/mcp"
+        },
+        "cloudflare": {
+          "type": "http",
+          "url": "https://mcp.cloudflare.com/mcp",
+          "headers": {
+            "Authorization": "Bearer ${CLOUDFLARE_API_TOKEN}"
+          }
+        }
+      }
+    }
+---
+# Persistent Remote Control server for the simplesalt/oci repo.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: claude-oauth-oci
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: claude-rc-oci
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: claude-rc-oci
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [claude-oauth-oci]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: claude-rc-oci
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+subjects:
+  - kind: ServiceAccount
+    name: claude-rc-oci
+    namespace: ssint-main-coding
+roleRef:
+  kind: Role
+  name: claude-rc-oci
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-conversations-oci
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-rc-oci
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: claude-rc-oci
+  template:
+    metadata:
+      labels:
+        app: claude-rc-oci
+        entity: ssint
+        env: main
+        capability: coding
+    spec:
+      serviceAccountName: claude-rc-oci
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 14400
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: claude-rc
+          image: ghcr.io/simplesalt/oci/builder-sb@sha256:6b59b9b74769be6ddd0f3c7221b735e9f4eb83d93ec6343d01efbdf8fda86506
+          args: ["serve-rc"]
+          env:
+            - name: REPO_URL
+              value: https://github.com/simplesalt/oci.git
+            - name: REPO_REF
+              value: main
+            - name: RC_NAME
+              value: claude-rc-oci
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gh-auth
+                  key: GITHUB_TOKEN
+            - name: CLOUDFLARE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cf-secret
+                  key: CLOUDFLARE_API_TOKEN
+            - name: CLOUDFLARE_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cf-id
+                  key: CLOUDFLARE_ACCOUNT_ID
+            - name: CLAUDE_USER_ID
+              value: "7b9377f89ae4bcb5fb7a41309fc72a92964ad21c557533b7025c3a14182cc85f"
+            - name: CLAUDE_ACCOUNT_UUID
+              value: "cc3b20ca-6c2c-47ce-aba8-b5c88357b5c4"
+            - name: CLAUDE_ORG_UUID
+              value: "bc07d162-b95e-4078-a1c4-4a876a935fb2"
+            - name: CLAUDE_EMAIL
+              value: "dylan.evans@simplesalt.company"
+            - name: CLAUDE_ORG_ROLE
+              value: "admin"
+            - name: CLAUDE_ORG_TYPE
+              value: "claude_max"
+            - name: CLAUDE_ORG_RATE_TIER
+              value: "default_claude_max_20x"
+            - name: CLAUDE_ORG_NAME
+              value: "dylan.evans@simplesalt.company's Organization"
+            - name: CLAUDE_DISPLAY_NAME
+              value: "dylan"
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HINDSIGHT_API_URL
+              value: http://hindsight.ssint-main-ai:8888
+            - name: HINDSIGHT_BANK_ID
+              value: hermes
+            - name: HINDSIGHT_API_TOKEN
+              value: local
+          volumeMounts:
+            - name: claude-oauth
+              mountPath: /var/run/claude
+              readOnly: true
+            - name: claude-creds
+              mountPath: /home/coder/.claude
+            - name: claude-conversations
+              mountPath: /home/coder/.claude/projects
+            - name: claude-json-override
+              mountPath: /etc/claude-code/skel/.claude.json.tmpl
+              subPath: claude.json.tmpl
+              readOnly: true
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "kill -TERM 1; while kill -0 1 2>/dev/null; do sleep 2; done"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 4Gi
+            limits:
+              memory: 6Gi
+        - name: cred-rotator
+          image: ghcr.io/simplesalt/oci/cred-rotator@sha256:8f0c251bb7685b66a9d7d531f27fab2ab4ea96d2c1365a7f9d9f45d6b80ea97c
+          env:
+            - name: SECRET_NAME
+              value: claude-oauth-oci
+            - name: SECRET_NAMESPACE
+              value: ssint-main-coding
+          volumeMounts:
+            - name: claude-creds
+              mountPath: /var/run/claude-creds
+              readOnly: true
+            - name: kube-api-access-rotator
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+          resources:
+            requests:
+              cpu: "10m"
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: claude-oauth
+          secret:
+            secretName: claude-oauth-oci
+            optional: true
+            items:
+              - key: .credentials.json
+                path: .credentials.json
+        - name: claude-creds
+          emptyDir:
+            medium: Memory
+        - name: claude-conversations
+          persistentVolumeClaim:
+            claimName: claude-conversations-oci
+        - name: claude-json-override
+          configMap:
+            name: claude-rc-skel-override
+        - name: kube-api-access-rotator
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+---
+# claude-rc-brain — persistent Remote Control builder for the simplesalt/brain repo.
+# Follows the per-repo pattern: its OWN claude-oauth-brain Secret, plus
+# SA/Role/RoleBinding/PVC/Deployment with a -brain suffix. Shares the
+# namespace-wide gh-auth/cf-secret/cf-id Secrets and the claude-rc-skel-override
+# ConfigMap.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: claude-oauth-brain
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: claude-rc-brain
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: claude-rc-brain
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [claude-oauth-brain]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: claude-rc-brain
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+subjects:
+  - kind: ServiceAccount
+    name: claude-rc-brain
+    namespace: ssint-main-coding
+roleRef:
+  kind: Role
+  name: claude-rc-brain
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-conversations-brain
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-rc-brain
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: claude-rc-brain
+  template:
+    metadata:
+      labels:
+        app: claude-rc-brain
+        entity: ssint
+        env: main
+        capability: coding
+    spec:
+      serviceAccountName: claude-rc-brain
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 14400
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: claude-rc
+          image: ghcr.io/simplesalt/oci/builder-sb@sha256:6b59b9b74769be6ddd0f3c7221b735e9f4eb83d93ec6343d01efbdf8fda86506
+          args: ["serve-rc"]
+          env:
+            - name: REPO_URL
+              value: https://github.com/simplesalt/brain.git
+            - name: REPO_REF
+              value: main
+            - name: RC_NAME
+              value: claude-rc-brain
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gh-auth
+                  key: GITHUB_TOKEN
+            - name: CLOUDFLARE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cf-secret
+                  key: CLOUDFLARE_API_TOKEN
+            - name: CLOUDFLARE_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cf-id
+                  key: CLOUDFLARE_ACCOUNT_ID
+            - name: CLAUDE_USER_ID
+              value: "7b9377f89ae4bcb5fb7a41309fc72a92964ad21c557533b7025c3a14182cc85f"
+            - name: CLAUDE_ACCOUNT_UUID
+              value: "cc3b20ca-6c2c-47ce-aba8-b5c88357b5c4"
+            - name: CLAUDE_ORG_UUID
+              value: "bc07d162-b95e-4078-a1c4-4a876a935fb2"
+            - name: CLAUDE_EMAIL
+              value: "dylan.evans@simplesalt.company"
+            - name: CLAUDE_ORG_ROLE
+              value: "admin"
+            - name: CLAUDE_ORG_TYPE
+              value: "claude_max"
+            - name: CLAUDE_ORG_RATE_TIER
+              value: "default_claude_max_20x"
+            - name: CLAUDE_ORG_NAME
+              value: "dylan.evans@simplesalt.company's Organization"
+            - name: CLAUDE_DISPLAY_NAME
+              value: "dylan"
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HINDSIGHT_API_URL
+              value: http://hindsight.ssint-main-ai:8888
+            - name: HINDSIGHT_BANK_ID
+              value: hermes
+            - name: HINDSIGHT_API_TOKEN
+              value: local
+          volumeMounts:
+            - name: claude-oauth
+              mountPath: /var/run/claude
+              readOnly: true
+            - name: claude-creds
+              mountPath: /home/coder/.claude
+            - name: claude-conversations
+              mountPath: /home/coder/.claude/projects
+            - name: claude-json-override
+              mountPath: /etc/claude-code/skel/.claude.json.tmpl
+              subPath: claude.json.tmpl
+              readOnly: true
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "kill -TERM 1; while kill -0 1 2>/dev/null; do sleep 2; done"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 4Gi
+            limits:
+              memory: 6Gi
+        - name: cred-rotator
+          image: ghcr.io/simplesalt/oci/cred-rotator@sha256:8f0c251bb7685b66a9d7d531f27fab2ab4ea96d2c1365a7f9d9f45d6b80ea97c
+          env:
+            - name: SECRET_NAME
+              value: claude-oauth-brain
+            - name: SECRET_NAMESPACE
+              value: ssint-main-coding
+          volumeMounts:
+            - name: claude-creds
+              mountPath: /var/run/claude-creds
+              readOnly: true
+            - name: kube-api-access-rotator
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+          resources:
+            requests:
+              cpu: "10m"
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: claude-oauth
+          secret:
+            secretName: claude-oauth-brain
+            optional: true
+            items:
+              - key: .credentials.json
+                path: .credentials.json
+        - name: claude-creds
+          emptyDir:
+            medium: Memory
+        - name: claude-conversations
+          persistentVolumeClaim:
+            claimName: claude-conversations-brain
+        - name: claude-json-override
+          configMap:
+            name: claude-rc-skel-override
+        - name: kube-api-access-rotator
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace

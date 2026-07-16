@@ -1,0 +1,610 @@
+# Cal.diy (https://github.com/calcom/cal.diy) — self-hosted scheduling platform.
+#
+# Migrated from base-stack/4.ss/cal.yaml (ssint-named-cal) to brain repo
+# (ssint-main-cal). Structure and configuration are identical to the base-stack
+# version; only the namespace and env label differ.
+#
+# Design decisions for this deployment:
+#   * Compute is stateless: cal-deploy holds no durable local state.
+#   * The ONLY durable store is PostgreSQL, hosted on CloudNativePG (CNPG).
+#   * Redis runs with emptyDir (ephemeral) on purpose: this is a local-testing
+#     deploy. Swap emptyDir for a PVC if durable Redis is later required.
+#   * SMTP is not configured.
+#   * Published at https://cal.famevans.win via a standard Ingress (DNS anchor
+#     for k8s-gateway) plus a Traefik IngressRoute.
+#   * Secrets (NEXTAUTH_SECRET, CALENDSO_ENCRYPTION_KEY) are SSA-merge
+#     placeholders populated by the cal-secret-bootstrap Job on first deploy.
+#
+# Cal.diy images track :latest (no per-release pin upstream).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+---
+# PostgreSQL for Cal.diy, hosted as a CloudNativePG (CNPG) instance.
+# CNPG auto-generates the "cal-pg-app" secret (keys: uri, username,
+# password, dbname, host, port, ...). The cluster's read-write service is
+# "cal-pg-rw". uuid-ossp is required by Prisma migrations.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: cal-pg
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:17
+  bootstrap:
+    initdb:
+      database: calendso
+      owner: cal
+      postInitApplicationSQL:
+        - CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+        - CREATE EXTENSION IF NOT EXISTS pg_trgm;
+  managed:
+    roles:
+      - name: cal
+        ensure: present
+        login: true
+        superuser: true
+        passwordSecret:
+          name: cal-pg-app
+  storage:
+    size: 10Gi
+---
+# Cal.diy secrets managed by the bootstrap Job below. Flux ensures the
+# Secret resource exists (ssa: merge prevents data wipeout); the bootstrap
+# Job populates NEXTAUTH_SECRET and CALENDSO_ENCRYPTION_KEY on first run
+# and is a no-op once both keys are present.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cal-secret
+  namespace: ssint-main-cal
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+# calcom-api-key: auto-managed by the cal-seed-users Job. Flux ensures the
+# resource exists (ssa: merge); the Job populates it on first deploy.
+# Hermes-msg reads this cross-namespace via its hermes-msg ServiceAccount.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: calcom-api-key
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+# Bootstrap Job: generates NEXTAUTH_SECRET and CALENDSO_ENCRYPTION_KEY in cal-secret
+# if they are not already set. Re-runs on each Flux reconcile but exits immediately
+# when the keys are already present (idempotent). Cleans up 10 minutes after success.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cal-secret-bootstrapper
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cal-secret-writer
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "patch"]
+    resourceNames: ["cal-secret", "calcom-api-key"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cal-secret-bootstrapper
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cal-secret-writer
+subjects:
+  - kind: ServiceAccount
+    name: cal-secret-bootstrapper
+    namespace: ssint-main-cal
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cal-secret-bootstrap
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: cal-secret-bootstrap
+        entity: ssint
+        env: main
+        capability: cal
+    spec:
+      serviceAccountName: cal-secret-bootstrapper
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              NS=ssint-main-cal
+              SECRET=cal-secret
+
+              # Collect values for any keys not yet present
+              NEXTAUTH_B64=""
+              CALENDSO_B64=""
+
+              VAL=$(kubectl get secret "$SECRET" -n "$NS" -o jsonpath='{.data.NEXTAUTH_SECRET}' 2>/dev/null || true)
+              if [ -z "$VAL" ]; then
+                NEXTAUTH_B64=$(cat /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 44 | base64 | tr -d '\n')
+                echo "Will set NEXTAUTH_SECRET"
+              fi
+
+              VAL=$(kubectl get secret "$SECRET" -n "$NS" -o jsonpath='{.data.CALENDSO_ENCRYPTION_KEY}' 2>/dev/null || true)
+              if [ -z "$VAL" ]; then
+                CALENDSO_B64=$(cat /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 32 | base64 | tr -d '\n')
+                echo "Will set CALENDSO_ENCRYPTION_KEY"
+              fi
+
+              if [ -z "$NEXTAUTH_B64" ] && [ -z "$CALENDSO_B64" ]; then
+                echo "cal-secret fully populated — nothing to do."
+                exit 0
+              fi
+
+              # Build patch JSON with only the missing keys
+              DATA="{"
+              SEP=""
+              [ -n "$NEXTAUTH_B64" ] && DATA="${DATA}${SEP}\"NEXTAUTH_SECRET\":\"${NEXTAUTH_B64}\"" && SEP=","
+              [ -n "$CALENDSO_B64" ] && DATA="${DATA}${SEP}\"CALENDSO_ENCRYPTION_KEY\":\"${CALENDSO_B64}\""
+              DATA="${DATA}}"
+
+              kubectl patch secret "$SECRET" -n "$NS" --type=merge -p "{\"data\":${DATA}}"
+              echo "cal-secret patched successfully."
+---
+# Read-only access for hermes-msg pods to fetch calcom-api-key at startup.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: calcom-api-key-reader
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames: ["calcom-api-key"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hermes-msg-cal-reader-main
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: calcom-api-key-reader
+subjects:
+  - kind: ServiceAccount
+    name: hermes-msg
+    namespace: ssint-main-msg
+---
+# User seed Job: creates three ADMIN accounts and the hermes-msg cal.com API key
+# on first deploy. Idempotent — user inserts use ON CONFLICT (email) DO NOTHING;
+# API key generation checks calcom-api-key before running.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cal-seed-users
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 8
+  template:
+    metadata:
+      labels:
+        app: cal-seed-users
+        entity: ssint
+        env: main
+        capability: cal
+    spec:
+      serviceAccountName: cal-secret-bootstrapper
+      restartPolicy: OnFailure
+      volumes:
+        - name: keyshare
+          emptyDir:
+            medium: Memory
+      initContainers:
+        - name: wait-for-db
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - until nc -z cal-pg-rw 5432; do echo "waiting for cal-pg-rw:5432"; sleep 2; done
+        - name: check-and-generate
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: keyshare
+              mountPath: /keyshare
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              VAL=$(kubectl get secret calcom-api-key -n ssint-main-cal \
+                -o jsonpath='{.data.api_key}' 2>/dev/null || true)
+              if [ -n "$VAL" ]; then
+                echo "calcom-api-key already populated — skipping key seed."
+                touch /keyshare/skip
+                exit 0
+              fi
+              KEY=$(cat /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 32)
+              printf '%s' "$KEY" > /keyshare/key
+              printf '%s' "$KEY" | base64 | tr -d '\n' > /keyshare/key_b64
+              echo "Generated new cal.com API key."
+      containers:
+        - name: seed
+          image: postgres:17-alpine
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: keyshare
+              mountPath: /keyshare
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: cal-pg-app
+                  key: uri
+          command:
+            - sh
+            - -c
+            - |
+              HASH='$2b$12$H8n6.mF6pwGOZ8qZADfjSOB2C7QVAWBIuEAO/uyO6h8c23/t1hkhO'
+              TL=/dev/termination-log
+              ERR=0
+              psql "$DATABASE_URL" -c "INSERT INTO users (uuid,username,name,email,role,\"emailVerified\",\"completedOnboarding\") VALUES (gen_random_uuid(),'dylan-evans','Dylan Evans','dylan.evans@simplesalt.company','ADMIN'::\"UserPermissionRole\",NOW(),true) ON CONFLICT (email) DO NOTHING" 2>>"$TL" || ERR=1
+              psql "$DATABASE_URL" -c "INSERT INTO \"UserPassword\" (\"userId\",hash) SELECT id,'${HASH}' FROM users WHERE email='dylan.evans@simplesalt.company' ON CONFLICT (\"userId\") DO NOTHING" 2>>"$TL" || ERR=1
+              psql "$DATABASE_URL" -c "INSERT INTO users (uuid,username,name,email,role,\"emailVerified\",\"completedOnboarding\") VALUES (gen_random_uuid(),'russell-rose','Russell Rose','russell.rose@simplesalt.company','ADMIN'::\"UserPermissionRole\",NOW(),true) ON CONFLICT (email) DO NOTHING" 2>>"$TL" || ERR=1
+              psql "$DATABASE_URL" -c "INSERT INTO \"UserPassword\" (\"userId\",hash) SELECT id,'${HASH}' FROM users WHERE email='russell.rose@simplesalt.company' ON CONFLICT (\"userId\") DO NOTHING" 2>>"$TL" || ERR=1
+              psql "$DATABASE_URL" -c "INSERT INTO users (uuid,username,name,email,role,\"emailVerified\",\"completedOnboarding\") VALUES (gen_random_uuid(),'admin-simplesalt','Admin','admin@simple-salt.com','ADMIN'::\"UserPermissionRole\",NOW(),true) ON CONFLICT (email) DO NOTHING" 2>>"$TL" || ERR=1
+              psql "$DATABASE_URL" -c "INSERT INTO \"UserPassword\" (\"userId\",hash) SELECT id,'${HASH}' FROM users WHERE email='admin@simple-salt.com' ON CONFLICT (\"userId\") DO NOTHING" 2>>"$TL" || ERR=1
+              if [ -f /keyshare/skip ]; then
+                echo "calcom-api-key already populated — skipping key seed." >> "$TL"
+                touch /keyshare/seed-done
+                exit $ERR
+              fi
+              if [ $ERR -ne 0 ]; then
+                echo "User inserts failed — skipping API key seed." >> "$TL"
+                exit $ERR
+              fi
+              KEY=$(cat /keyshare/key)
+              USER_ID=$(psql "$DATABASE_URL" -t -A \
+                -c "SELECT id FROM users WHERE email='dylan.evans@simplesalt.company' LIMIT 1" \
+                2>>"$TL")
+              if [ -z "$USER_ID" ]; then
+                echo "Admin user not found after inserts — unexpected, retrying." >> "$TL"
+                exit 1
+              fi
+              HASH_KEY=$(psql "$DATABASE_URL" -t -A \
+                -c "SELECT encode(sha256('${KEY}'::bytea), 'hex')" 2>>"$TL") || ERR=1
+              psql "$DATABASE_URL" \
+                -c "DELETE FROM \"ApiKey\" WHERE note='hermes-msg'" 2>>"$TL" || ERR=1
+              psql "$DATABASE_URL" \
+                -c "INSERT INTO \"ApiKey\" (id, \"userId\", \"hashedKey\", note, \"createdAt\") \
+                    VALUES (gen_random_uuid()::text, ${USER_ID}, '${HASH_KEY}', 'hermes-msg', NOW())" \
+                2>>"$TL" || ERR=1
+              if [ $ERR -eq 0 ]; then
+                touch /keyshare/seed-done
+                echo "ApiKey inserted for userId=${USER_ID}."
+              fi
+              exit $ERR
+        - name: patch-secret
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: keyshare
+              mountPath: /keyshare
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              until [ -f /keyshare/seed-done ] || [ -f /keyshare/skip ]; do
+                echo "Waiting for seed container..."; sleep 2
+              done
+              [ -f /keyshare/skip ] && echo "Skipping secret patch." && exit 0
+              KEY_B64=$(cat /keyshare/key_b64)
+              kubectl patch secret calcom-api-key -n ssint-main-cal \
+                --type=merge -p "{\"data\":{\"api_key\":\"${KEY_B64}\"}}"
+              echo "calcom-api-key patched in ssint-main-cal."
+---
+# Redis — ephemeral cache/queue for Cal.diy.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cal-redis
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cal-redis
+  template:
+    metadata:
+      labels:
+        app: cal-redis
+        entity: ssint
+        env: main
+        capability: cal
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: redis
+              containerPort: 6379
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cal-redis
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+spec:
+  selector:
+    app: cal-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+# Cal.diy — the scheduling application (Next.js + tRPC).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cal
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cal
+  template:
+    metadata:
+      labels:
+        app: cal
+        entity: ssint
+        env: main
+        capability: cal
+    spec:
+      initContainers:
+        - name: wait-for-db
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - until nc -z cal-pg-rw 5432; do echo "waiting for cal-pg-rw:5432"; sleep 2; done
+      containers:
+        - name: cal
+          image: calcom/cal.com:latest
+          imagePullPolicy: Always
+          env:
+            - name: DATABASE_HOST
+              value: cal-pg-rw
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: cal-pg-app
+                  key: uri
+            - name: DATABASE_DIRECT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: cal-pg-app
+                  key: uri
+            - name: NEXTAUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cal-secret
+                  key: NEXTAUTH_SECRET
+            - name: CALENDSO_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cal-secret
+                  key: CALENDSO_ENCRYPTION_KEY
+            - name: NEXT_PUBLIC_WEBAPP_URL
+              value: https://cal.famevans.win
+            - name: NEXTAUTH_URL
+              value: https://cal.famevans.win/api/auth
+            - name: CALCOM_TELEMETRY_DISABLED
+              value: "1"
+            - name: NODE_ENV
+              value: production
+          ports:
+            - name: http
+              containerPort: 3000
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cal
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+spec:
+  selector:
+    app: cal
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+---
+# TLS certificate for cal.famevans.win — issued by the famevans ClusterIssuer.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: cal-tls
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+spec:
+  secretName: cal-tls
+  issuerRef:
+    name: famevans
+    kind: ClusterIssuer
+  commonName: cal.famevans.win
+  dnsNames:
+    - cal.famevans.win
+---
+# Standard Ingress: anchors the cal.famevans.win DNS A record via k8s-gateway
+# and provides the catch-all route to the Cal.diy service.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cal
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - cal.famevans.win
+      secretName: cal-tls
+  rules:
+    - host: cal.famevans.win
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cal
+                port:
+                  number: 80
+---
+# Traefik IngressRoute routing cal.famevans.win to the Cal.diy backend.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: cal
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`cal.famevans.win`)
+      kind: Rule
+      services:
+        - name: cal
+          port: 80
+  tls:
+    secretName: cal-tls

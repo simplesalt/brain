@@ -16,7 +16,7 @@
 #   duxsoup-user-id:  user_id          (Remote Control URL user segment; operator-populated)
 #   quo-api-key:      api_key          (Quo API key; operator-populated)
 #   quo-from-number:  from_number      (E.164 outbound number; operator-populated)
-#   calcom-api-key:   api_key          (auto-managed by cal-seed-users Job; lives in ssint-named-cal)
+#   calcom-api-key:   api_key          (auto-managed by cal-seed-users Job; lives in ssint-main-cal)
 #
 # DWD prerequisite: hermes-agent-access@ already has Domain-wide Delegation enabled
 # in Google Admin Console with scopes:
@@ -33,7 +33,7 @@ metadata:
 ---
 # Secret placeholders — one secret string per object (operator-populated).
 # SSA merge ensures Flux never overwrites manually populated values.
-# calcom-api-key lives in ssint-named-cal (auto-managed by cal-seed-users Job);
+# calcom-api-key lives in ssint-main-cal (auto-managed by cal-seed-users Job);
 # fetched by the hermes-msg pod's fetch-calcom-key init container.
 #
 # kubectl patch secret google-dwd-key  -n ssint-main-msg --type=merge -p '{"stringData":{"private_key_b64":"<base64-pem>"}}'
@@ -166,7 +166,7 @@ data:
 
     const CALCOM_API_KEY = process.env.CALCOM_API_KEY ?? '';
     const CALCOM_BASE_URL = process.env.CALCOM_BASE_URL
-      ?? 'http://cal.ssint-named-cal.svc.cluster.local';
+      ?? 'http://cal.ssint-main-cal.svc.cluster.local';
 
     // ── Google JWT auth (DWD) ─────────────────────────────────────────────────
     // Same pattern as email-collector.mjs: crypto RSA-SHA256, no npm packages.
@@ -608,7 +608,7 @@ spec:
             - sh
             - -c
             - |
-              VAL=$(kubectl get secret calcom-api-key -n ssint-named-cal \
+              VAL=$(kubectl get secret calcom-api-key -n ssint-main-cal \
                 -o jsonpath='{.data.api_key}' 2>/dev/null || true)
               if [ -n "$VAL" ]; then
                 printf '%s' "$VAL" | base64 -d > /calcom-env/api_key
@@ -660,7 +660,7 @@ spec:
             - name: QUO_USER_ID
               value: ""
             - name: CALCOM_BASE_URL
-              value: http://cal.ssint-named-cal.svc.cluster.local
+              value: http://cal.ssint-main-cal.svc.cluster.local
             - name: GOOGLE_PRIVATE_KEY_B64
               valueFrom:
                 secretKeyRef:
