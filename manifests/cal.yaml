@@ -11,7 +11,8 @@
 #     deploy. Swap emptyDir for a PVC if durable Redis is later required.
 #   * SMTP is not configured.
 #   * Not exposed via Ingress. Internal-only (http://cal.ssint-main-cal.svc.cluster.local);
-#     will be surfaced via Cloudflare Access later (tracked in simplesalt/cloud-basis).
+#     will be surfaced at https://schedule.simplesalt.company via Cloudflare Access
+#     later (tracked in simplesalt/cloud-basis#1). App URLs already point there.
 #   * Secrets (NEXTAUTH_SECRET, CALENDSO_ENCRYPTION_KEY) are SSA-merge
 #     placeholders populated by the cal-secret-bootstrap Job on first deploy.
 #
@@ -498,9 +499,9 @@ spec:
                   name: cal-secret
                   key: CALENDSO_ENCRYPTION_KEY
             - name: NEXT_PUBLIC_WEBAPP_URL
-              value: https://cal.famevans.win
+              value: https://schedule.simplesalt.company
             - name: NEXTAUTH_URL
-              value: https://cal.famevans.win/api/auth
+              value: https://schedule.simplesalt.company/api/auth
             - name: CALCOM_TELEMETRY_DISABLED
               value: "1"
             - name: NODE_ENV
