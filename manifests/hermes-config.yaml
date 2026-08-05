@@ -7,11 +7,20 @@
 # (secretKeyRef) and may be referenced from this file with ${VAR} syntax.
 # Hermes fills defaults for any keys omitted here.
 
-# Inference: deepseek-v4-flash via OpenRouter. The API key is supplied to the
+# Inference: minimax-m2.7 via OpenRouter, with gpt-oss-120b as an automatic
+# fallback (see fallback_providers below). The API key is supplied to the
 # container as the OPENROUTER_API_KEY env var (GENERAL_API_LLM_API_KEY secret).
 model:
   provider: openrouter
-  default: deepseek/deepseek-v4-flash
+  default: minimax/minimax-m2.7
+
+# Fallback model chain (top-level key per the Hermes config schema, NOT nested
+# under model:). If the primary model above errors (rate limit / auth / downtime)
+# Hermes switches mid-session to the next provider:model pair. Both route through
+# OpenRouter, so the same OPENROUTER_API_KEY covers the fallback.
+fallback_providers:
+  - provider: openrouter
+    model: openai/gpt-oss-120b
 
 # Agent guidance. ${VAR} is substituted from the container env at load time, so
 # the real account id stays in the secret (only the placeholder lives here).

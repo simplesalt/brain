@@ -228,11 +228,16 @@ spec:
                 secretKeyRef:
                   name: gbrain-pg-app
                   key: uri
-            # Chat model: same provider/model as hindsight (gpt-oss-20b via
-            # OpenRouter). GBRAIN_CHAT_MODEL uses the `provider:modelId` format;
-            # `openrouter` is a first-class gbrain provider (src/core/ai/recipes/).
+            # Chat model: minimax-m2.7 via OpenRouter, with gpt-oss-120b as the
+            # fallback (GBRAIN_CHAT_FALLBACK_CHAIN below). GBRAIN_CHAT_MODEL uses
+            # the `provider:modelId` format; `openrouter` is a first-class gbrain
+            # provider (src/core/ai/recipes/).
             - name: GBRAIN_CHAT_MODEL
-              value: openrouter:openai/gpt-oss-20b
+              value: openrouter:minimax/minimax-m2.7
+            # Fallback chat model (maps to gbrain's chat_fallback_chain config
+            # field). Same OpenRouter key; used if the primary model errors.
+            - name: GBRAIN_CHAT_FALLBACK_CHAIN
+              value: openrouter:openai/gpt-oss-120b
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -355,7 +360,9 @@ spec:
                   name: gbrain-pg-app
                   key: uri
             - name: GBRAIN_CHAT_MODEL
-              value: openrouter:openai/gpt-oss-20b
+              value: openrouter:minimax/minimax-m2.7
+            - name: GBRAIN_CHAT_FALLBACK_CHAIN
+              value: openrouter:openai/gpt-oss-120b
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
