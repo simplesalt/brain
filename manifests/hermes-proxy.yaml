@@ -133,7 +133,7 @@ spec:
     spec:
       containers:
         - name: hermes-proxy
-          image: python:3.12-slim
+          image: python:3.12-alpine
           command: ["python", "/scripts/proxy.py"]
           ports:
             - name: http

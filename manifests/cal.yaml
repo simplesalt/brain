@@ -161,7 +161,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: bootstrap
-          image: bitnami/kubectl:latest
+          image: alpine/k8s:1.33.1
           imagePullPolicy: IfNotPresent
           command:
             - sh
@@ -269,14 +269,14 @@ spec:
             medium: Memory
       initContainers:
         - name: wait-for-db
-          image: busybox:1.36
+          image: postgres:17-alpine
           imagePullPolicy: IfNotPresent
           command:
             - sh
             - -c
-            - until nc -z cal-pg-rw 5432; do echo "waiting for cal-pg-rw:5432"; sleep 2; done
+            - until pg_isready -h cal-pg-rw -p 5432; do echo "waiting for cal-pg-rw:5432"; sleep 2; done
         - name: check-and-generate
-          image: bitnami/kubectl:latest
+          image: alpine/k8s:1.33.1
           imagePullPolicy: IfNotPresent
           volumeMounts:
             - name: keyshare
@@ -358,7 +358,7 @@ spec:
               fi
               exit $ERR
         - name: patch-secret
-          image: bitnami/kubectl:latest
+          image: alpine/k8s:1.33.1
           imagePullPolicy: IfNotPresent
           volumeMounts:
             - name: keyshare
@@ -466,11 +466,11 @@ spec:
     spec:
       initContainers:
         - name: wait-for-db
-          image: busybox:1.36
+          image: postgres:17-alpine
           command:
             - sh
             - -c
-            - until nc -z cal-pg-rw 5432; do echo "waiting for cal-pg-rw:5432"; sleep 2; done
+            - until pg_isready -h cal-pg-rw -p 5432; do echo "waiting for cal-pg-rw:5432"; sleep 2; done
       containers:
         - name: cal
           image: calcom/cal.com:latest
