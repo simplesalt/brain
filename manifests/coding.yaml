@@ -605,3 +605,245 @@ spec:
                     - path: namespace
                       fieldRef:
                         fieldPath: metadata.namespace
+---
+# claude-rc-basis — persistent Remote Control builder for the simplesalt/basis repo.
+# Follows the per-repo pattern: its OWN claude-oauth-basis Secret, plus
+# SA/Role/RoleBinding/PVC/Deployment with a -basis suffix. Shares the
+# namespace-wide gh-auth/cf-secret/cf-id Secrets and the claude-rc-skel-override
+# ConfigMap.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: claude-oauth-basis
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: claude-rc-basis
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: claude-rc-basis
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [claude-oauth-basis]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: claude-rc-basis
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+subjects:
+  - kind: ServiceAccount
+    name: claude-rc-basis
+    namespace: ssint-main-coding
+roleRef:
+  kind: Role
+  name: claude-rc-basis
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-conversations-basis
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-rc-basis
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: claude-rc-basis
+  template:
+    metadata:
+      labels:
+        app: claude-rc-basis
+        entity: ssint
+        env: main
+        capability: coding
+    spec:
+      serviceAccountName: claude-rc-basis
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 14400
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: claude-rc
+          image: ghcr.io/simplesalt/oci/builder-sb@sha256:5fbdd2a5c87839f2735e358b093110003b0b6053d738c52d24381ee4b2410c18
+          args: ["serve-rc"]
+          env:
+            - name: REPO_URL
+              value: https://github.com/simplesalt/basis.git
+            - name: REPO_REF
+              value: main
+            - name: RC_NAME
+              value: claude-rc-basis
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gh-auth
+                  key: GITHUB_TOKEN
+            - name: CLOUDFLARE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cf-secret
+                  key: CLOUDFLARE_API_TOKEN
+            - name: CLOUDFLARE_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cf-id
+                  key: CLOUDFLARE_ACCOUNT_ID
+            - name: CLAUDE_USER_ID
+              value: "7b9377f89ae4bcb5fb7a41309fc72a92964ad21c557533b7025c3a14182cc85f"
+            - name: CLAUDE_ACCOUNT_UUID
+              value: "cc3b20ca-6c2c-47ce-aba8-b5c88357b5c4"
+            - name: CLAUDE_ORG_UUID
+              value: "bc07d162-b95e-4078-a1c4-4a876a935fb2"
+            - name: CLAUDE_EMAIL
+              value: "dylan.evans@simplesalt.company"
+            - name: CLAUDE_ORG_ROLE
+              value: "admin"
+            - name: CLAUDE_ORG_TYPE
+              value: "claude_max"
+            - name: CLAUDE_ORG_RATE_TIER
+              value: "default_claude_max_20x"
+            - name: CLAUDE_ORG_NAME
+              value: "dylan.evans@simplesalt.company's Organization"
+            - name: CLAUDE_DISPLAY_NAME
+              value: "dylan"
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HINDSIGHT_API_URL
+              value: http://hindsight.ssint-main-ai:8888
+            - name: HINDSIGHT_BANK_ID
+              value: hermes
+            - name: HINDSIGHT_API_TOKEN
+              value: local
+          volumeMounts:
+            - name: claude-oauth
+              mountPath: /var/run/claude
+              readOnly: true
+            - name: claude-creds
+              mountPath: /home/coder/.claude
+            - name: claude-conversations
+              mountPath: /home/coder/.claude/projects
+            - name: claude-json-override
+              mountPath: /etc/claude-code/skel/.claude.json.tmpl
+              subPath: claude.json.tmpl
+              readOnly: true
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "kill -TERM 1; while kill -0 1 2>/dev/null; do sleep 2; done"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 4Gi
+            limits:
+              memory: 6Gi
+        - name: cred-rotator
+          image: ghcr.io/simplesalt/oci/cred-rotator@sha256:8f0c251bb7685b66a9d7d531f27fab2ab4ea96d2c1365a7f9d9f45d6b80ea97c
+          env:
+            - name: SECRET_NAME
+              value: claude-oauth-basis
+            - name: SECRET_NAMESPACE
+              value: ssint-main-coding
+          volumeMounts:
+            - name: claude-creds
+              mountPath: /var/run/claude-creds
+              readOnly: true
+            - name: kube-api-access-rotator
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+          resources:
+            requests:
+              cpu: "10m"
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: claude-oauth
+          secret:
+            secretName: claude-oauth-basis
+            optional: true
+            items:
+              - key: .credentials.json
+                path: .credentials.json
+        - name: claude-creds
+          emptyDir:
+            medium: Memory
+        - name: claude-conversations
+          persistentVolumeClaim:
+            claimName: claude-conversations-basis
+        - name: claude-json-override
+          configMap:
+            name: claude-rc-skel-override
+        - name: kube-api-access-rotator
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
