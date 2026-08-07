@@ -64,9 +64,8 @@ data:
     const DAILY        = join(DATA_DIR, 'daily');     // human/agent-readable markdown
     const RAW          = join(DATA_DIR, '.raw');
     const STATE_FILE   = join(DATA_DIR, 'state.json');
-    const WORK_EMAIL   = process.env.WORK_EMAIL ?? 'dylan.evans@simplesalt.company';
-    const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL
-      ?? 'hermes-agent-access@internalapps-481018.iam.gserviceaccount.com';
+    const WORK_EMAIL   = process.env.WORK_EMAIL ?? '';
+    const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL ?? '';
     const CALENDAR_ID  = process.env.CALENDAR_ID ?? 'primary';
     const DAYS_BACK    = Number(process.env.CAL_DAYS_BACK ?? 90);
     const DAYS_FWD     = Number(process.env.CAL_DAYS_FWD ?? 180);
@@ -208,6 +207,14 @@ data:
 
     async function sync() {
       const { privKey, kid } = loadPrivKey();
+      if (!WORK_EMAIL) {
+        console.error('FATAL: WORK_EMAIL must be set (google-dwd-key: impersonate_email)');
+        process.exit(1);
+      }
+      if (!CLIENT_EMAIL) {
+        console.error('FATAL: GOOGLE_CLIENT_EMAIL must be set (google-dwd-key: client_email)');
+        process.exit(1);
+      }
       const token = await getToken(privKey, kid, WORK_EMAIL);
 
       const now = Date.now();
@@ -441,6 +448,12 @@ data:
 
     async function diagnose() {
       const { privKey, kid } = loadPrivKey();
+      if (!CLIENT_EMAIL) {
+        console.error('FATAL: GOOGLE_CLIENT_EMAIL must be set (google-dwd-key: client_email)'); process.exit(1);
+      }
+      if (!WORK_EMAIL) {
+        console.error('FATAL: WORK_EMAIL must be set (google-dwd-key: impersonate_email)'); process.exit(1);
+      }
       console.log(`SA client email: ${CLIENT_EMAIL}`);
       console.log(`Impersonate:     ${WORK_EMAIL}`);
       console.log(`Calendar:        ${CALENDAR_ID}`);
@@ -501,8 +514,16 @@ spec:
               env:
                 - name: DATA_DIR
                   value: /data
+                # Impersonated work-account identity + service-account identity, from the
+                # google-dwd-key Secret (declared in email-collector.yaml, same namespace).
+                # optional: true → pod still schedules when unset; script exits 1 with a
+                # clear FATAL message.
                 - name: WORK_EMAIL
-                  value: dylan.evans@simplesalt.company
+                  valueFrom:
+                    secretKeyRef:
+                      name: google-dwd-key
+                      key: impersonate_email
+                      optional: true
                 - name: CALENDAR_ID
                   value: primary
                 - name: CAL_DAYS_BACK
@@ -510,7 +531,11 @@ spec:
                 - name: CAL_DAYS_FWD
                   value: "180"
                 - name: GOOGLE_CLIENT_EMAIL
-                  value: hermes-agent-access@internalapps-481018.iam.gserviceaccount.com
+                  valueFrom:
+                    secretKeyRef:
+                      name: google-dwd-key
+                      key: client_email
+                      optional: true
                 # gbrain MCP endpoint + inline bearer (matches gbrain + hermes Deployments).
                 - name: GBRAIN_MCP_URL
                   value: http://gbrain:3131/mcp

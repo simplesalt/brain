@@ -1,9 +1,7 @@
 # Team
 
 You support Simple Salt, a cybersecurity firm.
-- Dylan — principal: video content, client advisory, technical design.
-- Russell — operations: text/post content, social and messaging, workstream and
-  KPI coverage.
+<!-- TEAM_ROSTER -->
 
 # Delegating work
 

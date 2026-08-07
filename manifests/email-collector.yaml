@@ -10,9 +10,9 @@
 # workload's probe.
 #
 # PREREQUISITE (one-time, manual): In Google Admin Console → Security → API Controls
-# → Domain-wide Delegation, ensure the service account client-ID
-# (hermes-agent-access@internalapps-481018.iam.gserviceaccount.com) is authorized
-# with these scopes:
+# → Domain-wide Delegation, ensure the service account client-ID (the service
+# account configured via GOOGLE_CLIENT_EMAIL below, sourced from the google-dwd-key
+# Secret) is authorized with these scopes:
 #   https://mail.google.com/,
 #   https://www.googleapis.com/auth/drive,
 #   https://www.googleapis.com/auth/documents,
@@ -27,6 +27,27 @@
 # drive, etc.), which triggers Google's OAuth verification + CASA security audit
 # before production tokens are issued. Add a second account entry here once that
 # OAuth client + refresh token is obtained and stored in hermes-secrets.
+---
+# Holds the Google service-account identity used for Domain-wide Delegation:
+#   client_email       — the service-account's client email (iss claim of the DWD JWT)
+#   impersonate_email  — the work Google account being impersonated (sub claim)
+# Populated out-of-band (kept out of git). The ssa: merge annotation lets Flux own
+# the resource without clobbering the out-of-band value. Consumed via secretKeyRef
+# by email-collector.yaml (this file) and calendar-collector.yaml, both in this
+# namespace, as GOOGLE_CLIENT_EMAIL / WORK_EMAIL.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: google-dwd-key
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -72,9 +93,8 @@ data:
     const MESSAGES    = join(DATA_DIR, 'messages');
     const DIGESTS     = join(DATA_DIR, 'digests');
     const STATE_FILE  = join(DATA_DIR, 'state.json');
-    const WORK_EMAIL  = process.env.WORK_EMAIL ?? 'dylan.evans@simplesalt.company';
-    const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL
-      ?? 'hermes-agent-access@internalapps-481018.iam.gserviceaccount.com';
+    const WORK_EMAIL  = process.env.WORK_EMAIL ?? '';
+    const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL ?? '';
 
     // ---------- gbrain ingestion config ----------
     const INGESTED_FILE = join(DATA_DIR, 'ingested.json');
@@ -209,6 +229,14 @@ data:
 
       if (!privKey) {
         console.error('FATAL: GOOGLE_PRIVATE_KEY_B64 (or GOOGLE_PRIVATE_KEY) must be set');
+        process.exit(1);
+      }
+      if (!WORK_EMAIL) {
+        console.error('FATAL: WORK_EMAIL must be set (google-dwd-key: impersonate_email)');
+        process.exit(1);
+      }
+      if (!CLIENT_EMAIL) {
+        console.error('FATAL: GOOGLE_CLIENT_EMAIL must be set (google-dwd-key: client_email)');
         process.exit(1);
       }
 
@@ -513,6 +541,12 @@ data:
       if (!privKey) {
         console.error('FATAL: GOOGLE_PRIVATE_KEY_B64 not set'); process.exit(1);
       }
+      if (!CLIENT_EMAIL) {
+        console.error('FATAL: GOOGLE_CLIENT_EMAIL must be set (google-dwd-key: client_email)'); process.exit(1);
+      }
+      if (!WORK_EMAIL) {
+        console.error('FATAL: WORK_EMAIL must be set (google-dwd-key: impersonate_email)'); process.exit(1);
+      }
       console.log(`SA client email: ${CLIENT_EMAIL}`);
       console.log(`Private key ID:  ${kid}`);
       console.log(`Impersonate:     ${WORK_EMAIL}`);
@@ -606,8 +640,15 @@ spec:
               env:
                 - name: DATA_DIR
                   value: /data
+                # Impersonated work-account identity, from the google-dwd-key Secret
+                # (declared above in this file). optional: true → pod still schedules
+                # when unset; script exits 1 with a clear FATAL message.
                 - name: WORK_EMAIL
-                  value: dylan.evans@simplesalt.company
+                  valueFrom:
+                    secretKeyRef:
+                      name: google-dwd-key
+                      key: impersonate_email
+                      optional: true
                 # gbrain MCP endpoint + bearer for the enrich step. The token is an inline
                 # literal (matches the gbrain + hermes Deployments); the only security
                 # boundary is the in-cluster network, and the sent bearer and the
@@ -616,9 +657,13 @@ spec:
                   value: http://gbrain:3131/mcp
                 - name: GBRAIN_REMOTE_TOKEN
                   value: "gbrain-mcp"
-                # Service-account identity (not secret — it's a public identifier).
+                # Service-account identity, from the google-dwd-key Secret.
                 - name: GOOGLE_CLIENT_EMAIL
-                  value: hermes-agent-access@internalapps-481018.iam.gserviceaccount.com
+                  valueFrom:
+                    secretKeyRef:
+                      name: google-dwd-key
+                      key: client_email
+                      optional: true
                 # Private key from hermes-secrets (same keys the seed-google-token init uses).
                 # optional: true → pod still schedules when keys are absent; script exits 1 with
                 # a clear FATAL message so the Job history shows why it failed.

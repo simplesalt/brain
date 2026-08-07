@@ -11,6 +11,8 @@
 #
 # Secrets (all optional: pod starts even if absent, tools return clear error):
 #   google-dwd-key:   private_key_b64  (base64-encoded PEM private key; operator-populated)
+#   google-dwd-key:   client_email       (service-account client email; operator-populated)
+#   google-dwd-key:   impersonate_email  (work Google account being impersonated; operator-populated)
 #   google-private-key-id: private_key_id  (DWD JWT kid field; operator-populated)
 #   duxsoup-api-key:  api_key          (Remote Control auth key; operator-populated)
 #   duxsoup-user-id:  user_id          (Remote Control URL user segment; operator-populated)
@@ -37,6 +39,8 @@ metadata:
 # fetched by the hermes-msg pod's fetch-calcom-key init container.
 #
 # kubectl patch secret google-dwd-key  -n ssint-main-msg --type=merge -p '{"stringData":{"private_key_b64":"<base64-pem>"}}'
+# kubectl patch secret google-dwd-key  -n ssint-main-msg --type=merge -p '{"stringData":{"client_email":"<service-account-client-email>"}}'
+# kubectl patch secret google-dwd-key  -n ssint-main-msg --type=merge -p '{"stringData":{"impersonate_email":"<work-account-email-to-impersonate>"}}'
 # kubectl patch secret duxsoup-api-key -n ssint-main-msg --type=merge -p '{"stringData":{"api_key":"<remote-control-auth-key>"}}'
 # kubectl patch secret duxsoup-user-id -n ssint-main-msg --type=merge -p '{"stringData":{"user_id":"<user-id-from-remote-control-url>"}}'
 # kubectl patch secret quo-api-key     -n ssint-main-msg --type=merge -p '{"stringData":{"api_key":"<quo-api-key>"}}'
@@ -151,8 +155,7 @@ data:
 
     // ── Config ────────────────────────────────────────────────────────────────
     const PORT = Number(process.env.PORT ?? 8080);
-    const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL
-      ?? 'hermes-agent-access@internalapps-481018.iam.gserviceaccount.com';
+    const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL ?? '';
     const DEFAULT_IMPERSONATE = process.env.GOOGLE_IMPERSONATE_EMAIL ?? '';
     const EMAIL_SIG_BLOCK = process.env.EMAIL_SIG_BLOCK ?? '';
 
@@ -190,6 +193,7 @@ data:
       const sub = impersonate || DEFAULT_IMPERSONATE;
       if (!sub) throw new Error('GOOGLE_IMPERSONATE_EMAIL not configured');
       if (!_privKey) throw new Error('GOOGLE_PRIVATE_KEY_B64 not configured');
+      if (!CLIENT_EMAIL) throw new Error('GOOGLE_CLIENT_EMAIL not configured');
       const cached = _tokenCache.get(sub);
       if (cached && Date.now() < cached.expiresAt) return cached.token;
       const now = Math.floor(Date.now() / 1000);
@@ -632,9 +636,17 @@ spec:
               containerPort: 8080
           env:
             - name: GOOGLE_CLIENT_EMAIL
-              value: hermes-agent-access@internalapps-481018.iam.gserviceaccount.com
+              valueFrom:
+                secretKeyRef:
+                  name: google-dwd-key
+                  key: client_email
+                  optional: true
             - name: GOOGLE_IMPERSONATE_EMAIL
-              value: dylan.evans@simplesalt.company
+              valueFrom:
+                secretKeyRef:
+                  name: google-dwd-key
+                  key: impersonate_email
+                  optional: true
             - name: EMAIL_SIG_BLOCK
               value: ""
             - name: GOOGLE_PRIVATE_KEY_ID

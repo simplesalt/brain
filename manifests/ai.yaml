@@ -20,6 +20,38 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
+# Team roster, populated out-of-band (never committed to git — see AGENTS.md
+# for why). Single key, roster.json, an array of objects with this schema:
+#   [
+#     {
+#       "username": "<slug>",
+#       "name": "<Full Name>",
+#       "display_name": "<First Name>",
+#       "email": "<email>",
+#       "role": "<role-title, e.g. principal>",
+#       "description": "<short description, or null>",
+#       "admin": true,
+#       "apiKeyOwner": false
+#     }
+#   ]
+# This schema is shared with the independently-populated team-roster Secret
+# in cal.yaml (namespace ssint-main-cal) — keep both in sync if the shape
+# changes. The seed-hermes-config init container below only reads
+# display_name/role/description (used to render the AGENTS.md team roster);
+# username/email/admin/apiKeyOwner are for the cal.yaml consumer.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: team-roster
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
 # Persistent home for the hermes-agent (UID 10000). Stores session history,
 # kanban SQLite DB, skills, logs, and installed CLI binaries (claude, gh).
 # Init containers overwrite git-managed files (config.yaml, gh auth, .bashrc)
@@ -693,8 +725,54 @@ spec:
               #     <cwd>/AGENTS.md (cwd only, no git-root walk); the gateway cwd
               #     is pinned to /opt/data via the HERMES_ORIG_CWD env var below so
               #     this is found.
-              cp /seed/SOUL.md   /opt/data/SOUL.md
-              cp /seed/AGENTS.md /opt/data/AGENTS.md
+              cp /seed/SOUL.md /opt/data/SOUL.md
+
+              # AGENTS.md's "# Team" section carries a <!-- TEAM_ROSTER -->
+              # marker (no real names in git — see team-roster Secret above).
+              # Render it from roster.json if the Secret is mounted/populated;
+              # otherwise substitute a placeholder line. Never crash the init
+              # container over this — a missing/bad roster must still let the
+              # pod reach Ready, so failures fall back to a raw seed copy.
+              python3 -c '
+              import json, sys
+
+              agents_path = "/seed/AGENTS.md"
+              roster_path = "/secrets/team-roster/roster.json"
+              out_path = "/opt/data/AGENTS.md"
+              marker = "<!-- TEAM_ROSTER -->"
+              fallback = "(team roster unavailable — see team-roster Secret in ssint-main-ai)"
+
+              with open(agents_path) as f:
+                  content = f.read()
+
+              lines = []
+              try:
+                  with open(roster_path) as f:
+                      roster = json.load(f)
+                  if not isinstance(roster, list):
+                      raise ValueError("roster.json is not a JSON array")
+                  for entry in roster:
+                      if not isinstance(entry, dict):
+                          continue
+                      desc = entry.get("description")
+                      if not desc:
+                          continue
+                      display_name = entry.get("display_name") or ""
+                      role = entry.get("role") or ""
+                      desc = desc if desc.rstrip().endswith(".") else desc.rstrip() + "."
+                      lines.append("- %s — %s: %s" % (display_name, role, desc))
+              except FileNotFoundError:
+                  print("WARN: team-roster Secret not mounted/populated (roster.json missing); using placeholder", file=sys.stderr)
+              except (json.JSONDecodeError, ValueError) as e:
+                  print("WARN: team-roster roster.json invalid (%s); using placeholder" % e, file=sys.stderr)
+
+              rendered = "\n".join(lines) if lines else fallback
+              content = content.replace(marker, rendered)
+
+              with open(out_path, "w") as f:
+                  f.write(content)
+              print("rendered: team roster substituted into AGENTS.md")
+              ' || { echo "FATAL: AGENTS.md roster render failed, falling back to raw seed copy" >&2; cp /seed/AGENTS.md /opt/data/AGENTS.md; }
               chown 10000:10000 /opt/data/SOUL.md /opt/data/AGENTS.md
               chmod 644 /opt/data/SOUL.md /opt/data/AGENTS.md
 
@@ -766,6 +844,12 @@ spec:
             # tmpfs target for the provider-credential .env (see above).
             - name: secret-env
               mountPath: /run/secret-env
+            # Team roster (see team-roster Secret above). optional: true at the
+            # volume level means this mounts as an empty dir with no roster.json
+            # if the Secret is absent/unpopulated — handled gracefully below.
+            - name: team-roster
+              mountPath: /secrets/team-roster
+              readOnly: true
       containers:
         - name: hermes-agent
           # Tracks :latest with the digest pinned in git and auto-bumped by
@@ -865,7 +949,11 @@ spec:
             # dashboard binds and the pod goes Ready; it is still intended to be
             # fronted by Cloudflare Zero Trust.
             # TODO(harden): move HERMES_DASHBOARD_BASIC_AUTH_PASSWORD to a
-            # hermes-secrets key (sealed) instead of this temporary literal.
+            # hermes-secrets key (sealed) instead of this literal. Real access
+            # control for the dashboard is Cloudflare Zero Trust in front of
+            # it; this password only satisfies the image's "must have basic
+            # auth to bind 0.0.0.0" requirement, so the repo's standard dummy
+            # value (NotARealSecret-1) is used below.
             - name: HERMES_DASHBOARD
               value: "1"
             - name: HERMES_DASHBOARD_HOST
@@ -879,7 +967,7 @@ spec:
             - name: HERMES_DASHBOARD_BASIC_AUTH_USERNAME
               value: hermes
             - name: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
-              value: "changeme-temp-9119"
+              value: "NotARealSecret-1"
             # API server: OpenAI-compatible endpoint exposed by the gateway,
             # bearer-auth gated. Bind 0.0.0.0 so it is reachable in-cluster (the
             # default is 127.0.0.1). The bearer token lives in hermes-secrets
@@ -995,6 +1083,13 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 1Mi
+        # Team roster (see team-roster Secret above). optional: true so the pod
+        # still mounts (as an empty dir) and reaches Ready even if the Secret
+        # is missing or not yet populated out-of-band.
+        - name: team-roster
+          secret:
+            secretName: team-roster
+            optional: true
         # Email collector data (digests, messages JSON, state). Written by the
         # email-collector CronJob; read-only here. Separate PVC so the collector
         # can be paused/deleted without touching the hermes-home PVC.

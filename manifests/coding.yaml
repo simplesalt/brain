@@ -95,6 +95,36 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
+# Identity metadata for the Anthropic account these coding pods authenticate
+# as (user id, account/org UUIDs, email, org display name, display name).
+# Shared across all claude-rc-<repo> Deployments in this namespace. Populated
+# OUT-OF-BAND (kubectl) — never committed to git. The ssa: merge annotation
+# lets Flux own the resource without clobbering the out-of-band values.
+# Consumed via secretKeyRef (optional: true) as CLAUDE_USER_ID,
+# CLAUDE_ACCOUNT_UUID, CLAUDE_ORG_UUID, CLAUDE_EMAIL, CLAUDE_ORG_NAME,
+# CLAUDE_DISPLAY_NAME.
+#
+# kubectl create secret generic claude-identity -n ssint-main-coding \
+#   --from-literal=CLAUDE_USER_ID=<user-id> \
+#   --from-literal=CLAUDE_ACCOUNT_UUID=<account-uuid> \
+#   --from-literal=CLAUDE_ORG_UUID=<org-uuid> \
+#   --from-literal=CLAUDE_EMAIL=<email> \
+#   --from-literal=CLAUDE_ORG_NAME=<org-name> \
+#   --from-literal=CLAUDE_DISPLAY_NAME=<display-name> \
+#   --dry-run=client -o yaml | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: claude-identity
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
 # Skel override shared by the claude-rc-<repo> Deployments: injects extra MCP
 # servers into the Claude Code config without rebuilding the image. entrypoint.sh
 # does `cp -a /etc/claude-code/skel/. $HOME/` on every boot, so mounting a
@@ -258,13 +288,29 @@ spec:
                   name: cf-id
                   key: CLOUDFLARE_ACCOUNT_ID
             - name: CLAUDE_USER_ID
-              value: "7b9377f89ae4bcb5fb7a41309fc72a92964ad21c557533b7025c3a14182cc85f"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_USER_ID
+                  optional: true
             - name: CLAUDE_ACCOUNT_UUID
-              value: "cc3b20ca-6c2c-47ce-aba8-b5c88357b5c4"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_ACCOUNT_UUID
+                  optional: true
             - name: CLAUDE_ORG_UUID
-              value: "bc07d162-b95e-4078-a1c4-4a876a935fb2"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_ORG_UUID
+                  optional: true
             - name: CLAUDE_EMAIL
-              value: "dylan.evans@simplesalt.company"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_EMAIL
+                  optional: true
             - name: CLAUDE_ORG_ROLE
               value: "admin"
             - name: CLAUDE_ORG_TYPE
@@ -272,9 +318,17 @@ spec:
             - name: CLAUDE_ORG_RATE_TIER
               value: "default_claude_max_20x"
             - name: CLAUDE_ORG_NAME
-              value: "dylan.evans@simplesalt.company's Organization"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_ORG_NAME
+                  optional: true
             - name: CLAUDE_DISPLAY_NAME
-              value: "dylan"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_DISPLAY_NAME
+                  optional: true
             - name: NAMESPACE
               valueFrom:
                 fieldRef:
@@ -500,13 +554,29 @@ spec:
                   name: cf-id
                   key: CLOUDFLARE_ACCOUNT_ID
             - name: CLAUDE_USER_ID
-              value: "7b9377f89ae4bcb5fb7a41309fc72a92964ad21c557533b7025c3a14182cc85f"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_USER_ID
+                  optional: true
             - name: CLAUDE_ACCOUNT_UUID
-              value: "cc3b20ca-6c2c-47ce-aba8-b5c88357b5c4"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_ACCOUNT_UUID
+                  optional: true
             - name: CLAUDE_ORG_UUID
-              value: "bc07d162-b95e-4078-a1c4-4a876a935fb2"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_ORG_UUID
+                  optional: true
             - name: CLAUDE_EMAIL
-              value: "dylan.evans@simplesalt.company"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_EMAIL
+                  optional: true
             - name: CLAUDE_ORG_ROLE
               value: "admin"
             - name: CLAUDE_ORG_TYPE
@@ -514,9 +584,17 @@ spec:
             - name: CLAUDE_ORG_RATE_TIER
               value: "default_claude_max_20x"
             - name: CLAUDE_ORG_NAME
-              value: "dylan.evans@simplesalt.company's Organization"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_ORG_NAME
+                  optional: true
             - name: CLAUDE_DISPLAY_NAME
-              value: "dylan"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_DISPLAY_NAME
+                  optional: true
             - name: NAMESPACE
               valueFrom:
                 fieldRef:
@@ -742,13 +820,29 @@ spec:
                   name: cf-id
                   key: CLOUDFLARE_ACCOUNT_ID
             - name: CLAUDE_USER_ID
-              value: "7b9377f89ae4bcb5fb7a41309fc72a92964ad21c557533b7025c3a14182cc85f"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_USER_ID
+                  optional: true
             - name: CLAUDE_ACCOUNT_UUID
-              value: "cc3b20ca-6c2c-47ce-aba8-b5c88357b5c4"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_ACCOUNT_UUID
+                  optional: true
             - name: CLAUDE_ORG_UUID
-              value: "bc07d162-b95e-4078-a1c4-4a876a935fb2"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_ORG_UUID
+                  optional: true
             - name: CLAUDE_EMAIL
-              value: "dylan.evans@simplesalt.company"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_EMAIL
+                  optional: true
             - name: CLAUDE_ORG_ROLE
               value: "admin"
             - name: CLAUDE_ORG_TYPE
@@ -756,9 +850,17 @@ spec:
             - name: CLAUDE_ORG_RATE_TIER
               value: "default_claude_max_20x"
             - name: CLAUDE_ORG_NAME
-              value: "dylan.evans@simplesalt.company's Organization"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_ORG_NAME
+                  optional: true
             - name: CLAUDE_DISPLAY_NAME
-              value: "dylan"
+              valueFrom:
+                secretKeyRef:
+                  name: claude-identity
+                  key: CLAUDE_DISPLAY_NAME
+                  optional: true
             - name: NAMESPACE
               valueFrom:
                 fieldRef:

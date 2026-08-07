@@ -236,9 +236,51 @@ subjects:
     name: hermes-msg
     namespace: ssint-main-msg
 ---
-# User seed Job: creates three ADMIN accounts and the hermes-msg cal.com API key
-# on first deploy. Idempotent — user inserts use ON CONFLICT (email) DO NOTHING;
-# API key generation checks calcom-api-key before running.
+# team-roster: populated out-of-band (never committed) with the roster of
+# accounts to seed as Cal.diy admins. Consumed by the render-roster-sql init
+# container in the cal-seed-users Job below, mounted read-only as
+# /secrets/roster.json. The consuming Secret volume is optional: true, so a
+# missing/absent Secret does not block the Job — it just seeds no users.
+#
+# roster.json schema: a JSON array of objects, one per teammate to seed:
+#   [
+#     {
+#       "username": "<slug>",
+#       "name": "<Full Name>",
+#       "display_name": "<First Name>",
+#       "email": "<email>",
+#       "role": "<role-title, e.g. principal>",
+#       "description": "<short description, or null>",
+#       "admin": true,
+#       "apiKeyOwner": false
+#     }
+#   ]
+#
+# - Entries with "admin": true are seeded into Cal.diy as UserPermissionRole.ADMIN.
+# - Exactly one entry in the array must have "apiKeyOwner": true — that entry's
+#   email owns the hermes-msg cal.com API key seeded by this Job. A non-empty
+#   roster with zero or more than one apiKeyOwner renders no seed at all (see
+#   render-roster-sql below).
+# - This exact schema is shared with a separate "team-roster" Secret declared
+#   independently in manifests/ai.yaml (different namespace, populated
+#   separately, same shape). Keep the two in sync if the schema ever changes.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: team-roster
+  namespace: ssint-main-cal
+  labels:
+    entity: ssint
+    env: main
+    capability: cal
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+# User seed Job: seeds ADMIN accounts from the team-roster Secret above and
+# creates the hermes-msg cal.com API key on first deploy. Idempotent — user
+# inserts use ON CONFLICT (email) DO NOTHING; API key generation checks
+# calcom-api-key before running.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -267,6 +309,10 @@ spec:
         - name: keyshare
           emptyDir:
             medium: Memory
+        - name: team-roster
+          secret:
+            secretName: team-roster
+            optional: true
       initContainers:
         - name: wait-for-db
           image: postgres:17-alpine
@@ -297,6 +343,76 @@ spec:
               printf '%s' "$KEY" > /keyshare/key
               printf '%s' "$KEY" | base64 | tr -d '\n' > /keyshare/key_b64
               echo "Generated new cal.com API key."
+        - name: render-roster-sql
+          image: alpine/k8s:1.33.1
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: keyshare
+              mountPath: /keyshare
+            - name: team-roster
+              mountPath: /secrets
+              readOnly: true
+          command:
+            - sh
+            - -c
+            - |
+              # Renders /keyshare/seed-users.sql from the team-roster Secret
+              # (mounted at /secrets/roster.json). Never crash-loops the Job on
+              # malformed/missing input — any failure mode below degrades to an
+              # empty (no-op) seed file plus a stderr note, not a non-zero exit.
+              ROSTER=/secrets/roster.json
+              OUT=/keyshare/seed-users.sql
+              APIKEY_OUT=/keyshare/apikey-owner-email
+              : > "$OUT"
+              : > "$APIKEY_OUT"
+
+              if [ ! -s "$ROSTER" ]; then
+                echo "team-roster Secret missing or roster.json empty — rendering no-op seed (no users)." >&2
+                exit 0
+              fi
+
+              if ! jq -e 'type == "array"' "$ROSTER" >/dev/null 2>&1; then
+                echo "roster.json is not valid JSON / not an array — rendering no-op seed (no users)." >&2
+                exit 0
+              fi
+
+              COUNT=$(jq 'length' "$ROSTER")
+              if [ "$COUNT" -eq 0 ]; then
+                echo "roster.json is an empty array — nothing to seed." >&2
+                exit 0
+              fi
+
+              APIKEY_COUNT=$(jq '[.[] | select(.apiKeyOwner == true)] | length' "$ROSTER")
+              if [ "$APIKEY_COUNT" -ne 1 ]; then
+                echo "roster.json must have exactly one entry with apiKeyOwner: true (found ${APIKEY_COUNT}) — rendering no-op seed." >&2
+                exit 0
+              fi
+
+              # bcrypt(cost=12) of the standard dummy password "NotARealSecret-1" —
+              # see the comment above HASH= in the seed container for rationale.
+              HASH='$2b$12$.XgGly58H5r5xg3YTMO/v.kIGuZbfvQx/UpsGWGrgpb5TCDhf3cZa'
+
+              # '"'"' below is the POSIX-sh trick for embedding a literal single
+              # quote inside a single-quoted string (close quote, double-quoted
+              # quote char, reopen quote) — needed because the jq program itself
+              # (below) must build single-quoted SQL string literals while living
+              # inside this script's own single-quoted jq argument. esc doubles
+              # any embedded quote for SQL-safe string literals (defense in depth
+              # — roster.json is operator-populated, not attacker-controlled, but
+              # escape anyway).
+              jq -r --arg hash "$HASH" '
+                def esc: gsub("'"'"'"; "'"'"''"'"'");
+                .[] | select(.admin == true) |
+                (.username | esc) as $u |
+                (.name | esc) as $n |
+                (.email | esc) as $e |
+                "INSERT INTO users (uuid,username,name,email,role,\"emailVerified\",\"completedOnboarding\") VALUES (gen_random_uuid(),'"'"'" + $u + "'"'"','"'"'" + $n + "'"'"','"'"'" + $e + "'"'"','"'"'ADMIN'"'"'::\"UserPermissionRole\",NOW(),true) ON CONFLICT (email) DO NOTHING;\n" +
+                "INSERT INTO \"UserPassword\" (\"userId\",hash) SELECT id,'"'"'" + $hash + "'"'"' FROM users WHERE email='"'"'" + $e + "'"'"' ON CONFLICT (\"userId\") DO NOTHING;"
+              ' "$ROSTER" > "$OUT"
+
+              jq -r '[.[] | select(.apiKeyOwner == true)][0].email | gsub("'"'"'"; "'"'"''"'"'")' "$ROSTER" > "$APIKEY_OUT"
+
+              echo "Rendered seed SQL for $(jq '[.[] | select(.admin == true)] | length' "$ROSTER") admin user(s)."
       containers:
         - name: seed
           image: postgres:17-alpine
@@ -314,19 +430,25 @@ spec:
             - sh
             - -c
             - |
-              # Dummy bcrypt hash for the local-login password "dummy" (bcrypt, cost 12).
-              # This is intentionally a throwaway password: the whole auth story needs to be
-              # moved to CASB / Cloudflare Access anyway. It only exists to bypass Cal.com's
-              # local-login requirement if the user doesn't want to pay for SSO licensing.
-              HASH='$2b$12$VKvZJWh0icenTgrXTU.rEuXUb27FJ4mOfDx0dxTU489IeoZUfhLLa'
+              # Dummy password for every account seeded by this Job: the repo-wide
+              # standard placeholder "NotARealSecret-1" (real access control for this
+              # app is Cloudflare Zero Trust / CASB, not Cal.com local-login — this
+              # password only exists to satisfy Cal.com's local-login requirement when
+              # SSO licensing isn't in use).
+              #
+              # HASH is bcrypt(cost=12) of "NotARealSecret-1", pre-generated and
+              # verified (bcrypt.checkpw(b'NotARealSecret-1', HASH) == True) — never
+              # hand-invent a hash, always generate and verify one properly.
+              #
+              # ON CONFLICT ("userId") DO NOTHING (in /keyshare/seed-users.sql, from
+              # the render-roster-sql init container) means this HASH only takes effect
+              # for newly-seeded rows: accounts already seeded under the OLD dummy hash
+              # keep it. Resetting already-seeded accounts to the new dummy password is
+              # accepted future work, out of scope for this Job.
+              HASH='$2b$12$.XgGly58H5r5xg3YTMO/v.kIGuZbfvQx/UpsGWGrgpb5TCDhf3cZa'
               TL=/dev/termination-log
               ERR=0
-              psql "$DATABASE_URL" -c "INSERT INTO users (uuid,username,name,email,role,\"emailVerified\",\"completedOnboarding\") VALUES (gen_random_uuid(),'dylan-evans','Dylan Evans','dylan.evans@simplesalt.company','ADMIN'::\"UserPermissionRole\",NOW(),true) ON CONFLICT (email) DO NOTHING" 2>>"$TL" || ERR=1
-              psql "$DATABASE_URL" -c "INSERT INTO \"UserPassword\" (\"userId\",hash) SELECT id,'${HASH}' FROM users WHERE email='dylan.evans@simplesalt.company' ON CONFLICT (\"userId\") DO NOTHING" 2>>"$TL" || ERR=1
-              psql "$DATABASE_URL" -c "INSERT INTO users (uuid,username,name,email,role,\"emailVerified\",\"completedOnboarding\") VALUES (gen_random_uuid(),'russell-rose','Russell Rose','russell.rose@simplesalt.company','ADMIN'::\"UserPermissionRole\",NOW(),true) ON CONFLICT (email) DO NOTHING" 2>>"$TL" || ERR=1
-              psql "$DATABASE_URL" -c "INSERT INTO \"UserPassword\" (\"userId\",hash) SELECT id,'${HASH}' FROM users WHERE email='russell.rose@simplesalt.company' ON CONFLICT (\"userId\") DO NOTHING" 2>>"$TL" || ERR=1
-              psql "$DATABASE_URL" -c "INSERT INTO users (uuid,username,name,email,role,\"emailVerified\",\"completedOnboarding\") VALUES (gen_random_uuid(),'admin-simplesalt','Admin','admin@simple-salt.com','ADMIN'::\"UserPermissionRole\",NOW(),true) ON CONFLICT (email) DO NOTHING" 2>>"$TL" || ERR=1
-              psql "$DATABASE_URL" -c "INSERT INTO \"UserPassword\" (\"userId\",hash) SELECT id,'${HASH}' FROM users WHERE email='admin@simple-salt.com' ON CONFLICT (\"userId\") DO NOTHING" 2>>"$TL" || ERR=1
+              psql "$DATABASE_URL" -f /keyshare/seed-users.sql 2>>"$TL" || ERR=1
               if [ -f /keyshare/skip ]; then
                 echo "calcom-api-key already populated — skipping key seed." >> "$TL"
                 touch /keyshare/seed-done
@@ -337,11 +459,17 @@ spec:
                 exit $ERR
               fi
               KEY=$(cat /keyshare/key)
+              APIKEY_OWNER_EMAIL=$(cat /keyshare/apikey-owner-email 2>/dev/null || true)
+              if [ -z "$APIKEY_OWNER_EMAIL" ]; then
+                echo "No apiKeyOwner in team-roster (empty/malformed roster) — skipping API key seed." >> "$TL"
+                touch /keyshare/seed-done
+                exit $ERR
+              fi
               USER_ID=$(psql "$DATABASE_URL" -t -A \
-                -c "SELECT id FROM users WHERE email='dylan.evans@simplesalt.company' LIMIT 1" \
+                -c "SELECT id FROM users WHERE email='${APIKEY_OWNER_EMAIL}' LIMIT 1" \
                 2>>"$TL")
               if [ -z "$USER_ID" ]; then
-                echo "Admin user not found after inserts — unexpected, retrying." >> "$TL"
+                echo "apiKeyOwner user not found after inserts — unexpected, retrying." >> "$TL"
                 exit 1
               fi
               HASH_KEY=$(psql "$DATABASE_URL" -t -A \
