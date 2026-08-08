@@ -1,0 +1,121 @@
+# GCP resources supporting Cloudflare SSO integration for the ssint-main account.
+# Migrated from simplesalt/base-stack (3.infra/gcp.yaml, 3.infra/gcp-cloudflare-sso.yaml)
+# per simplesalt/projects#111 — GCP project internalapps-481018 is SimpleSalt's
+# proprietary project ID and doesn't belong in a generic infra layer. Nothing else
+# in base-stack referenced the gcp-default ProviderConfig, so it and its two
+# consumers move here together as one unit.
+#
+# Enables the Admin SDK API (required for SCIM directory sync), provisions
+# a dedicated service account, and generates a key that Crossplane writes
+# automatically to the cloudflare-sso-agent-key Secret in crossplane-system.
+#
+# Domain-wide delegation for cloudflare-sso-agent must be configured out-of-band
+# in the Google Workspace Admin console before SCIM can be activated.
+#
+# gcp-credentials is populated out-of-band: patch the JSON SA key directly into
+# the `credentials` key (there is no assembler Job — it was removed as redundant
+# indirection). ssa:merge ensures Flux creates the object but never overwrites
+# the patched value:
+#   kubectl patch secret gcp-credentials -n crossplane-system --type=merge \
+#     -p "{\"data\":{\"credentials\":\"$(base64 -w0 key.json)\"}}"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gcp-credentials
+  namespace: crossplane-system
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+
+---
+apiVersion: gcp.upbound.io/v1beta1
+kind: ProviderConfig
+metadata:
+  name: gcp-default
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+spec:
+  # Matches the loaded SA key (hermes-agent-access@internalapps-481018).
+  projectID: internalapps-481018
+  credentials:
+    source: Secret
+    secretRef:
+      namespace: crossplane-system
+      name: gcp-credentials
+      key: credentials
+
+---
+# Enable the Admin SDK Directory API — required for SCIM group/user provisioning.
+apiVersion: cloudplatform.gcp.upbound.io/v1beta1
+kind: ProjectService
+metadata:
+  name: admin-googleapis-com
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+  annotations:
+    crossplane.io/external-name: admin.googleapis.com
+spec:
+  forProvider:
+    project: internalapps-481018
+    service: admin.googleapis.com
+    disableOnDestroy: false
+    disableDependentServices: false
+  providerConfigRef:
+    name: gcp-default
+
+---
+# Dedicated service account for Cloudflare SSO SCIM provisioning.
+# After creation, grant it domain-wide delegation in Google Workspace Admin with scopes:
+#   https://www.googleapis.com/auth/admin.directory.group.readonly
+#   https://www.googleapis.com/auth/admin.directory.user.readonly
+apiVersion: cloudplatform.gcp.upbound.io/v1beta1
+kind: ServiceAccount
+metadata:
+  name: cloudflare-sso-agent
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+  annotations:
+    crossplane.io/external-name: cloudflare-sso-agent
+spec:
+  forProvider:
+    project: internalapps-481018
+    displayName: Cloudflare SSO SCIM Agent
+    description: Used by Cloudflare Zero Trust for Google Workspace SCIM provisioning
+  providerConfigRef:
+    name: gcp-default
+
+---
+# Service account key — Crossplane creates the key in GCP and writes it to
+# cloudflare-sso-agent-key (crossplane-system). Connection secret keys:
+#   private_key      — base64-encoded JSON key (use for domain-wide delegation setup)
+#   public_key       — corresponding public key
+#   valid_after/before — key validity window
+apiVersion: cloudplatform.gcp.upbound.io/v1beta1
+kind: ServiceAccountKey
+metadata:
+  name: cloudflare-sso-agent-key
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+spec:
+  forProvider:
+    serviceAccountIdRef:
+      name: cloudflare-sso-agent
+  writeConnectionSecretToRef:
+    namespace: crossplane-system
+    name: cloudflare-sso-agent-key
+  providerConfigRef:
+    name: gcp-default

@@ -12,6 +12,11 @@ resources:
   - manifests/coding.yaml
   - manifests/cal.yaml
   - manifests/governance.yaml
+  - manifests/cloudflare-zero-trust-main.yaml
+  - manifests/gcp-sso.yaml
+  - manifests/simplesalt-certs.yaml
+  # manifests/cloudflare-zero-trust-idp-quarantine.yaml intentionally NOT listed —
+  # quarantined pending a provider-cloudflare-zero CRD bump, see the file header.
   # manifests/ai-ingress.yaml intentionally NOT listed yet — the old
   # ssint-named-ai stack in base-stack still owns the public ai.famevans.win
   # Ingress/IngressRoute. Add this during the coordinated cutover (see the

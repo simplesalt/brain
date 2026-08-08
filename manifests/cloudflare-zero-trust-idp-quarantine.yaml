@@ -1,0 +1,75 @@
+# QUARANTINED — intentionally NOT listed in kustomization.yaml resources.
+# Do not add this file to the resources list without first bumping
+# provider-cloudflare-zero past v0.2.6 (see below).
+#
+# Migrated from simplesalt/base-stack (2.access/cf-zero-trust-idp.yaml), where it
+# was already commented out of that layer's kustomization.yaml resources list.
+# Split off there: the famevans (evans-home, personal-account) IdP definition
+# stayed in base-stack since it isn't SimpleSalt-proprietary content; this
+# simplesalt.company-branded "SS SSO" Google Workspace IdP definition moved here
+# per simplesalt/projects#111.
+#
+# Reason for quarantine: this manifest's config[]/scimConfig[] use list-form OIDC
+# fields (clientId, clientSecretSecretRef, pkceEnabled, appsDomain, SCIM) that
+# target a newer provider-cloudflare-zero than the version actually installed
+# (v0.2.6), whose CRD declares config/scimConfig as bare objects — applying this
+# causes a strict-decode failure. The live equivalent
+# (TrustAccessIdentityProvider cf-main-idp-ssint-sso, object-form config) lives in
+# manifests/cloudflare-zero-trust-main.yaml and IS reconciled; this file is a
+# superseded/duplicate definition of the same logical IdP, kept only as
+# scanned-from-the-API historical reference. It has never applied — live
+# Cloudflare SSO/IdPs (adopted by UUID) are unaffected either way.
+# Re-enable (add to kustomization.yaml resources) only if reverting to the
+# list-form CRD, after bumping provider-cloudflare-zero to a version whose CRD
+# matches this manifest's shape (and populating the client_secret Secret below).
+
+---
+# Secret placeholder for SS SSO IdP client secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudflare-idp-ss-sso-secret
+  namespace: crossplane-system
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+stringData:
+  client_secret: ""  # Populate out-of-band
+
+---
+# Identity Provider: SS SSO
+# Google Apps / G Suite IdP for @simplesalt.company domain.
+# Used by: automate, viz, nav-data, data, App Launcher
+apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
+kind: TrustAccessIdentityProvider
+metadata:
+  name: cloudflare-idp-ss-sso
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+spec:
+  forProvider:
+    accountId: ed503c805407090970caf579da8193a8
+    name: SS SSO
+    type: google-apps
+    config:
+      appsDomain: "simplesalt.company"
+      clientId: "358340479202-r0acjnd0au5r9l963kjlr6n0ccshav4j.apps.googleusercontent.com"
+      clientSecretSecretRef:
+        name: cloudflare-idp-ss-sso-secret
+        namespace: crossplane-system
+        key: client_secret
+      pkceEnabled: true
+    scimConfig:
+      enabled: true
+      userDeprovision: true
+      seatDeprovision: true
+      identityUpdateBehavior: "no_action"
+  providerConfigRef:
+    kind: ProviderConfig
+    name: default

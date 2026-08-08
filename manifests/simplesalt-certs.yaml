@@ -1,0 +1,45 @@
+# ACME ClusterIssuer for the simplesalt.company zone.
+# Migrated from simplesalt/base-stack (3.infra/certs.yaml) per
+# simplesalt/projects#111 — simplesalt.company branding doesn't belong in a
+# generic infra layer. Currently unconsumed by any Certificate in either repo
+# (brain's existing Certificates, e.g. manifests/ai.yaml's ai-tls, use the
+# `famevans` ClusterIssuer, which stays in base-stack/dylannevans-basis). Kept
+# here so any future brain-hosted app that needs a real simplesalt.company-issued
+# cert (rather than a famevans.win one) has this available without another
+# cross-repo migration.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: simplesalt
+  namespace: cert-manager
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@simplesalt.company
+    privateKeySecretRef:
+      name: simplesalt
+    solvers:
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: ss-acme-cf-token
+              key: api-token
+        selector:
+          dnsZones:
+            - "simplesalt.company"
+
+---
+# Cloudflare API token secret for simplesalt.company domain - managed externally
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ss-acme-cf-token
+  namespace: cert-manager
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+# data: {} # Managed externally via kubectl - Flux only ensures secret exists
