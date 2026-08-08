@@ -471,6 +471,35 @@ spec:
         fsGroup: 10000
         fsGroupChangePolicy: OnRootMismatch
       initContainers:
+        # Install the `gov` CLI (the governance sidecar's client) onto the
+        # home volume, alongside the other Hermes-invocable tools below.
+        # Copies gov.py from the governance-cli-seed ConfigMap volume (see
+        # governance.yaml) and marks it executable; gov talks to the
+        # governance sidecar container (below) over the governance-sock Unix
+        # socket, so Hermes's terminal/execute_code toolset can run `gov
+        # status` / `gov sweep` / `gov check <issue>` directly. No `set -e`
+        # and a trailing `exit 0`, same as install-cli-tools below: a failed
+        # copy must not crashloop the container or block the pod rollout.
+        - name: install-governance-cli
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export HOME=/opt/data
+              mkdir -p /opt/data/.local/bin
+              [ ! -x /opt/data/.local/bin/gov ] && {
+                cp /seed/gov.py /opt/data/.local/bin/gov \
+                  && chmod +x /opt/data/.local/bin/gov \
+                  || echo "WARN: gov CLI install failed"
+              }
+              exit 0
+          volumeMounts:
+            - name: home
+              mountPath: /opt/data
+            - name: governance-cli-seed
+              mountPath: /seed
+              readOnly: true
         # Install the CLI tools Hermes drives via the local terminal backend
         # onto the writable home volume (/opt/data/.local/bin, on PATH). Each
         # step is guarded by an existence check so it is a no-op when the binary
@@ -1062,6 +1091,66 @@ spec:
             - name: email-data
               mountPath: /var/email
               readOnly: true
+            # Unix domain socket shared with the governance sidecar below, so
+            # `gov` (installed by install-governance-cli above, invoked via
+            # Hermes's terminal/execute_code toolset) can reach the daemon.
+            - name: governance-sock
+              mountPath: /var/run/governance
+        # Governance sidecar: a UDS-server + scheduler daemon that lints and
+        # repairs a GitHub Projects board (STRUCTURAL/BOARD/STATUS/DEPENDENCY/
+        # HYGIENE rules, plus repairs), replacing simplesalt/projects'
+        # governance.yml GitHub Actions workflow (nightly sweep + reactive
+        # per-issue check). Runs as a genuine sidecar in this same pod, not a
+        # separate Deployment/Service, and is reached purely over the
+        # governance-sock Unix socket below (via the `gov` CLI) rather than
+        # HTTP — no ports/Service needed. Stock python:3.12-alpine image, no
+        # custom build, same pattern as hermes-proxy.yaml's hermes-proxy
+        # container.
+        - name: governance
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/scripts/daemon.py"]
+          env:
+            # Same GitHub token hermes-agent itself uses (see GITHUB_TOKEN
+            # above). The daemon calls the GitHub GraphQL/REST APIs directly
+            # via http.client (stdlib-only, no `gh` CLI in this image),
+            # authenticated as `Authorization: Bearer $GITHUB_TOKEN`.
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: GITHUB_TOKEN
+            # Target-repo/board configuration (repo, board id, field/status/
+            # label ids) — see the project-tracking Secret in governance.yaml.
+            # optional: true so the sidecar still starts and the pod reaches
+            # Ready before this Secret is populated out-of-band; the daemon
+            # reports "unconfigured" and its scheduler loop no-ops until the
+            # value is present.
+            - name: BOARD_CONFIG_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: project-tracking
+                  key: board-config.json
+                  optional: true
+            - name: SOCKET_PATH
+              value: /var/run/governance/governance.sock
+            - name: POLL_INTERVAL_MINUTES
+              value: "5"
+            - name: SWEEP_INTERVAL_HOURS
+              value: "24"
+          volumeMounts:
+            - name: governance-sock
+              mountPath: /var/run/governance
+            - name: governance-daemon-seed
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
       volumes:
         # Persistent home for session history, kanban DB, skills, logs, and
         # installed CLI binaries. Init containers overwrite git-managed files
@@ -1097,6 +1186,22 @@ spec:
           persistentVolumeClaim:
             claimName: email-collector-data
             readOnly: true
+        # Unix domain socket shared between hermes-agent and the governance
+        # sidecar — the actual comms channel for the `gov` CLI, instead of an
+        # HTTP Service.
+        - name: governance-sock
+          emptyDir: {}
+        # Seed source for the governance daemon script (read-only ConfigMap;
+        # see governance.yaml), mounted at /scripts in the governance sidecar.
+        - name: governance-daemon-seed
+          configMap:
+            name: governance-daemon-script
+        # Seed source for the gov CLI script (read-only ConfigMap; see
+        # governance.yaml), copied onto the home volume by
+        # install-governance-cli above.
+        - name: governance-cli-seed
+          configMap:
+            name: governance-cli-script
 ---
 apiVersion: v1
 kind: Service

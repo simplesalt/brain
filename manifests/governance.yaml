@@ -1,0 +1,1455 @@
+# Governance/project-tracking sidecar: a generalized, stdlib-only port of a
+# GitHub Projects v2 governance linter (structural/board/status/dependency/
+# hygiene rules + auto-repair + sticky-comment reporting). Runs as a sidecar
+# container in the hermes-agent Deployment (see ai.yaml) rather than as a
+# GitHub Actions workflow, so it can poll continuously and be queried live
+# through a Unix domain socket instead of GH Actions logs.
+#
+# This file only holds the ConfigMap-embedded scripts and the empty
+# board-config Secret; the `governance` sidecar container itself (image,
+# volumes, env) is wired up in ai.yaml's hermes-agent Deployment, alongside
+# the init container that installs `gov` (from governance-cli-script) onto
+# the shared hermes-home PVC.
+#
+# Fully generic/reusable: no target-repo, board, or personal-identity values
+# are hardcoded here. Everything the daemon needs at runtime (repo, board ID,
+# field IDs, status option IDs, label IDs) is loaded from the project-tracking
+# Secret's board-config.json, populated out-of-band per deployment.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: governance-daemon-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  daemon.py: |
+    #!/usr/bin/env python3
+    """
+    governance-daemon — sidecar port of a GitHub-Projects-v2 governance linter
+    (rule engine + auto-repair + sticky-comment reporting), generalized so it
+    carries no target-repo/board identity of its own: everything it needs is
+    loaded at startup from BOARD_CONFIG_JSON + GITHUB_TOKEN.
+
+    No `gh` CLI, no third-party deps — GitHub REST/GraphQL calls go straight
+    over http.client.HTTPSConnection. Control surface is a Unix domain socket
+    (line-delimited JSON in, line-delimited JSON out) instead of a CLI/cron
+    entrypoint, so it can run continuously as a sidecar:
+
+      {"cmd": "status"}              -> {"ok": true, "configured": bool, ...}
+      {"cmd": "report"}              -> {"ok": true, "report": {...} | null}
+      {"cmd": "sweep"}               -> {"ok": true, "report": {...}}
+      {"cmd": "check", "issue": 42}  -> {"ok": true, "report": {...}}
+
+    If GITHUB_TOKEN or BOARD_CONFIG_JSON is missing/empty, the process starts in
+    an "unconfigured" state: the socket still comes up (so `status` always
+    answers), but the scheduler is idle and every other command replies
+    {"ok": false, "error": "unconfigured"}.
+    """
+
+    import http.client
+    import json
+    import os
+    import re
+    import socket
+    import socketserver
+    import sys
+    import threading
+    import time
+    from datetime import datetime, timezone, timedelta
+    from typing import Optional
+
+    # ── Config (loaded once at startup — no target-repo identity baked in) ─────
+
+    GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
+    try:
+        _cfg = json.loads(os.environ.get("BOARD_CONFIG_JSON") or "{}")
+        if not isinstance(_cfg, dict):
+            _cfg = {}
+    except json.JSONDecodeError:
+        _cfg = {}
+
+    CONFIGURED = bool(GITHUB_TOKEN and _cfg)
+
+    REPO = _cfg.get("repo", "")
+    REPO_ID = _cfg.get("repo_id", "")
+    BOARD_ID = _cfg.get("board_id", "")
+
+    ISSUE_TYPES = _cfg.get("issue_types", {}) or {}
+    ISSUE_TYPE_BY_ID = {v: k for k, v in ISSUE_TYPES.items()}
+
+    _fields = _cfg.get("fields", {}) or {}
+    FIELD_STATUS = _fields.get("status")
+    FIELD_PRIORITY = _fields.get("priority")
+    FIELD_START_DATE = _fields.get("start_date")
+    FIELD_TARGET_DATE = _fields.get("target_date")
+    FIELD_REVIEW_ON = _fields.get("review_on")
+    FIELD_INITIATIVE = _fields.get("initiative")
+
+    _status_cfg = _cfg.get("status", {}) or {}
+    STATUS_UPCOMING = _status_cfg.get("upcoming")
+    STATUS_IN_PROGRESS = _status_cfg.get("in_progress")
+    STATUS_BLOCKED = _status_cfg.get("blocked")
+    STATUS_MONITORING = _status_cfg.get("monitoring")
+    STATUS_COMPLETE = _status_cfg.get("complete")
+    STATUS_CANCELLED = _status_cfg.get("cancelled")
+
+    STATUS_ACTIVE = {s for s in (STATUS_UPCOMING, STATUS_IN_PROGRESS, STATUS_BLOCKED, STATUS_MONITORING) if s}
+    STATUS_CLOSED = {s for s in (STATUS_COMPLETE, STATUS_CANCELLED) if s}
+
+    STATUS_ID_TO_NAME = {
+        STATUS_UPCOMING: "Upcoming",
+        STATUS_IN_PROGRESS: "In Progress",
+        STATUS_BLOCKED: "Blocked",
+        STATUS_MONITORING: "Monitoring",
+        STATUS_COMPLETE: "Complete",
+        STATUS_CANCELLED: "Cancelled",
+    }
+    STATUS_ID_TO_NAME.pop(None, None)
+
+    _labels_cfg = _cfg.get("labels", {}) or {}
+    WORKSTREAM_LABEL_IDS = set(_labels_cfg.get("workstream", []) or [])
+    LABEL_BLOCKED_EXTERNAL = _labels_cfg.get("blocked_external")
+    LABEL_GOVERNANCE_VIOLATION = _labels_cfg.get("governance_violation")
+    LABEL_GOVERNANCE_VIOLATION_NAME = _labels_cfg.get("governance_violation_name", "governance:violation")
+    LABEL_NEEDS_TRIAGE = _labels_cfg.get("needs_triage")
+
+    BANNED_LABEL_PREFIXES = tuple(_labels_cfg.get("banned_prefixes", ["status:", "priority:", "type:"]))
+    BANNED_LABEL_EXACT = set(_labels_cfg.get("banned_exact", ["blocked"]))
+
+    STICKY_MARKER = "<!-- governance-report -->"
+
+    SOCKET_PATH = os.environ.get("SOCKET_PATH", "/var/run/governance/governance.sock")
+    POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
+    SWEEP_INTERVAL_HOURS = int(os.environ.get("SWEEP_INTERVAL_HOURS", "24"))
+
+    # Type ladder. Kept as rule logic (not board identity) — see docstring on
+    # lint_issue's S05 check for why Epic -> Task is deliberately permitted.
+    TYPE_ALLOWED_CHILDREN = {
+        "Epic": {"Epic", "Feature", "Task", "Bug"},
+        "Feature": {"Task", "Bug"},
+        "Task": set(),
+        "Bug": set(),
+    }
+
+    _run_lock = threading.Lock()          # serializes sweep/check/poll against each other
+    _state_lock = threading.Lock()        # guards _state
+    _state = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "last_poll_at": None,
+        "last_poll_cursor": None,
+        "last_sweep_at": None,
+        "last_check_at": None,
+        "poll_count": 0,
+        "sweep_count": 0,
+        "check_count": 0,
+        "last_report": None,
+        "last_error": None,
+    }
+
+
+    # ── GitHub API helpers (stdlib http.client — no gh CLI, no requests) ───────
+
+    def _github_request(method: str, path: str, body: Optional[dict] = None,
+                         extra_headers: Optional[dict] = None):
+        conn = http.client.HTTPSConnection("api.github.com", timeout=30)
+        headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "User-Agent": "governance-daemon",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        try:
+            conn.request(method, path, body=data, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            status = resp.status
+        finally:
+            conn.close()
+        text = raw.decode("utf-8") if raw else ""
+        return status, text
+
+
+    def graphql(query: str, variables: Optional[dict] = None) -> dict:
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+        status, text = _github_request("POST", "/graphql", body=payload)
+        if status >= 400:
+            raise RuntimeError(f"GraphQL error (HTTP {status}): {text[:500]}\nQuery: {query[:200]}")
+        data = json.loads(text) if text else {}
+        if "errors" in data:
+            raise RuntimeError(f"GraphQL errors: {json.dumps(data['errors'])}\nQuery: {query[:200]}")
+        return data.get("data", {})
+
+
+    def rest(method: str, path: str, body: Optional[dict] = None):
+        status, text = _github_request(
+            method, path, body=body,
+            extra_headers={"Accept": "application/vnd.github+json"},
+        )
+        if status >= 400:
+            raise RuntimeError(f"REST error ({method} {path}): HTTP {status}: {text[:500]}")
+        if text.strip():
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+
+    # ── Board / Issue fetching ──────────────────────────────────────────────────
+
+    ISSUE_FIELDS_FRAGMENT = """
+      fragment IssueFields on Issue {
+        id
+        number
+        title
+        state
+        stateReason
+        createdAt
+        body
+        issueType { id name }
+        labels(first: 30) { nodes { id name } }
+        parent { id number title }
+        subIssues(first: 100) { nodes { id number state } totalCount }
+        blockedBy(first: 50) { nodes { id number state } }
+        blocking(first: 50) { nodes { id number state } }
+        timelineItems(first: 100, itemTypes: [LABELED_EVENT]) {
+          nodes {
+            ... on LabeledEvent {
+              createdAt
+              label { name }
+            }
+          }
+        }
+      }
+    """
+
+
+    def fetch_issue(number: int) -> dict:
+        """Fetch a single issue with all fields needed for linting."""
+        query = ISSUE_FIELDS_FRAGMENT + """
+        query($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) {
+            issue(number: $number) {
+              ...IssueFields
+            }
+          }
+        }
+        """
+        owner, repo = REPO.split("/")
+        data = graphql(query, {"owner": owner, "repo": repo, "number": number})
+        issue = data["repository"]["issue"]
+        if issue is None:
+            raise ValueError(f"Issue #{number} not found")
+        return issue
+
+
+    def fetch_board_items() -> list:
+        """Fetch all project board items with field values, paginated."""
+        query = """
+        query($boardId: ID!, $cursor: String) {
+          node(id: $boardId) {
+            ... on ProjectV2 {
+              items(first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  id
+                  content {
+                    ... on Issue {
+                      id
+                      number
+                    }
+                  }
+                  fieldValues(first: 20) {
+                    nodes {
+                      ... on ProjectV2ItemFieldSingleSelectValue {
+                        field { ... on ProjectV2SingleSelectField { id } }
+                        optionId
+                        name
+                      }
+                      ... on ProjectV2ItemFieldNumberValue {
+                        field { ... on ProjectV2Field { id } }
+                        number
+                      }
+                      ... on ProjectV2ItemFieldDateValue {
+                        field { ... on ProjectV2Field { id } }
+                        date
+                      }
+                      ... on ProjectV2ItemFieldTextValue {
+                        field { ... on ProjectV2Field { id } }
+                        text
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        items = []
+        cursor = None
+        while True:
+            variables = {"boardId": BOARD_ID}
+            if cursor:
+                variables["cursor"] = cursor
+            data = graphql(query, variables)
+            page = data["node"]["items"]
+            items.extend(page["nodes"])
+            if not page["pageInfo"]["hasNextPage"]:
+                break
+            cursor = page["pageInfo"]["endCursor"]
+        return items
+
+
+    def parse_board_item(item: dict) -> dict:
+        """Flatten a board item's field values into a dict."""
+        content = item.get("content") or {}
+        parsed = {
+            "board_item_id": item["id"],
+            "issue_id": content.get("id"),
+            "issue_number": content.get("number"),
+            "status_option_id": None,
+            "status_name": None,
+            "priority": None,
+            "start_date": None,
+            "target_date": None,
+            "review_on": None,
+            "initiative": None,
+        }
+        for fv in item.get("fieldValues", {}).get("nodes", []):
+            field_id = (fv.get("field") or {}).get("id")
+            if field_id == FIELD_STATUS:
+                parsed["status_option_id"] = fv.get("optionId")
+                parsed["status_name"] = fv.get("name")
+            elif field_id == FIELD_PRIORITY:
+                parsed["priority"] = fv.get("number")
+            elif field_id == FIELD_START_DATE:
+                parsed["start_date"] = fv.get("date")
+            elif field_id == FIELD_TARGET_DATE:
+                parsed["target_date"] = fv.get("date")
+            elif field_id == FIELD_REVIEW_ON:
+                parsed["review_on"] = fv.get("date")
+            elif field_id == FIELD_INITIATIVE:
+                parsed["initiative"] = fv.get("text")
+        return parsed
+
+
+    def build_board_index(items: list) -> dict:
+        """Return {issue_number: board_item_parsed} from raw board items."""
+        index = {}
+        for item in items:
+            parsed = parse_board_item(item)
+            num = parsed.get("issue_number")
+            if num is not None:
+                index[num] = parsed
+        return index
+
+
+    def fetch_open_repo_issues(since: Optional[str] = None) -> list:
+        """Fetch all open issues from the repo (paginated via REST GET).
+
+        `since` (ISO 8601, e.g. 2024-01-01T00:00:00Z) restricts to issues updated
+        at/after that time — used by the poll loop to avoid re-scanning the board.
+        """
+        issues = []
+        page = 1
+        while True:
+            url = f"/repos/{REPO}/issues?state=open&per_page=100&page={page}"
+            if since:
+                url += f"&since={since}"
+            batch = rest("GET", url)
+            if not isinstance(batch, list) or not batch:
+                break
+            issues.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return issues
+
+
+    # ── Ancestor / hierarchy helpers ────────────────────────────────────────────
+
+    def get_ancestors(issue: dict, issue_cache: dict) -> list:
+        """Walk parent links up to root; returns list from issue's parent to root."""
+        ancestors = []
+        seen = {issue["number"]}
+        current = issue
+        while current.get("parent"):
+            p = current["parent"]
+            p_num = p["number"]
+            if p_num in seen:
+                break  # cycle guard
+            seen.add(p_num)
+            if p_num not in issue_cache:
+                try:
+                    issue_cache[p_num] = fetch_issue(p_num)
+                except Exception:
+                    break
+            ancestor = issue_cache[p_num]
+            ancestors.append(ancestor)
+            current = ancestor
+        return ancestors
+
+
+    def get_root(issue: dict, issue_cache: dict) -> Optional[dict]:
+        """Return the root ancestor (no parent) of the issue."""
+        ancestors = get_ancestors(issue, issue_cache)
+        if ancestors:
+            return ancestors[-1]
+        if not issue.get("parent"):
+            return issue
+        return None
+
+
+    def get_all_descendants(issue: dict, issue_cache: dict, visited: Optional[set] = None) -> list:
+        """BFS of all sub-issues."""
+        if visited is None:
+            visited = set()
+        result = []
+        for child in issue.get("subIssues", {}).get("nodes", []):
+            c_num = child["number"]
+            if c_num in visited:
+                continue
+            visited.add(c_num)
+            if c_num not in issue_cache:
+                try:
+                    issue_cache[c_num] = fetch_issue(c_num)
+                except Exception:
+                    continue
+            full_child = issue_cache[c_num]
+            result.append(full_child)
+            result.extend(get_all_descendants(full_child, issue_cache, visited))
+        return result
+
+
+    def get_type_name(issue: dict) -> Optional[str]:
+        it = issue.get("issueType")
+        if not it:
+            return None
+        return ISSUE_TYPE_BY_ID.get(it["id"], it.get("name"))
+
+
+    def get_label_ids(issue: dict) -> set:
+        return {lbl["id"] for lbl in issue.get("labels", {}).get("nodes", [])}
+
+
+    def get_label_names(issue: dict) -> set:
+        return {lbl["name"] for lbl in issue.get("labels", {}).get("nodes", [])}
+
+
+    # ── Violation / repair collectors ───────────────────────────────────────────
+
+    class Report:
+        def __init__(self):
+            self.violations = []
+            self.repairs = []
+            self.issues_checked = 0
+
+        def violation(self, issue_number: int, rule: str, severity: str, message: str):
+            self.violations.append({
+                "issue": issue_number,
+                "rule": rule,
+                "severity": severity,
+                "message": message,
+            })
+
+        def repair(self, issue_number: int, repair_id: str, description: str):
+            self.repairs.append({
+                "issue": issue_number,
+                "repair": repair_id,
+                "description": description,
+            })
+
+        def to_dict(self) -> dict:
+            return {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "issues_checked": self.issues_checked,
+                "violations": self.violations,
+                "repairs_applied": self.repairs,
+            }
+
+
+    # ── Lint rules ───────────────────────────────────────────────────────────────
+
+    def lint_issue(issue: dict, board_index: dict, report: Report, issue_cache: dict, do_repair: bool):
+        num = issue["number"]
+        issue_type = get_type_name(issue)
+        label_ids = get_label_ids(issue)
+        label_names = get_label_names(issue)
+        is_open = issue["state"] == "OPEN"
+        board_item = board_index.get(num)
+
+        # ── STRUCTURAL ───────────────────────────────────────────────────────────
+
+        # S01: No type set
+        if issue.get("issueType") is None:
+            report.violation(num, "S01", "error", "Issue has no type set")
+
+        # S02: (API disallows multiple types; rule ID reserved, not checked here.)
+
+        # S03: Non-Epic must have exactly one parent. Open issues only — a closed
+        # orphan is unactionable history. Epics are exempt in both directions.
+        if is_open and issue_type != "Epic" and issue.get("parent") is None:
+            report.violation(num, "S03", "error",
+                              f"{issue_type or 'Issue'} has no parent — non-Epic must have exactly one parent")
+
+        # S04: Ancestor chain does not terminate in an Epic
+        if issue_type != "Epic" and issue.get("parent"):
+            ancestors = get_ancestors(issue, issue_cache)
+            if ancestors:
+                root = ancestors[-1]
+                root_type = get_type_name(root)
+                if root_type != "Epic":
+                    report.violation(num, "S04", "error",
+                                      f"Ancestor chain terminates in {root_type} #{root['number']}, not an Epic (orphan)")
+
+        # S05: Type ladder
+        if issue_type and issue.get("subIssues", {}).get("totalCount", 0) > 0:
+            allowed = TYPE_ALLOWED_CHILDREN.get(issue_type, set())
+            if not allowed:
+                report.violation(num, "S05", "error",
+                                  f"{issue_type} should be a leaf but has sub-issues")
+            for child_stub in issue.get("subIssues", {}).get("nodes", []):
+                c_num = child_stub["number"]
+                if c_num not in issue_cache:
+                    try:
+                        issue_cache[c_num] = fetch_issue(c_num)
+                    except Exception:
+                        continue
+                child = issue_cache[c_num]
+                child_type = get_type_name(child)
+                if child_type and child_type not in allowed:
+                    report.violation(num, "S05", "error",
+                                      f"{issue_type} contains {child_type} #{c_num} — type ladder violation")
+
+        # S06: Depth > 6 (policy limit; platform hard cap is 8)
+        if issue.get("parent"):
+            ancestors = get_ancestors(issue, issue_cache)
+            depth = len(ancestors) + 1
+            if depth > 6:
+                report.violation(num, "S06", "error",
+                                  f"Issue is at depth {depth} (policy max 6; platform cap 8)")
+
+        # S07/S08: Fan-out
+        child_count = issue.get("subIssues", {}).get("totalCount", 0)
+        if child_count >= 95:
+            report.violation(num, "S08", "error", f"Fan-out {child_count} >= 95 children")
+        elif child_count >= 80:
+            report.violation(num, "S07", "warn", f"Fan-out {child_count} >= 80 children")
+
+        # ── BOARD (open-issue-only) ──────────────────────────────────────────────
+
+        if is_open:
+            # B01: Open issue not on board
+            if board_item is None:
+                report.violation(num, "B01", "error", "Open issue is not on the board")
+                if do_repair:
+                    try:
+                        _repair_add_to_board(issue, report)
+                    except Exception as e:
+                        print(f"  [repair R01 failed] #{num}: {e}", file=sys.stderr)
+            else:
+                # B02: On board but no Status
+                if board_item["status_option_id"] is None:
+                    report.violation(num, "B02", "error", "Issue is on board but has no Status set")
+                # B05: Priority not set
+                if board_item["priority"] is None:
+                    report.violation(num, "B05", "error", "Priority not set on board")
+
+            ws_labels = label_ids & WORKSTREAM_LABEL_IDS
+
+            # B03: No workstream:* label
+            if not ws_labels:
+                report.violation(num, "B03", "error", "Issue has no workstream:* label")
+
+            # B04: Multiple workstream:* labels (warn)
+            if len(ws_labels) > 1:
+                report.violation(num, "B04", "warn",
+                                  f"Issue has {len(ws_labels)} workstream:* labels (expected 1)")
+
+        # ── STATUS ────────────────────────────────────────────────────────────────
+
+        status_id = (board_item or {}).get("status_option_id")
+        status_name = STATUS_ID_TO_NAME.get(status_id, status_id) if status_id else None
+
+        # ST01: Blocked status but no open blockedBy and no blocked-external label
+        if status_id == STATUS_BLOCKED:
+            open_blockers = [b for b in issue.get("blockedBy", {}).get("nodes", []) if b["state"] == "OPEN"]
+            has_blocked_external = LABEL_BLOCKED_EXTERNAL in label_ids
+            if not open_blockers and not has_blocked_external:
+                report.violation(num, "ST01", "error",
+                                  "Status=Blocked but no open blockedBy edges and no blocked-external label")
+
+        # ST02: Monitoring but Review On not set or in the past
+        if status_id == STATUS_MONITORING:
+            review_on = (board_item or {}).get("review_on")
+            if not review_on:
+                report.violation(num, "ST02", "error", "Status=Monitoring but Review On date is not set")
+            else:
+                review_date = datetime.fromisoformat(review_on).replace(tzinfo=timezone.utc)
+                if review_date < datetime.now(timezone.utc):
+                    report.violation(num, "ST02", "error",
+                                      f"Status=Monitoring but Review On date {review_on} is in the past")
+
+        # ST03: In Progress but has open blockers
+        if status_id == STATUS_IN_PROGRESS:
+            open_blockers = [b for b in issue.get("blockedBy", {}).get("nodes", []) if b["state"] == "OPEN"]
+            if open_blockers:
+                blocker_nums = [str(b["number"]) for b in open_blockers]
+                report.violation(num, "ST03", "error",
+                                  f"Status=In Progress but has open blocker(s): #{', #'.join(blocker_nums)}")
+
+        # ST04: Closed issue with open sub-issues
+        if not is_open:
+            open_children = [c for c in issue.get("subIssues", {}).get("nodes", []) if c["state"] == "OPEN"]
+            if open_children:
+                child_nums = [str(c["number"]) for c in open_children]
+                report.violation(num, "ST04", "error",
+                                  f"Closed issue has open sub-issue(s): #{', #'.join(child_nums)}")
+
+        # ST05: Status/state mismatch
+        if status_id is not None:
+            if status_id == STATUS_COMPLETE and is_open:
+                report.violation(num, "ST05", "error", "Status=Complete but issue is open")
+                if do_repair:
+                    try:
+                        _repair_close_issue(num, "completed", report)
+                    except Exception as e:
+                        print(f"  [repair R03 failed] #{num}: {e}", file=sys.stderr)
+            elif status_id == STATUS_CANCELLED and is_open:
+                report.violation(num, "ST05", "error", "Status=Cancelled but issue is open")
+                if do_repair:
+                    try:
+                        _repair_close_issue(num, "not_planned", report)
+                    except Exception as e:
+                        print(f"  [repair R03 failed] #{num}: {e}", file=sys.stderr)
+            elif status_id in STATUS_ACTIVE and not is_open:
+                report.violation(num, "ST05", "error", f"Status={status_name} but issue is closed")
+                if do_repair:
+                    try:
+                        _repair_reopen_issue(num, report)
+                    except Exception as e:
+                        print(f"  [repair R03 failed] #{num}: {e}", file=sys.stderr)
+
+        # ── DEPENDENCY ────────────────────────────────────────────────────────────
+
+        # D01: Dependency cycle
+        blocker_ids = {b["id"] for b in issue.get("blockedBy", {}).get("nodes", [])}
+        if issue["id"] in blocker_ids:
+            report.violation(num, "D01", "error", "Issue is blocked by itself (trivial cycle)")
+        else:
+            visited = {issue["id"]}
+            frontier = list(issue.get("blockedBy", {}).get("nodes", []))
+            cycle_detected = False
+            while frontier and not cycle_detected:
+                node = frontier.pop()
+                n_id = node["id"]
+                if n_id == issue["id"]:
+                    cycle_detected = True
+                    break
+                if n_id in visited:
+                    continue
+                visited.add(n_id)
+                n_num = node["number"]
+                if n_num not in issue_cache:
+                    try:
+                        issue_cache[n_num] = fetch_issue(n_num)
+                    except Exception:
+                        continue
+                blocker_issue = issue_cache[n_num]
+                frontier.extend(blocker_issue.get("blockedBy", {}).get("nodes", []))
+            if cycle_detected:
+                report.violation(num, "D01", "error", "Dependency cycle detected in blockedBy chain")
+
+        # D02: Parent-of and blocked-by same issue
+        child_ids = {c["id"] for c in issue.get("subIssues", {}).get("nodes", [])}
+        parent_id = (issue.get("parent") or {}).get("id")
+        for blocker in issue.get("blockedBy", {}).get("nodes", []):
+            if blocker["id"] in child_ids:
+                report.violation(num, "D02", "error",
+                                  f"Issue is both parent-of and blocked-by #{blocker['number']}")
+            if parent_id and blocker["id"] == parent_id:
+                report.violation(num, "D02", "error",
+                                  f"Issue is both child-of and blocked-by parent #{blocker['number']}")
+
+        # D03: BlockedBy edge points to ancestor or descendant
+        ancestor_ids = {a["id"] for a in get_ancestors(issue, issue_cache)}
+        all_children_ids = {c["id"] for c in get_all_descendants(issue, issue_cache)}
+        for blocker in issue.get("blockedBy", {}).get("nodes", []):
+            if blocker["id"] in ancestor_ids:
+                report.violation(num, "D03", "error",
+                                  f"BlockedBy #{blocker['number']} which is an ancestor (vertical dependency)")
+            if blocker["id"] in all_children_ids:
+                report.violation(num, "D03", "error",
+                                  f"BlockedBy #{blocker['number']} which is a descendant (vertical dependency)")
+
+        # ── HYGIENE ───────────────────────────────────────────────────────────────
+
+        now = datetime.now(timezone.utc)
+        created_at = datetime.fromisoformat(issue["createdAt"].replace("Z", "+00:00"))
+
+        # H01: needs-triage label and older than 7 days
+        if LABEL_NEEDS_TRIAGE in label_ids:
+            age = now - created_at
+            if age > timedelta(days=7):
+                report.violation(num, "H01", "warn",
+                                  f"Has needs-triage label and is {age.days} days old (>7)")
+
+        # H02: Unfilled form placeholders in body
+        body = issue.get("body") or ""
+        placeholder_patterns = [
+            r"_No response_",
+            r"\[your (?:text|answer|description) here\]",
+            r"\[Enter [^\]\n]*\]",
+            r"<!--\s*placeholder",
+            r"TODO:?\s+fill",
+        ]
+        for pat in placeholder_patterns:
+            if re.search(pat, body, re.IGNORECASE):
+                report.violation(num, "H02", "warn", "Issue body contains unfilled form placeholders")
+                break
+
+        # H03: Banned labels
+        for lbl_name in label_names:
+            is_banned = any(lbl_name.startswith(prefix) for prefix in BANNED_LABEL_PREFIXES)
+            if lbl_name in BANNED_LABEL_EXACT:
+                is_banned = True
+            if is_banned:
+                report.violation(num, "H03", "error", f"Banned label: '{lbl_name}'")
+
+        # H04: Body contains '## Status:' heading
+        if re.search(r"^##\s+Status:", body, re.MULTILINE):
+            report.violation(num, "H04", "warn",
+                              "Body contains '## Status:' heading (agent-written Hindsight shape)")
+
+        # B06 (priority uniqueness) is cross-issue — checked at the sweep level.
+
+
+    # ── Cross-board rules ────────────────────────────────────────────────────────
+
+    def lint_board_priority_uniqueness(board_index: dict, report: Report):
+        """B06: Priority must be unique across the board — global (open AND closed):
+        closed issues still occupy their float Priority values, so an open issue
+        landing on the same value as a closed one is a genuine defect."""
+        seen = {}
+        for num, item in board_index.items():
+            p = item.get("priority")
+            if p is None:
+                continue
+            seen.setdefault(p, []).append(num)
+        for p, nums in seen.items():
+            if len(nums) > 1:
+                for num in nums:
+                    others = ", #".join(str(n) for n in nums if n != num)
+                    report.violation(num, "B06", "error",
+                                      f"Priority {p} is not unique on the board (tied with #{others})")
+
+
+    def repair_priority_ties(board_index: dict, report: Report):
+        """R04: Nudge the later-created issue in a priority tie."""
+        seen = {}
+        for num, item in board_index.items():
+            p = item.get("priority")
+            if p is None:
+                continue
+            seen.setdefault(p, []).append(num)
+
+        for p, nums in seen.items():
+            if len(nums) <= 1:
+                continue
+            distinct_priorities = sorted(seen.keys())
+            p_idx = distinct_priorities.index(p)
+            if p_idx + 1 < len(distinct_priorities):
+                next_p = distinct_priorities[p_idx + 1]
+                gap = next_p - p
+                nudge = 0.5 * gap if gap > 0 else 1.0
+            else:
+                nudge = 1.0
+            later_num = max(nums)
+            new_priority = p + nudge
+            try:
+                _set_board_field_number(board_index[later_num]["board_item_id"], FIELD_PRIORITY, new_priority)
+                board_index[later_num]["priority"] = new_priority
+                report.repair(later_num, "R04", f"Nudged priority from {p} to {new_priority} to break tie")
+            except Exception as e:
+                print(f"  [repair R04 failed] #{later_num}: {e}", file=sys.stderr)
+
+
+    def repair_renormalize_priorities(board_index: dict, report: Report):
+        """R06: Renormalize priorities to integers if any gap < 1e-6."""
+        items_with_priority = [(num, item) for num, item in board_index.items() if item.get("priority") is not None]
+        if len(items_with_priority) < 2:
+            return
+        sorted_items = sorted(items_with_priority, key=lambda x: x[1]["priority"])
+        priorities = [item["priority"] for _, item in sorted_items]
+        gaps = [priorities[i + 1] - priorities[i] for i in range(len(priorities) - 1)]
+        if not any(g < 1e-6 for g in gaps):
+            return
+        for i, (num, item) in enumerate(sorted_items):
+            new_p = float(i)
+            try:
+                _set_board_field_number(item["board_item_id"], FIELD_PRIORITY, new_p)
+                board_index[num]["priority"] = new_p
+                report.repair(num, "R06", f"Renormalized priority to {new_p} (gap < 1e-6 detected)")
+            except Exception as e:
+                print(f"  [repair R06 failed] #{num}: {e}", file=sys.stderr)
+
+
+    def repair_initiative_fields(board_index: dict, issue_cache: dict, report: Report):
+        """R02: Sync stale Initiative field to root Epic title."""
+        for num, item in board_index.items():
+            issue = issue_cache.get(num)
+            if issue is None:
+                continue
+            root = get_root(issue, issue_cache)
+            if root is None:
+                continue
+            if get_type_name(root) != "Epic":
+                continue
+            expected = root["title"]
+            current = item.get("initiative")
+            if current != expected:
+                try:
+                    _set_board_field_text(item["board_item_id"], FIELD_INITIATIVE, expected)
+                    report.repair(num, "R02", f"Updated Initiative from {repr(current)} to {repr(expected)}")
+                except Exception as e:
+                    print(f"  [repair R02 failed] #{num}: {e}", file=sys.stderr)
+
+
+    def repair_backfill_start_dates(board_index: dict, issue_cache: dict, report: Report):
+        """R05: Backfill missing Start Date from first In Progress label event."""
+        for num, item in board_index.items():
+            if item.get("start_date") is not None:
+                continue
+            issue = issue_cache.get(num)
+            if issue is None:
+                continue
+            for event in issue.get("timelineItems", {}).get("nodes", []):
+                lbl = event.get("label", {})
+                if lbl and lbl.get("name") == "In Progress":
+                    start = event["createdAt"]
+                    try:
+                        _set_board_field_date(item["board_item_id"], FIELD_START_DATE, start[:10])
+                        report.repair(num, "R05",
+                                      f"Backfilled Start Date from first In Progress label event: {start[:10]}")
+                    except Exception as e:
+                        print(f"  [repair R05 failed] #{num}: {e}", file=sys.stderr)
+                    break
+
+
+    # ── Board mutation helpers ──────────────────────────────────────────────────
+
+    def _repair_add_to_board(issue: dict, report: Report):
+        """R01: Add an open issue to the board."""
+        mutation = """
+        mutation($boardId: ID!, $contentId: ID!) {
+          addProjectV2ItemById(input: {projectId: $boardId, contentId: $contentId}) {
+            item { id }
+          }
+        }
+        """
+        data = graphql(mutation, {"boardId": BOARD_ID, "contentId": issue["id"]})
+        item_id = data["addProjectV2ItemById"]["item"]["id"]
+        report.repair(issue["number"], "R01", f"Added issue to board (item {item_id})")
+
+
+    def _set_board_field_number(item_id: str, field_id: str, value: float):
+        mutation = """
+        mutation($boardId: ID!, $itemId: ID!, $fieldId: ID!, $value: Float!) {
+          updateProjectV2ItemFieldValue(input: {
+            projectId: $boardId, itemId: $itemId, fieldId: $fieldId,
+            value: { number: $value }
+          }) { projectV2Item { id } }
+        }
+        """
+        graphql(mutation, {"boardId": BOARD_ID, "itemId": item_id, "fieldId": field_id, "value": value})
+
+
+    def _set_board_field_text(item_id: str, field_id: str, value: str):
+        mutation = """
+        mutation($boardId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
+          updateProjectV2ItemFieldValue(input: {
+            projectId: $boardId, itemId: $itemId, fieldId: $fieldId,
+            value: { text: $value }
+          }) { projectV2Item { id } }
+        }
+        """
+        graphql(mutation, {"boardId": BOARD_ID, "itemId": item_id, "fieldId": field_id, "value": value})
+
+
+    def _set_board_field_date(item_id: str, field_id: str, value: str):
+        mutation = """
+        mutation($boardId: ID!, $itemId: ID!, $fieldId: ID!, $value: Date!) {
+          updateProjectV2ItemFieldValue(input: {
+            projectId: $boardId, itemId: $itemId, fieldId: $fieldId,
+            value: { date: $value }
+          }) { projectV2Item { id } }
+        }
+        """
+        graphql(mutation, {"boardId": BOARD_ID, "itemId": item_id, "fieldId": field_id, "value": value})
+
+
+    def _repair_close_issue(number: int, state_reason: str, report: Report):
+        """R03: Close an issue with the given state reason."""
+        rest("PATCH", f"/repos/{REPO}/issues/{number}", {"state": "closed", "state_reason": state_reason})
+        report.repair(number, "R03", f"Closed issue as {state_reason} (Status field indicated {state_reason.replace('_', ' ')})")
+
+
+    def _repair_reopen_issue(number: int, report: Report):
+        """R03: Reopen an issue."""
+        rest("PATCH", f"/repos/{REPO}/issues/{number}", {"state": "open"})
+        report.repair(number, "R03", "Reopened issue (Status is active but issue was closed)")
+
+
+    # ── Sticky comment ───────────────────────────────────────────────────────────
+
+    def find_sticky_comment(issue_number: int) -> Optional[dict]:
+        """Find existing governance sticky comment on an issue."""
+        page = 1
+        while True:
+            try:
+                comments = rest("GET", f"/repos/{REPO}/issues/{issue_number}/comments?per_page=100&page={page}")
+            except Exception:
+                return None
+            if not isinstance(comments, list) or not comments:
+                break
+            for comment in comments:
+                if STICKY_MARKER in (comment.get("body") or ""):
+                    return comment
+            if len(comments) < 100:
+                break
+            page += 1
+        return None
+
+
+    def format_report_comment(issue_number: int, violations: list, repairs: list) -> str:
+        issue_violations = [v for v in violations if v["issue"] == issue_number]
+        issue_repairs = [r for r in repairs if r["issue"] == issue_number]
+
+        lines = [STICKY_MARKER, "## Governance Report"]
+        lines.append(f"*Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}*")
+        lines.append("")
+
+        if not issue_violations:
+            lines.append("No violations found.")
+        else:
+            errors = [v for v in issue_violations if v["severity"] == "error"]
+            warnings = [v for v in issue_violations if v["severity"] == "warn"]
+            if errors:
+                lines.append("### Errors")
+                for v in errors:
+                    lines.append(f"- **{v['rule']}**: {v['message']}")
+            if warnings:
+                lines.append("### Warnings")
+                for v in warnings:
+                    lines.append(f"- **{v['rule']}** _(warn)_: {v['message']}")
+
+        if issue_repairs:
+            lines.append("")
+            lines.append("### Auto-Repairs Applied")
+            for r in issue_repairs:
+                lines.append(f"- **{r['repair']}**: {r['description']}")
+
+        return "\n".join(lines)
+
+
+    def post_or_update_sticky(issue_number: int, report: Report):
+        """Post or update the governance sticky comment; manage governance:violation label."""
+        issue_violations = [v for v in report.violations if v["issue"] == issue_number]
+        has_violations = bool(issue_violations)
+
+        existing = find_sticky_comment(issue_number)
+
+        if has_violations:
+            body = format_report_comment(issue_number, report.violations, report.repairs)
+            if existing:
+                rest("PATCH", f"/repos/{REPO}/issues/comments/{existing['id']}", {"body": body})
+            else:
+                rest("POST", f"/repos/{REPO}/issues/{issue_number}/comments", {"body": body})
+            rest("POST", f"/repos/{REPO}/issues/{issue_number}/labels",
+                 {"labels": [LABEL_GOVERNANCE_VIOLATION_NAME]})
+        else:
+            if existing:
+                clear_body = (
+                    f"{STICKY_MARKER}\n"
+                    f"## Governance Report\n"
+                    f"*Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}*\n\n"
+                    "All clear — no violations found."
+                )
+                rest("PATCH", f"/repos/{REPO}/issues/comments/{existing['id']}", {"body": clear_body})
+            try:
+                rest("DELETE", f"/repos/{REPO}/issues/{issue_number}/labels/{LABEL_GOVERNANCE_VIOLATION_NAME}")
+            except Exception:
+                pass
+
+
+    # ── Run entry points (used by both the scheduler and the UDS handlers) ─────
+
+    def run_check(issue_number: int, do_repair: bool, post_comments: bool = True) -> Report:
+        """Check a single issue and its immediate context."""
+        report = Report()
+        issue_cache = {}
+
+        issue = fetch_issue(issue_number)
+        issue_cache[issue_number] = issue
+
+        if issue.get("parent"):
+            p_num = issue["parent"]["number"]
+            try:
+                issue_cache[p_num] = fetch_issue(p_num)
+            except Exception:
+                pass
+
+        board_items = fetch_board_items()
+        board_index = build_board_index(board_items)
+
+        lint_issue(issue, board_index, report, issue_cache, do_repair)
+        report.issues_checked = 1
+
+        if post_comments:
+            post_or_update_sticky(issue_number, report)
+
+        return report
+
+
+    def run_sweep(do_repair: bool, post_comments: bool = True) -> Report:
+        """Check all board issues plus all open repo issues."""
+        report = Report()
+        issue_cache = {}
+
+        board_items = fetch_board_items()
+        board_index = build_board_index(board_items)
+
+        numbers_to_check = set(board_index.keys())
+        open_issues = fetch_open_repo_issues()
+        for oi in open_issues:
+            numbers_to_check.add(oi["number"])
+
+        for num in sorted(numbers_to_check):
+            try:
+                if num not in issue_cache:
+                    issue_cache[num] = fetch_issue(num)
+                issue = issue_cache[num]
+                lint_issue(issue, board_index, report, issue_cache, do_repair)
+                report.issues_checked += 1
+            except Exception as e:
+                print(f"  [error] #{num}: {e}", file=sys.stderr)
+
+        lint_board_priority_uniqueness(board_index, report)
+
+        if do_repair:
+            repair_priority_ties(board_index, report)
+            repair_renormalize_priorities(board_index, report)
+            repair_initiative_fields(board_index, issue_cache, report)
+            repair_backfill_start_dates(board_index, issue_cache, report)
+
+        if post_comments:
+            issues_with_violations = {v["issue"] for v in report.violations}
+            issues_with_repairs = {r["issue"] for r in report.repairs}
+            for num in sorted(numbers_to_check):
+                if num in issues_with_violations or num in issues_with_repairs:
+                    try:
+                        post_or_update_sticky(num, report)
+                    except Exception as e:
+                        print(f"  [sticky comment failed] #{num}: {e}", file=sys.stderr)
+
+        return report
+
+
+    def run_poll(since: Optional[str]) -> Report:
+        """Lint only open issues updated since `since` — the near-real-time
+        replacement for the old webhook-triggered per-issue check."""
+        report = Report()
+        issue_cache = {}
+
+        board_items = fetch_board_items()
+        board_index = build_board_index(board_items)
+
+        issues = fetch_open_repo_issues(since=since)
+        for oi in issues:
+            num = oi["number"]
+            try:
+                issue = fetch_issue(num)
+            except Exception as e:
+                print(f"  [error] #{num}: {e}", file=sys.stderr)
+                continue
+            issue_cache[num] = issue
+            lint_issue(issue, board_index, report, issue_cache, do_repair=True)
+            report.issues_checked += 1
+
+        issues_with_violations = {v["issue"] for v in report.violations}
+        issues_with_repairs = {r["issue"] for r in report.repairs}
+        for num in sorted(issues_with_violations | issues_with_repairs):
+            try:
+                post_or_update_sticky(num, report)
+            except Exception as e:
+                print(f"  [sticky comment failed] #{num}: {e}", file=sys.stderr)
+
+        return report
+
+
+    # ── Locked wrappers shared by the scheduler thread and the UDS handlers ────
+
+    def _run_sweep_locked() -> Report:
+        with _run_lock:
+            report = run_sweep(do_repair=True, post_comments=True)
+            with _state_lock:
+                _state["last_sweep_at"] = datetime.now(timezone.utc).isoformat()
+                _state["sweep_count"] += 1
+                _state["last_report"] = report.to_dict()
+                _state["last_error"] = None
+            return report
+
+
+    def _run_check_locked(issue_number: int) -> Report:
+        with _run_lock:
+            report = run_check(issue_number, do_repair=True, post_comments=True)
+            with _state_lock:
+                _state["last_check_at"] = datetime.now(timezone.utc).isoformat()
+                _state["check_count"] += 1
+                _state["last_report"] = report.to_dict()
+                _state["last_error"] = None
+            return report
+
+
+    def _run_poll_locked() -> Report:
+        with _run_lock:
+            since = _state.get("last_poll_cursor")
+            report = run_poll(since)
+            cursor = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with _state_lock:
+                _state["last_poll_at"] = datetime.now(timezone.utc).isoformat()
+                _state["last_poll_cursor"] = cursor
+                _state["poll_count"] += 1
+                _state["last_report"] = report.to_dict()
+                _state["last_error"] = None
+            return report
+
+
+    # ── Background scheduler ────────────────────────────────────────────────────
+
+    def _scheduler_loop():
+        if not CONFIGURED:
+            return  # unconfigured: stay idle forever, UDS server still answers `status`
+
+        poll_seconds = max(POLL_INTERVAL_MINUTES, 1) * 60
+        sweep_seconds = max(SWEEP_INTERVAL_HOURS, 1) * 3600
+        next_sweep = time.monotonic() + sweep_seconds
+
+        # Seed the poll cursor to "now" so the first poll only sees issues updated
+        # after the daemon started, not the whole open-issue backlog.
+        with _state_lock:
+            _state["last_poll_cursor"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        while True:
+            time.sleep(poll_seconds)
+            try:
+                _run_poll_locked()
+            except Exception as e:
+                print(f"[governance] poll failed: {e}", file=sys.stderr, flush=True)
+                with _state_lock:
+                    _state["last_error"] = f"poll: {e}"
+
+            if time.monotonic() >= next_sweep:
+                try:
+                    _run_sweep_locked()
+                except Exception as e:
+                    print(f"[governance] sweep failed: {e}", file=sys.stderr, flush=True)
+                    with _state_lock:
+                        _state["last_error"] = f"sweep: {e}"
+                next_sweep = time.monotonic() + sweep_seconds
+
+
+    # ── Unix domain socket control server ───────────────────────────────────────
+
+    def _handle_command(cmd) -> dict:
+        if not isinstance(cmd, dict):
+            return {"ok": False, "error": "invalid command"}
+        action = cmd.get("cmd")
+
+        if action == "status":
+            with _state_lock:
+                return {
+                    "ok": True,
+                    "configured": CONFIGURED,
+                    "repo": REPO if CONFIGURED else None,
+                    "started_at": _state["started_at"],
+                    "last_poll_at": _state["last_poll_at"],
+                    "last_sweep_at": _state["last_sweep_at"],
+                    "last_check_at": _state["last_check_at"],
+                    "poll_count": _state["poll_count"],
+                    "sweep_count": _state["sweep_count"],
+                    "check_count": _state["check_count"],
+                    "last_error": _state["last_error"],
+                    "poll_interval_minutes": POLL_INTERVAL_MINUTES,
+                    "sweep_interval_hours": SWEEP_INTERVAL_HOURS,
+                }
+
+        if not CONFIGURED:
+            return {"ok": False, "error": "unconfigured"}
+
+        if action == "report":
+            with _state_lock:
+                return {"ok": True, "report": _state["last_report"]}
+
+        if action == "sweep":
+            try:
+                report = _run_sweep_locked()
+                return {"ok": True, "report": report.to_dict()}
+            except Exception as e:
+                with _state_lock:
+                    _state["last_error"] = f"sweep: {e}"
+                return {"ok": False, "error": str(e)}
+
+        if action == "check":
+            raw_issue = cmd.get("issue")
+            try:
+                issue_number = int(raw_issue)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "missing/invalid 'issue' number"}
+            try:
+                report = _run_check_locked(issue_number)
+                return {"ok": True, "report": report.to_dict()}
+            except Exception as e:
+                with _state_lock:
+                    _state["last_error"] = f"check: {e}"
+                return {"ok": False, "error": str(e)}
+
+        return {"ok": False, "error": f"unknown cmd: {action}"}
+
+
+    class _UDSHandler(socketserver.StreamRequestHandler):
+        def handle(self):
+            try:
+                line = self.rfile.readline()
+                if not line:
+                    return
+                try:
+                    cmd = json.loads(line.decode("utf-8"))
+                except Exception:
+                    resp = {"ok": False, "error": "invalid JSON"}
+                else:
+                    resp = _handle_command(cmd)
+            except Exception as e:
+                resp = {"ok": False, "error": str(e)}
+            try:
+                self.wfile.write((json.dumps(resp) + "\n").encode("utf-8"))
+            except Exception:
+                pass
+
+        def log_message(self, *a):
+            pass
+
+
+    class _UDSServer(socketserver.ThreadingUnixStreamServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+
+    def _start_uds_server() -> _UDSServer:
+        sock_dir = os.path.dirname(SOCKET_PATH)
+        if sock_dir:
+            os.makedirs(sock_dir, exist_ok=True)
+        if os.path.exists(SOCKET_PATH):
+            try:
+                os.remove(SOCKET_PATH)
+            except OSError:
+                pass
+        server = _UDSServer(SOCKET_PATH, _UDSHandler)
+        try:
+            os.chmod(SOCKET_PATH, 0o666)
+        except OSError:
+            pass
+        return server
+
+
+    if __name__ == "__main__":
+        if CONFIGURED:
+            print(
+                f"governance-daemon: configured for {REPO} (board {BOARD_ID}) — "
+                f"poll every {POLL_INTERVAL_MINUTES}m, sweep every {SWEEP_INTERVAL_HOURS}h, "
+                f"socket {SOCKET_PATH}",
+                flush=True,
+            )
+        else:
+            print(
+                f"governance-daemon: UNCONFIGURED (missing GITHUB_TOKEN and/or BOARD_CONFIG_JSON) "
+                f"— socket {SOCKET_PATH} up, scheduler idle",
+                flush=True,
+            )
+
+        scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
+        scheduler_thread.start()
+
+        srv = _start_uds_server()
+        srv.serve_forever()
+---
+# Thin CLI installed onto the shared hermes-home PVC as `gov` (see the
+# install-governance-cli init container in ai.yaml) so Hermes's terminal
+# tooling can run `gov status` / `gov sweep` / `gov check <issue>` without
+# any GitHub auth of its own — all API access happens sidecar-side, this
+# just talks to the sidecar over the shared Unix domain socket.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: governance-cli-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  gov.py: |
+    #!/usr/bin/env python3
+    """
+    gov — thin CLI for the governance sidecar.
+
+    Connects to the governance daemon's Unix domain socket, sends one
+    line-delimited JSON command, reads one line-delimited JSON response, and
+    pretty-prints it. Pure stdlib — no deps beyond the socket the sidecar
+    already exposes.
+    """
+
+    import argparse
+    import json
+    import os
+    import socket
+    import sys
+
+    SOCKET_PATH = os.environ.get("GOVERNANCE_SOCKET", "/var/run/governance/governance.sock")
+
+
+    def _send(cmd: dict) -> dict:
+        if not os.path.exists(SOCKET_PATH):
+            print(f"gov: governance sidecar not reachable (no socket at {SOCKET_PATH})", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(120)
+            sock.connect(SOCKET_PATH)
+            sock.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            chunks = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            sock.close()
+        except OSError as e:
+            print(f"gov: governance sidecar not reachable: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
+        if not raw:
+            print("gov: empty response from governance sidecar", file=sys.stderr)
+            sys.exit(1)
+        try:
+            return json.loads(raw.splitlines()[0])
+        except json.JSONDecodeError:
+            print(f"gov: invalid response from governance sidecar: {raw[:200]}", file=sys.stderr)
+            sys.exit(1)
+
+
+    def main():
+        parser = argparse.ArgumentParser(prog="gov", description="Governance sidecar control CLI")
+        sub = parser.add_subparsers(dest="command", required=True)
+        sub.add_parser("status", help="Show sidecar configuration and last-run state")
+        sub.add_parser("report", help="Show the full last sweep/check report")
+        sub.add_parser("sweep", help="Run a full board sweep now")
+        check_p = sub.add_parser("check", help="Lint a single issue now")
+        check_p.add_argument("issue", type=int, help="Issue number")
+
+        args = parser.parse_args()
+
+        if args.command == "status":
+            resp = _send({"cmd": "status"})
+        elif args.command == "report":
+            resp = _send({"cmd": "report"})
+        elif args.command == "sweep":
+            resp = _send({"cmd": "sweep"})
+        elif args.command == "check":
+            resp = _send({"cmd": "check", "issue": args.issue})
+        else:
+            parser.error("unknown command")
+            return
+
+        print(json.dumps(resp, indent=2))
+        sys.exit(0 if resp.get("ok") else 1)
+
+
+    if __name__ == "__main__":
+        main()
+---
+# Populated out-of-band (never committed to git — same pattern as
+# claude-identity in coding.yaml). Single key, board-config.json, a JSON
+# blob holding everything the governance daemon needs to know about the
+# target repo/board — no code changes needed to point this sidecar at a
+# different repo or board, just a different Secret value.
+#
+# kubectl create secret generic project-tracking -n ssint-main-ai \
+#   --from-literal=board-config.json='<json>' \
+#   --dry-run=client -o yaml | kubectl apply -f -
+#
+# Example board-config.json shape (generic placeholders only — never commit
+# real repo/board/field/label IDs here):
+#   {
+#     "repo": "<owner>/<repo>",
+#     "repo_id": "<repo node ID>",
+#     "board_id": "<ProjectV2 node ID>",
+#     "issue_types": {
+#       "Epic": "<issue type node ID>",
+#       "Feature": "<issue type node ID>",
+#       "Task": "<issue type node ID>",
+#       "Bug": "<issue type node ID>"
+#     },
+#     "fields": {
+#       "status": "<field node ID>",
+#       "priority": "<field node ID>",
+#       "start_date": "<field node ID>",
+#       "target_date": "<field node ID>",
+#       "review_on": "<field node ID>",
+#       "initiative": "<field node ID>"
+#     },
+#     "status": {
+#       "upcoming": "<status option ID>",
+#       "in_progress": "<status option ID>",
+#       "blocked": "<status option ID>",
+#       "monitoring": "<status option ID>",
+#       "complete": "<status option ID>",
+#       "cancelled": "<status option ID>"
+#     },
+#     "labels": {
+#       "workstream": ["<label node ID>", "<label node ID>"],
+#       "blocked_external": "<label node ID>",
+#       "governance_violation": "<label node ID>",
+#       "governance_violation_name": "governance:violation",
+#       "needs_triage": "<label node ID>"
+#     }
+#   }
+apiVersion: v1
+kind: Secret
+metadata:
+  name: project-tracking
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
