@@ -12,9 +12,11 @@
 # the shared hermes-home PVC.
 #
 # Fully generic/reusable: no target-repo, board, or personal-identity values
-# are hardcoded here. Everything the daemon needs at runtime (repo, board ID,
-# field IDs, status option IDs, label IDs) is loaded from the project-tracking
-# Secret's board-config.json, populated out-of-band per deployment.
+# are hardcoded here. The project-tracking Secret's board-config.json (out-of-
+# band per deployment) carries only the two facts that can't be derived any
+# other way — repo slug and project board number; everything else the daemon
+# needs at runtime (board/field/status-option/label node IDs) is resolved
+# dynamically at startup via GraphQL, matched by human-readable name.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -30,8 +32,10 @@ data:
     """
     governance-daemon — sidecar port of a GitHub-Projects-v2 governance linter
     (rule engine + auto-repair + sticky-comment reporting), generalized so it
-    carries no target-repo/board identity of its own: everything it needs is
-    loaded at startup from BOARD_CONFIG_JSON + GITHUB_TOKEN.
+    carries no target-repo/board identity of its own: BOARD_CONFIG_JSON only
+    supplies {"repo": "...", "board_number": N}; everything else (board/field/
+    status-option/label node IDs) is resolved at startup via GraphQL, matched
+    by human-readable name (see resolve_board_config()).
 
     No `gh` CLI, no third-party deps — GitHub REST/GraphQL calls go straight
     over http.client.HTTPSConnection. Control surface is a Unix domain socket
@@ -61,7 +65,17 @@ data:
     from datetime import datetime, timezone, timedelta
     from typing import Optional
 
-    # ── Config (loaded once at startup — no target-repo identity baked in) ─────
+    # ── Config (resolved once at startup — no target-repo identity baked in) ───
+    #
+    # BOARD_CONFIG_JSON only needs to carry the two facts that can't be
+    # derived any other way — which repo, and which project board number:
+    #
+    #   {"repo": "<owner>/<repo>", "board_number": <ProjectV2 number>}
+    #
+    # Everything else (repo/board/issue-type/field/status-option/label node
+    # IDs) is resolved dynamically below via GraphQL once at startup, matched
+    # by the human-readable names any deployer of this board template would
+    # share — see resolve_board_config() after the GitHub API helpers.
 
     GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
@@ -72,51 +86,11 @@ data:
     except json.JSONDecodeError:
         _cfg = {}
 
-    CONFIGURED = bool(GITHUB_TOKEN and _cfg)
-
-    REPO = _cfg.get("repo", "")
-    REPO_ID = _cfg.get("repo_id", "")
-    BOARD_ID = _cfg.get("board_id", "")
-
-    ISSUE_TYPES = _cfg.get("issue_types", {}) or {}
-    ISSUE_TYPE_BY_ID = {v: k for k, v in ISSUE_TYPES.items()}
-
-    _fields = _cfg.get("fields", {}) or {}
-    FIELD_STATUS = _fields.get("status")
-    FIELD_PRIORITY = _fields.get("priority")
-    FIELD_START_DATE = _fields.get("start_date")
-    FIELD_TARGET_DATE = _fields.get("target_date")
-    FIELD_REVIEW_ON = _fields.get("review_on")
-    FIELD_INITIATIVE = _fields.get("initiative")
-
-    _status_cfg = _cfg.get("status", {}) or {}
-    STATUS_UPCOMING = _status_cfg.get("upcoming")
-    STATUS_IN_PROGRESS = _status_cfg.get("in_progress")
-    STATUS_BLOCKED = _status_cfg.get("blocked")
-    STATUS_MONITORING = _status_cfg.get("monitoring")
-    STATUS_COMPLETE = _status_cfg.get("complete")
-    STATUS_CANCELLED = _status_cfg.get("cancelled")
-
-    STATUS_ACTIVE = {s for s in (STATUS_UPCOMING, STATUS_IN_PROGRESS, STATUS_BLOCKED, STATUS_MONITORING) if s}
-    STATUS_CLOSED = {s for s in (STATUS_COMPLETE, STATUS_CANCELLED) if s}
-
-    STATUS_ID_TO_NAME = {
-        STATUS_UPCOMING: "Upcoming",
-        STATUS_IN_PROGRESS: "In Progress",
-        STATUS_BLOCKED: "Blocked",
-        STATUS_MONITORING: "Monitoring",
-        STATUS_COMPLETE: "Complete",
-        STATUS_CANCELLED: "Cancelled",
-    }
-    STATUS_ID_TO_NAME.pop(None, None)
-
+    # These three stay literal opt-in overrides rather than resolved
+    # dynamically — sensible generic defaults, only worth overriding if a
+    # deployer's board template genuinely differs.
     _labels_cfg = _cfg.get("labels", {}) or {}
-    WORKSTREAM_LABEL_IDS = set(_labels_cfg.get("workstream", []) or [])
-    LABEL_BLOCKED_EXTERNAL = _labels_cfg.get("blocked_external")
-    LABEL_GOVERNANCE_VIOLATION = _labels_cfg.get("governance_violation")
     LABEL_GOVERNANCE_VIOLATION_NAME = _labels_cfg.get("governance_violation_name", "governance:violation")
-    LABEL_NEEDS_TRIAGE = _labels_cfg.get("needs_triage")
-
     BANNED_LABEL_PREFIXES = tuple(_labels_cfg.get("banned_prefixes", ["status:", "priority:", "type:"]))
     BANNED_LABEL_EXACT = set(_labels_cfg.get("banned_exact", ["blocked"]))
 
@@ -203,6 +177,228 @@ data:
             except json.JSONDecodeError:
                 return {}
         return {}
+
+
+    # ── Board config resolution (name-matched GraphQL lookups, run once) ───────
+    #
+    # Generic board-template conventions used to match resolved names — not
+    # identifying data, just the shape any deployer of this template shares.
+
+    ISSUE_TYPE_NAMES = ("Epic", "Feature", "Task", "Bug")
+
+    FIELD_NAMES = {
+        "status": "Status",
+        "priority": "Priority",
+        "start_date": "Start Date",
+        "target_date": "Target Date",
+        "review_on": "Review On",
+        "initiative": "Initiative",
+    }
+
+    STATUS_OPTION_NAMES = {
+        "upcoming": "Upcoming",
+        "in_progress": "In Progress",
+        "blocked": "Blocked",
+        "monitoring": "Monitoring",
+        "complete": "Complete",
+        "cancelled": "Cancelled",
+    }
+
+    WORKSTREAM_LABEL_PREFIX = "workstream:"
+    LABEL_BLOCKED_EXTERNAL_NAME = "blocked-external"
+    LABEL_NEEDS_TRIAGE_NAME = "needs-triage"
+
+
+    def resolve_board_config(cfg: dict) -> Optional[dict]:
+        """Resolve the minimal {"repo": "...", "board_number": N} config into
+        the full set of GraphQL node IDs the daemon needs, by querying GitHub
+        once at startup and matching on human-readable names (the *_NAMES /
+        *_PREFIX constants above). Returns None — after logging the reason to
+        stderr — on any missing input or resolution failure, so the caller
+        degrades to the same "unconfigured" state used when GITHUB_TOKEN or
+        BOARD_CONFIG_JSON are absent, instead of crash-looping.
+        """
+        repo = cfg.get("repo")
+        board_number = cfg.get("board_number")
+        if not repo or not board_number:
+            return None
+        try:
+            owner, name = repo.split("/", 1)
+        except ValueError:
+            print(f"[governance] BOARD_CONFIG_JSON 'repo' is not 'owner/name': {repo!r}", file=sys.stderr)
+            return None
+
+        try:
+            data = graphql(
+                """
+                query($owner: String!, $name: String!) {
+                  repository(owner: $owner, name: $name) {
+                    id
+                    issueTypes(first: 20) { nodes { id name } }
+                    labels(first: 100) { nodes { id name } }
+                  }
+                }
+                """,
+                {"owner": owner, "name": name},
+            )
+            repo_node = data["repository"]
+            repo_id = repo_node["id"]
+
+            issue_types = {
+                it["name"]: it["id"] for it in repo_node["issueTypes"]["nodes"]
+                if it["name"] in ISSUE_TYPE_NAMES
+            }
+            missing_types = [n for n in ISSUE_TYPE_NAMES if n not in issue_types]
+            if missing_types:
+                print(f"[governance] repo {repo} is missing issue type(s): {missing_types}", file=sys.stderr)
+                return None
+
+            labels_by_name = {lbl["name"]: lbl["id"] for lbl in repo_node["labels"]["nodes"]}
+            workstream_label_ids = [
+                lbl_id for lbl_name, lbl_id in labels_by_name.items()
+                if lbl_name.startswith(WORKSTREAM_LABEL_PREFIX)
+            ]
+            if not workstream_label_ids:
+                print(f"[governance] repo {repo} has no '{WORKSTREAM_LABEL_PREFIX}*' labels", file=sys.stderr)
+                return None
+
+            required_label_names = (LABEL_BLOCKED_EXTERNAL_NAME, LABEL_NEEDS_TRIAGE_NAME, LABEL_GOVERNANCE_VIOLATION_NAME)
+            missing_labels = [n for n in required_label_names if n not in labels_by_name]
+            if missing_labels:
+                print(f"[governance] repo {repo} is missing label(s): {missing_labels}", file=sys.stderr)
+                return None
+
+            # Board: try org-owned, then user-owned project.
+            board_id = None
+            for query, root_key in (
+                (
+                    "query($login: String!, $number: Int!) { "
+                    "organization(login: $login) { projectV2(number: $number) { id } } }",
+                    "organization",
+                ),
+                (
+                    "query($login: String!, $number: Int!) { "
+                    "user(login: $login) { projectV2(number: $number) { id } } }",
+                    "user",
+                ),
+            ):
+                try:
+                    bdata = graphql(query, {"login": owner, "number": board_number})
+                except Exception:
+                    continue
+                node = (bdata.get(root_key) or {}).get("projectV2")
+                if node:
+                    board_id = node["id"]
+                    break
+            if not board_id:
+                print(f"[governance] could not resolve project board #{board_number} for owner {owner}",
+                      file=sys.stderr)
+                return None
+
+            fdata = graphql(
+                """
+                query($boardId: ID!) {
+                  node(id: $boardId) {
+                    ... on ProjectV2 {
+                      fields(first: 20) { nodes { ... on ProjectV2FieldCommon { id name } } }
+                    }
+                  }
+                }
+                """,
+                {"boardId": board_id},
+            )
+            fields_by_name = {f["name"]: f["id"] for f in fdata["node"]["fields"]["nodes"]}
+            fields = {}
+            for key, disp_name in FIELD_NAMES.items():
+                field_id = fields_by_name.get(disp_name)
+                if not field_id:
+                    print(f"[governance] board is missing field '{disp_name}'", file=sys.stderr)
+                    return None
+                fields[key] = field_id
+
+            sdata = graphql(
+                """
+                query($fieldId: ID!) {
+                  node(id: $fieldId) {
+                    ... on ProjectV2SingleSelectField { options { id name } }
+                  }
+                }
+                """,
+                {"fieldId": fields["status"]},
+            )
+            options_by_name = {o["name"]: o["id"] for o in sdata["node"]["options"]}
+            status = {}
+            for key, disp_name in STATUS_OPTION_NAMES.items():
+                option_id = options_by_name.get(disp_name)
+                if not option_id:
+                    print(f"[governance] Status field is missing option '{disp_name}'", file=sys.stderr)
+                    return None
+                status[key] = option_id
+
+            return {
+                "repo": repo,
+                "repo_id": repo_id,
+                "board_id": board_id,
+                "issue_types": issue_types,
+                "fields": fields,
+                "status": status,
+                "labels": {
+                    "workstream": workstream_label_ids,
+                    "blocked_external": labels_by_name[LABEL_BLOCKED_EXTERNAL_NAME],
+                    "governance_violation": labels_by_name[LABEL_GOVERNANCE_VIOLATION_NAME],
+                    "needs_triage": labels_by_name[LABEL_NEEDS_TRIAGE_NAME],
+                },
+            }
+        except Exception as e:
+            print(f"[governance] board config resolution failed: {e}", file=sys.stderr)
+            return None
+
+
+    _resolved = resolve_board_config(_cfg) if (GITHUB_TOKEN and _cfg) else None
+
+    CONFIGURED = _resolved is not None
+
+    REPO = (_resolved or {}).get("repo", "")
+    REPO_ID = (_resolved or {}).get("repo_id", "")
+    BOARD_ID = (_resolved or {}).get("board_id", "")
+
+    ISSUE_TYPES = (_resolved or {}).get("issue_types", {}) or {}
+    ISSUE_TYPE_BY_ID = {v: k for k, v in ISSUE_TYPES.items()}
+
+    _resolved_fields = (_resolved or {}).get("fields", {}) or {}
+    FIELD_STATUS = _resolved_fields.get("status")
+    FIELD_PRIORITY = _resolved_fields.get("priority")
+    FIELD_START_DATE = _resolved_fields.get("start_date")
+    FIELD_TARGET_DATE = _resolved_fields.get("target_date")
+    FIELD_REVIEW_ON = _resolved_fields.get("review_on")
+    FIELD_INITIATIVE = _resolved_fields.get("initiative")
+
+    _resolved_status = (_resolved or {}).get("status", {}) or {}
+    STATUS_UPCOMING = _resolved_status.get("upcoming")
+    STATUS_IN_PROGRESS = _resolved_status.get("in_progress")
+    STATUS_BLOCKED = _resolved_status.get("blocked")
+    STATUS_MONITORING = _resolved_status.get("monitoring")
+    STATUS_COMPLETE = _resolved_status.get("complete")
+    STATUS_CANCELLED = _resolved_status.get("cancelled")
+
+    STATUS_ACTIVE = {s for s in (STATUS_UPCOMING, STATUS_IN_PROGRESS, STATUS_BLOCKED, STATUS_MONITORING) if s}
+    STATUS_CLOSED = {s for s in (STATUS_COMPLETE, STATUS_CANCELLED) if s}
+
+    STATUS_ID_TO_NAME = {
+        STATUS_UPCOMING: "Upcoming",
+        STATUS_IN_PROGRESS: "In Progress",
+        STATUS_BLOCKED: "Blocked",
+        STATUS_MONITORING: "Monitoring",
+        STATUS_COMPLETE: "Complete",
+        STATUS_CANCELLED: "Cancelled",
+    }
+    STATUS_ID_TO_NAME.pop(None, None)
+
+    _resolved_labels = (_resolved or {}).get("labels", {}) or {}
+    WORKSTREAM_LABEL_IDS = set(_resolved_labels.get("workstream", []) or [])
+    LABEL_BLOCKED_EXTERNAL = _resolved_labels.get("blocked_external")
+    LABEL_GOVERNANCE_VIOLATION = _resolved_labels.get("governance_violation")
+    LABEL_NEEDS_TRIAGE = _resolved_labels.get("needs_triage")
 
 
     # ── Board / Issue fetching ──────────────────────────────────────────────────
@@ -1396,50 +1592,24 @@ data:
         main()
 ---
 # Populated out-of-band (never committed to git — same pattern as
-# claude-identity in coding.yaml). Single key, board-config.json, a JSON
-# blob holding everything the governance daemon needs to know about the
-# target repo/board — no code changes needed to point this sidecar at a
-# different repo or board, just a different Secret value.
+# claude-identity in coding.yaml). Single key, board-config.json, a minimal
+# JSON blob holding only the two facts about the target repo/board that
+# can't be derived any other way — repo slug and project board number.
+# Everything else (repo/board/issue-type/field/status-option/label node IDs)
+# is resolved dynamically by daemon.py at startup via GraphQL, matched by
+# human-readable name (see resolve_board_config() above) — no code changes
+# needed to point this sidecar at a different repo or board, just a
+# different Secret value.
 #
 # kubectl create secret generic project-tracking -n ssint-main-ai \
 #   --from-literal=board-config.json='<json>' \
 #   --dry-run=client -o yaml | kubectl apply -f -
 #
-# Example board-config.json shape (generic placeholders only — never commit
-# real repo/board/field/label IDs here):
+# board-config.json shape (generic placeholders only — never commit real
+# repo/board values here):
 #   {
 #     "repo": "<owner>/<repo>",
-#     "repo_id": "<repo node ID>",
-#     "board_id": "<ProjectV2 node ID>",
-#     "issue_types": {
-#       "Epic": "<issue type node ID>",
-#       "Feature": "<issue type node ID>",
-#       "Task": "<issue type node ID>",
-#       "Bug": "<issue type node ID>"
-#     },
-#     "fields": {
-#       "status": "<field node ID>",
-#       "priority": "<field node ID>",
-#       "start_date": "<field node ID>",
-#       "target_date": "<field node ID>",
-#       "review_on": "<field node ID>",
-#       "initiative": "<field node ID>"
-#     },
-#     "status": {
-#       "upcoming": "<status option ID>",
-#       "in_progress": "<status option ID>",
-#       "blocked": "<status option ID>",
-#       "monitoring": "<status option ID>",
-#       "complete": "<status option ID>",
-#       "cancelled": "<status option ID>"
-#     },
-#     "labels": {
-#       "workstream": ["<label node ID>", "<label node ID>"],
-#       "blocked_external": "<label node ID>",
-#       "governance_violation": "<label node ID>",
-#       "governance_violation_name": "governance:violation",
-#       "needs_triage": "<label node ID>"
-#     }
+#     "board_number": <ProjectV2 number>
 #   }
 apiVersion: v1
 kind: Secret
