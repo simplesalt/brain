@@ -263,7 +263,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: claude-rc
-          image: ghcr.io/simplesalt/oci/builder-sb@sha256:7e3042da46c070a6e86a94eac7d1a9a8f482513087f39c497ae1e5251b13b5a6
+          image: ghcr.io/simplesalt/oci/builder-sb@sha256:cb0df5f4cadb1b9ac68e66887c093359deade935255fba2e55fbb5dfc7084280
           args: ["serve-rc"]
           env:
             - name: REPO_URL
