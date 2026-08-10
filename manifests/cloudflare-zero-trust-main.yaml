@@ -195,13 +195,14 @@ spec:
 ---
 # Ingress config for the ssint-main tunnel (TrustTunnelCloudflared ssint-main-tunnel
 # stays in base-stack, 3.infra/cf-main-tunnel.yaml — this Config just references its
-# UUID by value, injected via ${ssint_main_tunnel_id}).
+# UUID by value).
 # Routes info.simplesalt.company to big-agi (port 3000).
 # Public TLS is terminated at Cloudflare's edge; intra-cluster is plain HTTP.
-# ${ssint_main_tunnel_id} is injected at reconcile time via postBuild.substituteFrom
-# on the brain Kustomization (order.yaml in base-stack), reading from the
-# ssint-main-tunnel-id Secret (flux-system) that base-stack's
-# fetch-ssint-main-tunnel-id Job patches.
+# The tunnel UUID (83c27a64-4074-474c-9a8f-19448d1c2081) is hardcoded below
+# rather than substituted at reconcile time: the tunnel is adopted by
+# external-name in simplesalt/cloud-basis (10-cloudflare/tunnel.yaml), so its
+# UUID is a fixed known constant, not something assigned at creation time.
+# See simplesalt/projects#235.
 apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
 kind: TrustTunnelCloudflaredConfig
 metadata:
@@ -213,7 +214,7 @@ metadata:
 spec:
   forProvider:
     accountId: ba92fe12c6c1275f965c7c86e3b392ac
-    tunnelId: "${ssint_main_tunnel_id}"
+    tunnelId: "83c27a64-4074-474c-9a8f-19448d1c2081"
     config:
       ingress:
         - hostname: info.simplesalt.company
@@ -238,7 +239,7 @@ spec:
     zoneId: 260b251cdb53f8376875a8eb8d03ca0b
     name: info
     type: CNAME
-    content: ${ssint_main_tunnel_id}.cfargotunnel.com
+    content: 83c27a64-4074-474c-9a8f-19448d1c2081.cfargotunnel.com
     proxied: true
     ttl: 1
   providerConfigRef:
