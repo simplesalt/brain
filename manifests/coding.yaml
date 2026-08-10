@@ -263,7 +263,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: claude-rc
-          image: ghcr.io/simplesalt/oci/builder-sb@sha256:2f8970cfecea3ac49c9c26ce820b63f7c0d81492da60f4d59fb9dc7518a352e1
+          image: ghcr.io/simplesalt/oci/builder-sb@sha256:ad05ad60e0ee0c96ddb17dada85b9894af442768dcd2ed9aa41c624d749e97ee
           args: ["serve-rc"]
           env:
             - name: REPO_URL
@@ -529,7 +529,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: claude-rc
-          image: ghcr.io/simplesalt/oci/builder-sb@sha256:2f8970cfecea3ac49c9c26ce820b63f7c0d81492da60f4d59fb9dc7518a352e1
+          image: ghcr.io/simplesalt/oci/builder-sb@sha256:ad05ad60e0ee0c96ddb17dada85b9894af442768dcd2ed9aa41c624d749e97ee
           args: ["serve-rc"]
           env:
             - name: REPO_URL
@@ -795,7 +795,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: claude-rc
-          image: ghcr.io/simplesalt/oci/builder-sb@sha256:2f8970cfecea3ac49c9c26ce820b63f7c0d81492da60f4d59fb9dc7518a352e1
+          image: ghcr.io/simplesalt/oci/builder-sb@sha256:ad05ad60e0ee0c96ddb17dada85b9894af442768dcd2ed9aa41c624d749e97ee
           args: ["serve-rc"]
           env:
             - name: REPO_URL
