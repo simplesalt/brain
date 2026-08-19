@@ -1603,7 +1603,12 @@ data:
 #
 # kubectl create secret generic project-tracking -n ssint-main-ai \
 #   --from-literal=board-config.json='<json>' \
-#   --dry-run=client -o yaml | kubectl apply -f -
+#   --dry-run=client -o yaml | kubectl apply --server-side -f -
+#
+# NOTE: --server-side is required, not optional. Client-side `kubectl apply`
+# copies the full rendered manifest (including the base64 secret values) into
+# the kubectl.kubernetes.io/last-applied-configuration annotation, which is not
+# redacted by tooling that masks Secret data. See simplesalt/basis#3.
 #
 # board-config.json shape (generic placeholders only — never commit real
 # repo/board values here):
