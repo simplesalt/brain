@@ -1,0 +1,50 @@
+---
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: OCIRepository
+metadata:
+  name: claude-rc
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  interval: 12h
+  url: oci://ghcr.io/simplesalt/charts/claude-rc
+  ref:
+    tag: "0.4.0"
+    digest: "sha256:7f0d2f46f94a5db303c1d474f43269341e4e8ed2468b8f8fd0b509384ca1b6cc"
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: build-basis
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  interval: 5m
+  chartRef:
+    kind: OCIRepository
+    name: claude-rc
+    namespace: flux-system
+  targetNamespace: ssint-main-coding
+  install:
+    createNamespace: false
+    timeout: 10m
+    remediation:
+      retries: 3
+  upgrade:
+    timeout: 10m
+    remediation:
+      retries: 3
+  values:
+    repo:
+      slug: basis
+      ref: main
+    skelOverride:
+      enabled: true
+      create: false
+      existingConfigMap: claude-rc-skel-override
