@@ -507,8 +507,9 @@ spec:
         # downloads only happen on first boot or after a manual binary removal).
         # No `set -e`: a transient failure of one tool must not hard-block the
         # pod from starting (init must exit 0).
-        #   - claude (Claude Code): authenticates at runtime via
-        #     CLAUDE_CODE_OAUTH_TOKEN.
+        #   - claude (Claude Code): installed UNAUTHENTICATED. hermes-agent
+        #     does not need Claude auth, so no OAuth token is injected; the
+        #     binary is present for plugin tooling only.
         #   - gh (GitHub CLI): auth seeded into ~/.config/gh/hosts.yml by
         #     seed-hermes-config (GITHUB_TOKEN is blocked from subprocess env
         #     by the Copilot provider blocklist; file-based auth is the fix).
@@ -536,7 +537,7 @@ spec:
               export HOME=/opt/data
               mkdir -p /opt/data/.local/bin
 
-              # Claude Code CLI (auth at runtime via CLAUDE_CODE_OAUTH_TOKEN)
+              # Claude Code CLI (installed unauthenticated -- no OAuth token injected)
               if [ ! -x /opt/data/.local/bin/claude ]; then
                 curl -fsSL https://claude.ai/install.sh | bash \
                   || echo "WARN: claude install failed"
@@ -838,11 +839,6 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: GITHUB_TOKEN
-            - name: CLAUDE_CODE_OAUTH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-secrets
-                  key: CLAUDE_CODE_OAUTH_TOKEN
             # OpenRouter inference key (same secret the main container maps to
             # OPENROUTER_API_KEY); used by the .env seeding step above.
             - name: OPENROUTER_API_KEY
@@ -1022,11 +1018,6 @@ spec:
               value: "true"
             - name: WEBHOOK_PORT
               value: "8644"
-            - name: _HERMES_FORCE_CLAUDE_CODE_OAUTH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-secrets
-                  key: CLAUDE_CODE_OAUTH_TOKEN
             - name: _HERMES_FORCE_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
