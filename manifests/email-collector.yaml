@@ -83,7 +83,7 @@ data:
     //   server-side self-wiring (entities, links, timeline). Hermes may still add
     //   higher-order judgment (urgency, replies) on top, but ingestion no longer
     //   depends on the agent loop.
-    // Usage: bun email-collector.mjs collect | digest | enrich | healthcheck | diagnose
+    // Usage: bun email-collector.mjs collect | backfill | digest | enrich | healthcheck | diagnose
 
     import { createSign } from 'crypto';
     import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, appendFileSync, readdirSync } from 'fs';
@@ -294,6 +294,121 @@ data:
       state.lastCollect = new Date().toISOString();
       saveState(state);
       console.log(`collect [${WORK_EMAIL}]: +${added} new (${inbox.length} inbox, ${sent.length} sent checked)`);
+    }
+
+    // ---------- backfill ----------
+    // One-shot historical re-pull for a closed date window. `collect` only ever walks
+    // forward from state.lastCollect, so a gap in the day-files is structurally
+    // unrecoverable by the normal cadence — nothing ever looks backwards. backfill
+    // re-pulls the window straight from Gmail (the authoritative source) and files each
+    // message under the day-file for its own internalDate, which is where enrich already
+    // looks. Records are byte-identical in shape to collect's, so digest/enrich need no
+    // knowledge that a backfill happened.
+    //
+    // Deliberately never writes state.json. The every-minute collector owns that file and
+    // a slow backfill would clobber its concurrent knownIds/lastCollect updates on save.
+    // Skipping it is safe because the two never contend for the same message: collect's
+    // window is `newer_than:~2h` and backfill's is strictly historical. Worst case on
+    // overlap is a redundant Gmail fetch — the day-file and ingested.json both dedup by id.
+    //
+    // Window is given as UTC dates, both ends inclusive, and converted to epoch seconds
+    // for the Gmail query. Gmail's `after:`/`before:` accept Unix timestamps and interpret
+    // bare YYYY/MM/DD dates in the account's timezone; epoch keeps the window absolute and
+    // aligned with the UTC basis the day-file names already use.
+
+    function dayOf(msg, fallbackDate) {
+      const ms = Number(msg.internalDate);
+      if (Number.isFinite(ms) && ms > 0) return new Date(ms).toISOString().slice(0, 10);
+      const parsed = Date.parse(fallbackDate ?? '');
+      if (Number.isFinite(parsed)) return new Date(parsed).toISOString().slice(0, 10);
+      return null;
+    }
+
+    async function backfill() {
+      const from = process.env.BACKFILL_FROM ?? process.argv[3] ?? '';
+      const to   = process.env.BACKFILL_TO   ?? process.argv[4] ?? '';
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+        console.error('FATAL: BACKFILL_FROM and BACKFILL_TO must be YYYY-MM-DD (inclusive window)');
+        process.exit(1);
+      }
+
+      const keyB64 = process.env.GOOGLE_PRIVATE_KEY_B64;
+      const privKey = keyB64
+        ? Buffer.from(keyB64, 'base64').toString('utf8')
+        : process.env.GOOGLE_PRIVATE_KEY;
+      const kid = process.env.GOOGLE_PRIVATE_KEY_ID ?? '';
+
+      if (!privKey)     { console.error('FATAL: GOOGLE_PRIVATE_KEY_B64 (or GOOGLE_PRIVATE_KEY) must be set'); process.exit(1); }
+      if (!WORK_EMAIL)  { console.error('FATAL: WORK_EMAIL must be set (google-dwd-key: impersonate_email)'); process.exit(1); }
+      if (!CLIENT_EMAIL){ console.error('FATAL: GOOGLE_CLIENT_EMAIL must be set (google-dwd-key: client_email)'); process.exit(1); }
+
+      const afterSec  = Math.floor(Date.parse(`${from}T00:00:00Z`) / 1000);
+      const beforeSec = Math.floor(Date.parse(`${to}T00:00:00Z`) / 1000) + 86_400;
+      if (!Number.isFinite(afterSec) || !Number.isFinite(beforeSec) || beforeSec <= afterSec) {
+        console.error(`FATAL: invalid window ${from}..${to}`);
+        process.exit(1);
+      }
+
+      const token = await getToken(privKey, kid, WORK_EMAIL);
+      const q = `after:${afterSec} before:${beforeSec}`;
+      console.log(`backfill [${WORK_EMAIL}]: window ${from}..${to} inclusive (${q})`);
+
+      // MAX is a ceiling, not an expectation: gmailList's default of 100 would silently
+      // truncate a multi-week window into the first page of results.
+      const MAX = Number(process.env.BACKFILL_MAX ?? 5000);
+      const [inbox, sent] = await Promise.all([
+        gmailList(token, `in:inbox ${q}`, MAX),
+        gmailList(token, `in:sent ${q}`, MAX),
+      ]);
+      if (inbox.length >= MAX) {
+        console.error(`WARN: inbox hit the ${MAX}-message ceiling — window may be truncated, raise BACKFILL_MAX`);
+      }
+      const sentThreads = new Set(sent.map(m => m.threadId));
+      console.log(`backfill: ${inbox.length} inbox, ${sent.length} sent in window`);
+
+      mkdirSync(MESSAGES, { recursive: true });
+      const byDay = new Map();
+      let undated = 0;
+
+      for (const ref of inbox) {
+        const msg = await gmailGet(token, ref.id);
+        const from_ = hdr(msg, 'From'), subj = hdr(msg, 'Subject'), date = hdr(msg, 'Date');
+        const day = dayOf(msg, date);
+        if (!day) { undated++; continue; }
+        const rec = {
+          id: ref.id, threadId: ref.threadId,
+          from: from_, subject: subj, date,
+          snippet: (msg.snippet ?? '').slice(0, 200),
+          is_noise: isNoise(from_),
+          is_signature: isSig(from_, subj),
+          is_replied: sentThreads.has(ref.threadId),
+          gmail_link: gmailLink(ref.id, WORK_EMAIL),
+          account: WORK_EMAIL,
+        };
+        if (!byDay.has(day)) byDay.set(day, []);
+        byDay.get(day).push(rec);
+        // Same Gmail quota courtesy as collect (250 units/user/sec).
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      let added = 0;
+      for (const day of [...byDay.keys()].sort()) {
+        const dayFile = join(MESSAGES, `${day}.json`);
+        const existing = existsSync(dayFile) ? JSON.parse(readFileSync(dayFile, 'utf8')) : [];
+        const seenIds = new Set(existing.map(m => m.id));
+        let dayAdded = 0;
+        for (const rec of byDay.get(day)) {
+          if (seenIds.has(rec.id)) continue;
+          existing.push(rec); seenIds.add(rec.id); dayAdded++; added++;
+        }
+        const tmp = `${dayFile}.tmp`;
+        writeFileSync(tmp, JSON.stringify(existing, null, 2));
+        renameSync(tmp, dayFile);
+        console.log(`backfill: ${day} +${dayAdded} new (${existing.length} total in day-file)`);
+      }
+
+      if (undated) console.error(`WARN: ${undated} message(s) had no usable date and were skipped`);
+      console.log(`backfill: +${added} new across ${byDay.size} day-file(s); enrich will ingest on its next run`);
     }
 
     // ---------- digest ----------
@@ -589,11 +704,12 @@ data:
 
     const cmd = process.argv[2];
     if      (cmd === 'collect')     await collect();
+    else if (cmd === 'backfill')    await backfill();
     else if (cmd === 'digest')      await digest();
     else if (cmd === 'enrich')      await enrich();
     else if (cmd === 'healthcheck') healthcheck();
     else if (cmd === 'diagnose')    await diagnose();
-    else { console.error('Usage: email-collector.mjs collect|digest|enrich|healthcheck|diagnose'); process.exit(1); }
+    else { console.error('Usage: email-collector.mjs collect|backfill <from> <to>|digest|enrich|healthcheck|diagnose'); process.exit(1); }
 ---
 # CronJob runs the deterministic collector every 30 minutes.
 # concurrencyPolicy: Forbid ensures no overlapping runs (safe for state.json and atomic digest writes).
