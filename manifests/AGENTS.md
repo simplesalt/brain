@@ -20,5 +20,10 @@ persistence, and storage.
 
 - gbrain — your PM memory: retains open conversations, work, engagements, and
   priorities.
-- hindsight — shared cross-agent memory; auto-injects context. Recall from it
-  when you may be missing context.
+- hindsight — your own episodic memory, in the `hermes` bank; auto-injects
+  context. Recall from it when you may be missing context. It is not shared
+  with the coding agents: they write to a separate `coding` bank, and only
+  ever two narrow categories (dead ends and durable environment facts).
+
+Neither is a system of record. Anything that must survive and be trusted —
+decisions, conventions, project status — belongs in git or a GitHub issue.
