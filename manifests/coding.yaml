@@ -341,9 +341,11 @@ spec:
             - name: HINDSIGHT_API_URL
               value: http://hindsight.ssint-main-ai:8888
             - name: HINDSIGHT_BANK_ID
-              value: hermes
+              value: coding
             - name: HINDSIGHT_API_TOKEN
               value: local
+            - name: HINDSIGHT_AUTO_RETAIN
+              value: "false"
           volumeMounts:
             - name: claude-oauth
               mountPath: /var/run/claude
@@ -607,9 +609,11 @@ spec:
             - name: HINDSIGHT_API_URL
               value: http://hindsight.ssint-main-ai:8888
             - name: HINDSIGHT_BANK_ID
-              value: hermes
+              value: coding
             - name: HINDSIGHT_API_TOKEN
               value: local
+            - name: HINDSIGHT_AUTO_RETAIN
+              value: "false"
           volumeMounts:
             - name: claude-oauth
               mountPath: /var/run/claude
@@ -873,9 +877,11 @@ spec:
             - name: HINDSIGHT_API_URL
               value: http://hindsight.ssint-main-ai:8888
             - name: HINDSIGHT_BANK_ID
-              value: hermes
+              value: coding
             - name: HINDSIGHT_API_TOKEN
               value: local
+            - name: HINDSIGHT_AUTO_RETAIN
+              value: "false"
           volumeMounts:
             - name: claude-oauth
               mountPath: /var/run/claude
