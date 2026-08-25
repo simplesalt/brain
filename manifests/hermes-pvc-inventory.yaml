@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: hermes-pvc-inventory
+  name: hermes-pvc-inventory-b
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -15,7 +15,7 @@ spec:
   template:
     metadata:
       labels:
-        app: hermes-pvc-inventory
+        app: hermes-pvc-inventory-b
         entity: ssint
         env: main
         capability: ai
@@ -41,25 +41,23 @@ spec:
           args:
             - |
               export HOME=/tmp
-              echo "== du -sh /opt/data =="
-              du -sh /opt/data 2>&1
-              echo
-              echo "== du -sh /opt/data/* /opt/data/.[!.]* =="
-              du -sh /opt/data/* /opt/data/.[!.]* 2>/dev/null
-              echo
-              echo "== 30 largest files =="
-              find /opt/data -type f -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -30 | cut -f2- | xargs -d '\n' -r du -h 2>/dev/null
-              echo
-              echo "== suspect paths =="
-              for p in /opt/data/state.db /opt/data/kanban.db /opt/data/sessions/ /opt/data/.claude/plugins/data/ /opt/data/logs/ /opt/data/skills/ /opt/data/.local/bin/ /opt/data/.hermes/; do
+              echo "=== suspect paths (size, file count) ==="
+              for p in /opt/data/state.db /opt/data/kanban.db /opt/data/sessions /opt/data/.claude /opt/data/.claude/plugins/data /opt/data/logs /opt/data/skills /opt/data/.local /opt/data/.hindsight /opt/data/.hermes; do
                 if [ -e "$p" ]; then
-                  echo "-- $p --"
-                  ls -la "$p" 2>&1
-                  du -sh "$p" 2>&1
+                  printf '%s\t%s files\n' "$(du -sh "$p" 2>/dev/null)" "$(find "$p" -type f 2>/dev/null | wc -l)"
                 else
-                  echo "-- $p: absent --"
+                  printf 'ABSENT\t%s\n' "$p"
                 fi
               done
+              echo
+              echo "=== 20 largest files ==="
+              find /opt/data -type f -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -20
+              echo
+              echo "=== top level, largest first ==="
+              du -sh /opt/data/* /opt/data/.[!.]* 2>/dev/null | sort -rh
+              echo
+              echo "=== total ==="
+              du -sh /opt/data 2>&1
               exit 0
           volumeMounts:
             - name: home
