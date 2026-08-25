@@ -12,8 +12,8 @@ spec:
   interval: 12h
   url: oci://ghcr.io/simplesalt/charts/builder
   ref:
-    tag: "0.4.1"
-    digest: "sha256:ee782932dc65209b0b2f61ae2a6686e6690aa85eaf0ae681706171d888ffa63a"
+    tag: "0.4.2"
+    digest: "sha256:815a1c4fefb3f87e28e34f38d5ce49bcc449fbb10e9e399de8da46e8daf34b58"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
