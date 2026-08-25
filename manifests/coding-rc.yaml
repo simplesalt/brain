@@ -2,7 +2,7 @@
 apiVersion: source.toolkit.fluxcd.io/v1beta2
 kind: OCIRepository
 metadata:
-  name: claude-rc
+  name: builder
   namespace: flux-system
   labels:
     entity: ssint
@@ -10,10 +10,10 @@ metadata:
     capability: coding
 spec:
   interval: 12h
-  url: oci://ghcr.io/simplesalt/charts/claude-rc
+  url: oci://ghcr.io/simplesalt/charts/builder
   ref:
-    tag: "0.4.0"
-    digest: "sha256:7f0d2f46f94a5db303c1d474f43269341e4e8ed2468b8f8fd0b509384ca1b6cc"
+    tag: "0.4.1"
+    digest: "sha256:ee782932dc65209b0b2f61ae2a6686e6690aa85eaf0ae681706171d888ffa63a"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -28,7 +28,7 @@ spec:
   interval: 5m
   chartRef:
     kind: OCIRepository
-    name: claude-rc
+    name: builder
     namespace: flux-system
   targetNamespace: ssint-main-coding
   install:
@@ -44,6 +44,9 @@ spec:
     repo:
       slug: basis
       ref: main
+    oauthSecret:
+      create: false
+      name: claude-oauth-basis
     skelOverride:
       enabled: true
       create: false
