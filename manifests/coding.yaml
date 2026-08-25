@@ -168,23 +168,6 @@ metadata:
 type: Opaque
 ---
 apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: claude-conversations-oci
-  namespace: ssint-main-coding
-  labels:
-    entity: ssint
-    env: main
-    capability: coding
-spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: 5Gi
----
-apiVersion: v1
 kind: Secret
 metadata:
   name: claude-oauth-brain
@@ -198,23 +181,6 @@ metadata:
 type: Opaque
 ---
 apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: claude-conversations-brain
-  namespace: ssint-main-coding
-  labels:
-    entity: ssint
-    env: main
-    capability: coding
-spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: 5Gi
----
-apiVersion: v1
 kind: Secret
 metadata:
   name: claude-oauth-basis
@@ -226,20 +192,3 @@ metadata:
   annotations:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: claude-conversations-basis
-  namespace: ssint-main-coding
-  labels:
-    entity: ssint
-    env: main
-    capability: coding
-spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: 5Gi
