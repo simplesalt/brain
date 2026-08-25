@@ -1,0 +1,82 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hermes-pvc-inventory
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app: hermes-pvc-inventory
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 10000
+        runAsGroup: 10000
+        runAsNonRoot: true
+        fsGroup: 10000
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: hermes-home
+            readOnly: true
+        - name: tmp
+          emptyDir: {}
+      containers:
+        - name: inventory
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:192c6d84eccfbc14959df4084a14dd5d3c5fda7be57579282689c9ecd2b00f4d
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export HOME=/tmp
+              echo "== du -sh /opt/data =="
+              du -sh /opt/data 2>&1
+              echo
+              echo "== du -sh /opt/data/* /opt/data/.[!.]* =="
+              du -sh /opt/data/* /opt/data/.[!.]* 2>/dev/null
+              echo
+              echo "== 30 largest files =="
+              find /opt/data -type f -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -30 | cut -f2- | xargs -d '\n' -r du -h 2>/dev/null
+              echo
+              echo "== suspect paths =="
+              for p in /opt/data/state.db /opt/data/kanban.db /opt/data/sessions/ /opt/data/.claude/plugins/data/ /opt/data/logs/ /opt/data/skills/ /opt/data/.local/bin/ /opt/data/.hermes/; do
+                if [ -e "$p" ]; then
+                  echo "-- $p --"
+                  ls -la "$p" 2>&1
+                  du -sh "$p" 2>&1
+                else
+                  echo "-- $p: absent --"
+                fi
+              done
+              exit 0
+          volumeMounts:
+            - name: home
+              mountPath: /opt/data
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
