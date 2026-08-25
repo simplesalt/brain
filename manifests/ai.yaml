@@ -1029,10 +1029,6 @@ spec:
             # the literal on the gbrain Deployment above.
             - name: GBRAIN_REMOTE_TOKEN
               value: "gbrain-mcp"
-            # Path where the email-collector CronJob writes daily markdown digests.
-            # The email-collector-data PVC is mounted read-only at /var/email below.
-            - name: EMAIL_DIGEST_DIR
-              value: /var/email/digests
             # NOTE: deliberately NO `PATH` (and no S6_KEEP_ENV) override here.
             # The image's Dockerfile already sets
             #   ENV PATH=/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:$PATH
@@ -1073,15 +1069,6 @@ spec:
             # the gateway/session model client (the consumer of the key).
             - name: secret-env
               mountPath: /run/secret-env
-            # Email digest PVC written by the email-collector CronJob (every 30 min).
-            # Read-only here; the CronJob holds the write side. On a single-node
-            # k3s cluster (local-path, RWO) multiple pods on the same node can
-            # mount the same PVC simultaneously — the "once" in RWO is per-node.
-            # The collector uses atomic temp+rename writes so Hermes never reads
-            # a partial digest file.
-            - name: email-data
-              mountPath: /var/email
-              readOnly: true
             # Unix domain socket shared with the governance sidecar below, so
             # `gov` (installed by install-governance-cli above, invoked via
             # Hermes's terminal/execute_code toolset) can reach the daemon.
@@ -1170,13 +1157,6 @@ spec:
           secret:
             secretName: team-roster
             optional: true
-        # Email collector data (digests, messages JSON, state). Written by the
-        # email-collector CronJob; read-only here. Separate PVC so the collector
-        # can be paused/deleted without touching the hermes-home PVC.
-        - name: email-data
-          persistentVolumeClaim:
-            claimName: email-collector-data
-            readOnly: true
         # Unix domain socket shared between hermes-agent and the governance
         # sidecar — the actual comms channel for the `gov` CLI, instead of an
         # HTTP Service.
