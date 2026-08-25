@@ -102,6 +102,50 @@ spec:
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
+  name: build-basis-dylannevans
+  namespace: flux-system
+  labels:
+    entity: fe
+    env: main
+    capability: coding
+spec:
+  interval: 5m
+  chartRef:
+    kind: OCIRepository
+    name: builder
+    namespace: flux-system
+  targetNamespace: fe-main-coding
+  install:
+    createNamespace: false
+    timeout: 10m
+    remediation:
+      retries: 3
+  upgrade:
+    timeout: 10m
+    remediation:
+      retries: 3
+  values:
+    repo:
+      slug: basis
+      url: https://github.com/dylannevans/basis.git
+      ref: main
+    commonLabels:
+      entity: fe
+      env: main
+      capability: coding
+    hindsight:
+      bankId: coding
+    extraEnv:
+      - name: HINDSIGHT_AUTO_RETAIN
+        value: "false"
+    skelOverride:
+      enabled: true
+      create: false
+      existingConfigMap: claude-rc-skel-override
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
   name: build-oci
   namespace: flux-system
   labels:

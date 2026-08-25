@@ -1,0 +1,115 @@
+# Personal-dev coding pods (dylannevans/ repos) — namespace-scoped credentials.
+#
+# `gh-auth`/`cf-secret`/`cf-id`/`claude-identity` are SSA-merge placeholders shared
+# across every coding pod in this namespace — Flux creates the empty shells,
+# real values are patched in OUT-OF-BAND (kubectl --server-side), never committed to git.
+#
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fe-main-coding
+  labels:
+    name: fe-main-coding
+    entity: fe
+    env: main
+    capability: coding
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gh-auth
+  namespace: fe-main-coding
+  labels:
+    entity: fe
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cf-secret
+  namespace: fe-main-coding
+  labels:
+    entity: fe
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cf-id
+  namespace: fe-main-coding
+  labels:
+    entity: fe
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+# Identity metadata for the Anthropic account these coding pods authenticate
+# as (user id, account/org UUIDs, email, org display name, display name).
+# Shared across all claude-rc-<repo> Deployments in this namespace. Populated
+# OUT-OF-BAND (kubectl) — never committed to git.
+#
+# kubectl create secret generic claude-identity -n fe-main-coding \
+#   --from-literal=CLAUDE_USER_ID=<user-id> \
+#   --from-literal=CLAUDE_ACCOUNT_UUID=<account-uuid> \
+#   --from-literal=CLAUDE_ORG_UUID=<org-uuid> \
+#   --from-literal=CLAUDE_EMAIL=<email> \
+#   --from-literal=CLAUDE_ORG_NAME=<org-name> \
+#   --from-literal=CLAUDE_DISPLAY_NAME=<display-name> \
+#   --dry-run=client -o yaml | kubectl apply --server-side -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: claude-identity
+  namespace: fe-main-coding
+  labels:
+    entity: fe
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+# Skel override shared by the claude-rc-<repo> Deployments: injects extra MCP
+# servers into the Claude Code config without rebuilding the image. entrypoint.sh
+# does `cp -a /etc/claude-code/skel/. $HOME/` on every boot, so mounting a
+# single file here (subPath) is enough — the rest of skel is unaffected.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: claude-rc-skel-override
+  namespace: fe-main-coding
+  labels:
+    entity: fe
+    env: main
+    capability: coding
+data:
+  claude.json.tmpl: |
+    {
+      "mcpServers": {
+        "flux": {
+          "type": "http",
+          "url": "http://mcp-flux.flux-system:9090/mcp"
+        },
+        "cloudflare": {
+          "type": "http",
+          "url": "https://mcp.cloudflare.com/mcp",
+          "headers": {
+            "Authorization": "Bearer ${CLOUDFLARE_API_TOKEN}"
+          }
+        }
+      }
+    }

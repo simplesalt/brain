@@ -11,6 +11,7 @@ resources:
   - manifests/hermes-msg.yaml
   - manifests/coding.yaml
   - manifests/coding-rc.yaml
+  - manifests/coding-fe.yaml
   - manifests/cal.yaml
   - manifests/governance.yaml
   - manifests/cloudflare-zero-trust-main.yaml
