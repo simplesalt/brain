@@ -268,7 +268,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: claude-rc
-          image: ghcr.io/simplesalt/oci/builder-sb@sha256:179e6ad7b36223dbae466d264f827e3565f42d47cd0d4d4a9614f11e9b78590d
+          image: ghcr.io/simplesalt/oci/builder-sb@sha256:5526649ab714fa930dad980e33335b454677121682c095cf8abef5dc4b215854
           args: ["serve-rc"]
           env:
             - name: REPO_URL
@@ -372,7 +372,7 @@ spec:
             limits:
               memory: 6Gi
         - name: cred-rotator
-          image: ghcr.io/simplesalt/oci/cred-rotator@sha256:8f0c251bb7685b66a9d7d531f27fab2ab4ea96d2c1365a7f9d9f45d6b80ea97c
+          image: ghcr.io/simplesalt/oci/cred-rotator@sha256:4957c6a94b533180da2322e38cf9fa436e1a3a94654a6c63fc2e5a91ef227009
           env:
             - name: SECRET_NAME
               value: claude-oauth-oci
