@@ -47,6 +47,95 @@ spec:
     oauthSecret:
       create: false
       name: claude-oauth-basis
+    hindsight:
+      bankId: coding
+    extraEnv:
+      - name: HINDSIGHT_AUTO_RETAIN
+        value: "false"
+    skelOverride:
+      enabled: true
+      create: false
+      existingConfigMap: claude-rc-skel-override
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: build-brain
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  interval: 5m
+  chartRef:
+    kind: OCIRepository
+    name: builder
+    namespace: flux-system
+  targetNamespace: ssint-main-coding
+  install:
+    createNamespace: false
+    timeout: 10m
+    remediation:
+      retries: 3
+  upgrade:
+    timeout: 10m
+    remediation:
+      retries: 3
+  values:
+    repo:
+      slug: brain
+      ref: main
+    oauthSecret:
+      create: false
+      name: claude-oauth-brain
+    hindsight:
+      bankId: coding
+    extraEnv:
+      - name: HINDSIGHT_AUTO_RETAIN
+        value: "false"
+    skelOverride:
+      enabled: true
+      create: false
+      existingConfigMap: claude-rc-skel-override
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: build-oci
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  interval: 5m
+  chartRef:
+    kind: OCIRepository
+    name: builder
+    namespace: flux-system
+  targetNamespace: ssint-main-coding
+  install:
+    createNamespace: false
+    timeout: 10m
+    remediation:
+      retries: 3
+  upgrade:
+    timeout: 10m
+    remediation:
+      retries: 3
+  values:
+    repo:
+      slug: oci
+      ref: main
+    oauthSecret:
+      create: false
+      name: claude-oauth-oci
+    hindsight:
+      bankId: coding
+    extraEnv:
+      - name: HINDSIGHT_AUTO_RETAIN
+        value: "false"
     skelOverride:
       enabled: true
       create: false
