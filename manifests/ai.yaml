@@ -186,7 +186,7 @@ spec:
           args:
             - |
               if [ ! -x /install/bin/gbrain ]; then
-                BUN_INSTALL=/install bun install -g github:garrytan/gbrain \
+                BUN_INSTALL=/install bun install -g github:garrytan/gbrain#492b5528238dfea0ed9e3ee491805d83af86f6a6 \
                   || { echo "FATAL: gbrain install failed"; exit 1; }
               fi
           volumeMounts:
