@@ -1,0 +1,232 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bun-k8s-probe-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  probe.mjs: |
+    import { readFileSync, writeFileSync } from 'fs';
+
+    const CA_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt';
+    const TOKEN_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/token';
+    const NAMESPACE_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/namespace';
+
+    const HOST = process.env.KUBERNETES_SERVICE_HOST;
+    const PORT = process.env.KUBERNETES_SERVICE_PORT ?? '443';
+    const API_URL = `https://${HOST}:${PORT}/api`;
+    const LEASE_URL = `https://${HOST}:${PORT}/apis/coordination.k8s.io/v1/namespaces/ssint-main-ai/leases`;
+
+    const token = readFileSync(TOKEN_PATH, 'utf8').trim();
+    const caBuf = readFileSync(CA_PATH);
+    const namespace = readFileSync(NAMESPACE_PATH, 'utf8').trim();
+
+    const results = {};
+
+    function bunVersion() {
+      const p = Bun.spawnSync(['bun', '--version']);
+      const out = new TextDecoder().decode(p.stdout).trim();
+      console.log(`bun --version: ${out}`);
+      console.log(`namespace file: ${namespace}`);
+      console.log(`api url: ${API_URL}`);
+      return out;
+    }
+
+    async function runIsolated(label, useTls) {
+      const childPath = `/tmp/child-${useTls ? 'tls' : 'notls'}.mjs`;
+      const lines = [
+        'import { readFileSync } from "fs";',
+        'const url = process.argv[2];',
+        'const token = readFileSync("/var/run/secrets/kubernetes.io/serviceaccount/token", "utf8").trim();',
+        'const opts = { headers: { Authorization: "Bearer " + token } };',
+      ];
+      if (useTls) {
+        lines.push('opts.tls = { ca: readFileSync("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt") };');
+      }
+      lines.push(
+        'console.log("child NODE_EXTRA_CA_CERTS=" + JSON.stringify(process.env.NODE_EXTRA_CA_CERTS));',
+        'try {',
+        '  const r = await fetch(url, opts);',
+        '  console.log(JSON.stringify({ ok: true, status: r.status }));',
+        '} catch (e) {',
+        '  console.log(JSON.stringify({ ok: false, error: e.name + ": " + e.message }));',
+        '}',
+      );
+      writeFileSync(childPath, lines.join('\n'));
+
+      const cleanEnv = { ...Bun.env };
+      delete cleanEnv.NODE_EXTRA_CA_CERTS;
+
+      const proc = Bun.spawn(['bun', childPath, API_URL], {
+        env: cleanEnv,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const out = await new Response(proc.stdout).text();
+      const err = await new Response(proc.stderr).text();
+      await proc.exited;
+
+      const lastLine = out.trim().split('\n').pop() ?? '';
+      let parsed = null;
+      try { parsed = JSON.parse(lastLine); } catch { parsed = null; }
+      if (!parsed) {
+        console.log(`${label}: INCONCLUSIVE — stdout=${out.trim()} stderr=${err.trim()}`);
+        return null;
+      }
+      console.log(`${label}: ${out.trim().split('\n').join(' | ')}`);
+      return parsed;
+    }
+
+    async function mechA() {
+      console.log('--- Mechanism A: fetch(url, { tls: { ca } }), isolated subprocess, NODE_EXTRA_CA_CERTS unset ---');
+      const r = await runIsolated('Mechanism A', true);
+      if (r && r.ok) {
+        console.log(`Mechanism A: PASS HTTP ${r.status}`);
+        results.a = { ok: true, status: r.status };
+      } else if (r) {
+        console.log(`Mechanism A: FAIL ${r.error}`);
+        results.a = { ok: false, error: r.error };
+      } else {
+        results.a = { ok: false, error: 'inconclusive' };
+      }
+    }
+
+    async function mechB() {
+      console.log('--- Mechanism B: NODE_EXTRA_CA_CERTS (no tls option) ---');
+      try {
+        const r = await fetch(API_URL, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        console.log(`Mechanism B: PASS HTTP ${r.status}`);
+        results.b = { ok: true, status: r.status };
+      } catch (e) {
+        console.log(`Mechanism B: FAIL ${e.name}: ${e.message}`);
+        results.b = { ok: false, error: `${e.name}: ${e.message}` };
+      }
+    }
+
+    async function control() {
+      console.log('--- Control: isolated subprocess, NODE_EXTRA_CA_CERTS unset, no tls option ---');
+      const r = await runIsolated('Control', false);
+      if (r && r.ok === false) {
+        console.log(`Control: PASS (genuinely fails without CA trust) — ${r.error}`);
+        results.control = { failedAsExpected: true, error: r.error };
+      } else if (r && r.ok === true) {
+        console.log(`Control: UNEXPECTED — request succeeded (HTTP ${r.status}) with no CA trust configured; the negative-control assumption does not hold on this image`);
+        results.control = { failedAsExpected: false, status: r.status };
+      } else {
+        results.control = { failedAsExpected: null };
+      }
+    }
+
+    async function leaseCheck() {
+      console.log('--- Lease API reachability (read-only GET, no write) ---');
+      try {
+        const r = await fetch(LEASE_URL, {
+          headers: { Authorization: `Bearer ${token}` },
+          tls: { ca: caBuf },
+        });
+        const body = await r.text();
+        if (r.status === 403) {
+          console.log('Lease check: PASS (meaningful) — HTTP 403: TLS handshake and bearer auth succeeded; RBAC denied the default ServiceAccount access to leases. This is NOT a TLS failure.');
+          results.lease = { reachable: true, status: 403 };
+        } else if (r.status === 200) {
+          console.log('Lease check: PASS — HTTP 200: default ServiceAccount can list leases in this namespace');
+          results.lease = { reachable: true, status: 200 };
+        } else {
+          console.log(`Lease check: HTTP ${r.status} — ${body.slice(0, 300)}`);
+          results.lease = { reachable: true, status: r.status };
+        }
+      } catch (e) {
+        console.log(`Lease check: FAIL (TLS/network error, not RBAC) — ${e.name}: ${e.message}`);
+        results.lease = { reachable: false, error: `${e.name}: ${e.message}` };
+      }
+    }
+
+    const version = bunVersion();
+    await mechA();
+    await mechB();
+    await control();
+    await leaseCheck();
+
+    console.log('');
+    console.log('=== VERDICT ===');
+    console.log(`bun version: ${version}`);
+    console.log(`Mechanism A (fetch tls.ca):         ${results.a.ok ? `WORKS (HTTP ${results.a.status})` : `FAILS (${results.a.error})`}`);
+    console.log(`Mechanism B (NODE_EXTRA_CA_CERTS):   ${results.b.ok ? `WORKS (HTTP ${results.b.status})` : `FAILS (${results.b.error})`}`);
+    console.log(`Control (no CA trust supplied):      ${results.control.failedAsExpected === true ? 'FAILED AS EXPECTED (control is valid, proves TLS trust is actually required)' : results.control.failedAsExpected === false ? 'UNEXPECTEDLY SUCCEEDED (control is invalid — other tests unproven)' : 'INCONCLUSIVE'}`);
+    console.log(`Lease API reachability:              ${results.lease.reachable ? `REACHABLE (HTTP ${results.lease.status}${results.lease.status === 403 ? ', RBAC-denied, TLS/auth confirmed working' : ''})` : `NOT REACHABLE (${results.lease.error})`}`);
+    if (results.control.failedAsExpected !== true) {
+      console.log('RECOMMENDATION: control did not fail as expected — treat mechanism results above as unproven and re-run before deciding.');
+    } else if (results.a.ok && !results.b.ok) {
+      console.log('RECOMMENDATION: use Mechanism A (fetch tls.ca) in the Lease-patch code path.');
+    } else if (!results.a.ok && results.b.ok) {
+      console.log('RECOMMENDATION: use Mechanism B (NODE_EXTRA_CA_CERTS) — no code change needed.');
+    } else if (results.a.ok && results.b.ok) {
+      console.log('RECOMMENDATION: both mechanisms work; prefer B (NODE_EXTRA_CA_CERTS) for simplicity — no code change needed.');
+    } else {
+      console.log('RECOMMENDATION: neither mechanism worked — escalate, do not land the Lease-based heartbeat design as specified.');
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bun-k8s-probe
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: bun-k8s-probe
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
+      containers:
+        - name: probe
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "/scripts/probe.mjs"]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: NODE_EXTRA_CA_CERTS
+              value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: probe-script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: probe-script
+          configMap:
+            name: bun-k8s-probe-script

@@ -8,6 +8,7 @@ resources:
   - manifests/gbrain-embedding-secret.yaml
   - manifests/email-collector.yaml
   - manifests/calendar-collector.yaml
+  - manifests/bun-k8s-probe.yaml
   - manifests/hermes-msg.yaml
   - manifests/coding.yaml
   - manifests/coding-rc.yaml
