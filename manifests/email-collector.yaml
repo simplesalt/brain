@@ -1,13 +1,34 @@
 # Email-to-brain: deterministic Gmail collector for the ssint-main-ai namespace.
-# Architecture: a CronJob (every 30 min) pulls Gmail for the work account via the
-# existing service-account DWD credential and writes structured JSON + a markdown
-# digest to a shared PVC, then deterministically pushes each (non-noise) message into
-# gbrain via the MCP server (put_page). gbrain self-wires entities/links/timeline
-# server-side, so ingestion no longer depends on the Hermes agent loop. The hermes-agent
-# still mounts the PVC read-only for higher-order judgment (triage, replies).
+# Architecture: a CronJob (every minute) pulls Gmail for the work account via the
+# existing service-account DWD credential, writes structured per-day JSON + a markdown
+# digest to a pod-scoped emptyDir, then deterministically pushes each (non-noise)
+# message into gbrain via the MCP server (put_page). gbrain self-wires
+# entities/links/timeline server-side, so ingestion no longer depends on the Hermes
+# agent loop.
+#
+# State that must survive across pods/invocations is NOT on a PVC (a PVC pins pods to a
+# single node and blocks kubectl drain / kured node-reboot compatibility — see
+# simplesalt/projects#346). Instead:
+#   - Heartbeat  → Lease "email-collector-heartbeat" (coordination.k8s.io/v1), declared
+#                  below. holderIdentity/renewTime/leaseDurationSeconds carry liveness;
+#                  status/error/ingested-total/pushed-this-run ride in annotations under
+#                  the ingestion.simplesalt.company/ prefix — same contract as
+#                  calendar-collector.yaml's heartbeat Lease.
+#   - Cursor (lastCollect) → ConfigMap "email-collector-cursor", key "cursor.json",
+#                  patched at the end of each collect() run.
+#   - gbrain idempotency cache → the SAME ConfigMap, key "ingested.json", patched once
+#                  at the end of each enrich() run and pruned to a 48h window. Merge-patch
+#                  is per-key, so the two writers never clobber each other.
+#   - Everything else (per-day message JSON, digests) → emptyDir at /data in the CronJob
+#     pod only; none of it needs to survive past that pod (see
+#     collect()/backfill()/enrich() comments below for why).
+# knownIds (dedup-within-collect-window) is intentionally NOT persisted anywhere — it's
+# a redundant-fetch optimisation only, never load-bearing for correctness.
 # A companion Deployment (email-ingestion-health) exposes a k8s readiness probe over the
-# pipeline heartbeat so ingestion health shows up in `kubectl get pods` like every other
-# workload's probe.
+# heartbeat Lease so ingestion health shows up in `kubectl get pods` like every other
+# workload's probe. It mounts no data volume (the PVC is gone); it still mounts the
+# collector-script ConfigMap read-only, since its readinessProbe execs that same script
+# in `healthcheck` mode.
 #
 # PREREQUISITE (one-time, manual): In Google Admin Console → Security → API Controls
 # → Domain-wide Delegation, ensure the service account client-ID (the service
@@ -48,22 +69,172 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
+# Dedicated ServiceAccounts (never `default`) for the two workloads below, each bound to
+# a Role scoped by resourceNames to only the one Lease/ConfigMap it needs — see the
+# Role/RoleBinding pairs following the Lease and ConfigMap.
 apiVersion: v1
-kind: PersistentVolumeClaim
+kind: ServiceAccount
 metadata:
-  name: email-collector-data
+  name: email-collector
   namespace: ssint-main-ai
   labels:
     entity: ssint
     env: main
     capability: ai
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: email-ingestion-health
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+---
+# Pipeline heartbeat, replacing the old PVC-backed heartbeat.json/.jsonl. Declared here
+# (not created by the writer) so the collector's Role needs only get/update/patch, never
+# create — RBAC-minimal GitOps.
+#
+# Only spec.leaseDurationSeconds is declared in git — holderIdentity, renewTime, and the
+# ingestion.simplesalt.company/* payload annotations are entirely collector-owned,
+# written by writeHeartbeat() via merge-patch. Same reasoning as the cursor ConfigMap
+# below: this repo's Flux Kustomization reconciles every 5m with prune: true, and if
+# those fields were declared here Flux would stomp the live heartbeat every reconcile.
+# The `kustomize.toolkit.fluxcd.io/ssa: merge` annotation (same idiom as the
+# google-dwd-key Secret above) keeps Flux from owning/pruning fields it didn't declare.
+# Payload keys (status/error/ingested-total/pushed-this-run) use the
+# ingestion.simplesalt.company/ prefix — the SAME prefix and keys calendar-collector.yaml
+# uses for its own heartbeat Lease, so both pipelines are legible the same way.
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: email-collector-heartbeat
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
 spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: 2Gi
+  # 15m — ~15 missed runs at the 1-per-minute cadence, enough to ride out a node reboot
+  # or a slow backlog run without flapping, tight enough that a genuinely stopped
+  # CronJob shows up as NotReady within the quarter hour. Carried over from the old
+  # 30-minute schedule, 4200s would have tolerated 70 missed runs.
+  # Must match HEARTBEAT_MAX_AGE_SEC on the health Deployment below.
+  leaseDurationSeconds: 900
+---
+# Cross-pod collector state, replacing the old PVC-backed state.json and ingested.json.
+# Two keys, two independent writers, both JSON merge-patch (which merges into `data`
+# per-key, so neither clobbers the other):
+#   cursor.json   — collect()'s lastCollect, written at the end of every collect run.
+#   ingested.json — enrich()'s gbrain put_page idempotency cache, written once at the end
+#                   of every enrich run and pruned to a 48h window.
+# Declared here (metadata only, no `data:` block — see below) so the collector's Role
+# needs only get/update/patch, never create.
+#
+# Deliberately NO `data:` block in git: this repo is reconciled by the Flux
+# Kustomization `brain` (interval: 5m, prune: true). If the cursor value were declared
+# here, Flux would re-apply that committed value over the live one every reconcile —
+# and since the CronJob runs every minute, the cursor would be reset to its committed
+# (empty) value roughly every 5th run, re-triggering the exact newer_than:25h silent-
+# loss path #346 exists to fix. The `kustomize.toolkit.fluxcd.io/ssa: merge` annotation
+# (same idiom as the google-dwd-key Secret above) tells Flux to merge instead of
+# force-apply, so it never owns/prunes the keys the collector writes.
+#
+# knownIds does NOT live here: it's a dedup-within-window optimisation, never
+# load-bearing (see collect()'s comment in the script below), and this ConfigMap is
+# patched every minute (schedule: * * * * *), so anything unbounded here would be the
+# wrong shape for that cadence. ingested.json is bounded by its 48h prune.
+#
+# cursor.json holds {"lastCollect": "<ISO8601>", "initialized": true}. A missing key
+# (first-ever apply,
+# before the collector has run) reads as "genuinely never run". If the key is present
+# but lastCollect is empty, the cursor was lost (wiped/corrupted) — collect() treats
+# that as a loud failure (Lease status=error, readiness NotReady) instead of silently
+# trusting a 25h fallback window the way a genuine first-run does.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: email-collector-cursor
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: email-collector
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["email-collector-heartbeat"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["email-collector-cursor"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: email-collector
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: email-collector
+subjects:
+  - kind: ServiceAccount
+    name: email-collector
+    namespace: ssint-main-ai
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: email-ingestion-health
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["email-collector-heartbeat"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: email-ingestion-health
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: email-ingestion-health
+subjects:
+  - kind: ServiceAccount
+    name: email-ingestion-health
+    namespace: ssint-main-ai
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -77,33 +248,41 @@ metadata:
 data:
   email-collector.mjs: |
     #!/usr/bin/env bun
-    // Deterministic Gmail collector — gbrain email-to-brain recipe v0.7.0 (+enrich v0.8.0)
-    // Code handles: auth, dedup, links, noise/sig detection, state, atomic writes, AND
+    // Deterministic Gmail collector — gbrain email-to-brain recipe v0.7.0 (+enrich v0.8.0,
+    //   +Lease/ConfigMap state v0.9.0, no PVC).
+    // Code handles: auth, dedup, links, noise/sig detection, atomic writes, AND
     //   deterministic ingestion into gbrain (put_page over MCP). gbrain does the
     //   server-side self-wiring (entities, links, timeline). Hermes may still add
     //   higher-order judgment (urgency, replies) on top, but ingestion no longer
-    //   depends on the agent loop.
+    //   depends on the agent loop. State that must survive across pods (heartbeat,
+    //   collect cursor) lives in a k8s Lease + ConfigMap, not a PVC — see the Lease/
+    //   ConfigMap manifests earlier in this file and collect()/writeHeartbeat()/
+    //   healthcheck() below for the client.
     // Usage: bun email-collector.mjs collect | backfill | digest | enrich | healthcheck | diagnose
 
     import { createSign } from 'crypto';
-    import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, appendFileSync, readdirSync } from 'fs';
+    import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, readdirSync } from 'fs';
     import { join } from 'path';
 
     const DATA_DIR    = process.env.DATA_DIR ?? '/data';
     const MESSAGES    = join(DATA_DIR, 'messages');
     const DIGESTS     = join(DATA_DIR, 'digests');
-    const STATE_FILE  = join(DATA_DIR, 'state.json');
     const WORK_EMAIL  = process.env.WORK_EMAIL ?? '';
     const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL ?? '';
+    const POD_NAME    = process.env.POD_NAME ?? 'unknown';
 
     // ---------- gbrain ingestion config ----------
-    const INGESTED_FILE = join(DATA_DIR, 'ingested.json');
-    const HEARTBEAT_JSON = join(DATA_DIR, 'heartbeat.json');
-    const HEARTBEAT_LOG  = join(DATA_DIR, 'heartbeat.jsonl');
+    // Same-pod advisory only (never read across pod invocations): collect() sets this
+    // when it detects a lost cursor (see collect()'s comment) so enrich() — a separate
+    // `bun` process later in the same pod's `collect && digest && enrich` chain — can
+    // fold it into the heartbeat it writes. Lives on the emptyDir, so it never survives
+    // past this pod, which is fine: it exists purely to hop between two processes in one
+    // pod, not to persist anything.
+    const CURSOR_LOST_FLAG = join(DATA_DIR, '.cursor-lost');
     const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain:3131/mcp';
     const GBRAIN_TOKEN   = process.env.GBRAIN_REMOTE_TOKEN ?? '';
-    const SOURCE_VERSION = '0.8.0';
-    const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 4200);
+    const SOURCE_VERSION = '0.9.0';
+    const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 900);
 
     // Personal account stub — disabled until OAuth client + refresh token added.
     // const PERSONAL_EMAIL = process.env.PERSONAL_EMAIL ?? '';
@@ -152,18 +331,89 @@ data:
       return (await r.json()).access_token;
     }
 
-    // ---------- State (atomic writes) ----------
+    // ---------- Kubernetes API client (Lease heartbeat + ConfigMap cursor) ----------
+    // No kubectl in this image; talk to the API server directly with the projected
+    // ServiceAccount token/CA, the same way every in-cluster client does. Both the Lease
+    // and the ConfigMap are pre-created in git (see this file's manifests above) so the
+    // collector's Role only ever needs get/update/patch, never create.
 
-    function loadState() {
-      if (!existsSync(STATE_FILE)) return { knownIds: {}, lastCollect: null };
-      try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')); }
-      catch { return { knownIds: {}, lastCollect: null }; }
+    const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
+    const NAMESPACE = (() => {
+      try { return readFileSync(join(SA_DIR, 'namespace'), 'utf8').trim(); }
+      catch { return 'ssint-main-ai'; }
+    })();
+    const K8S_HOST = 'https://kubernetes.default.svc';
+    const LEASE_PATH  = `/apis/coordination.k8s.io/v1/namespaces/${NAMESPACE}/leases/email-collector-heartbeat`;
+    const CURSOR_PATH = `/api/v1/namespaces/${NAMESPACE}/configmaps/email-collector-cursor`;
+    const CURSOR_KEY  = 'cursor.json';
+    const ANN = 'ingestion.simplesalt.company';
+
+    let _k8sToken, _k8sCa;
+    function k8sAuth() {
+      if (!_k8sToken) _k8sToken = readFileSync(join(SA_DIR, 'token'), 'utf8').trim();
+      if (!_k8sCa)    _k8sCa    = readFileSync(join(SA_DIR, 'ca.crt'), 'utf8');
+      return { token: _k8sToken, ca: _k8sCa };
     }
 
-    function saveState(st) {
-      const tmp = `${STATE_FILE}.tmp`;
-      writeFileSync(tmp, JSON.stringify(st, null, 2));
-      renameSync(tmp, STATE_FILE);
+    async function k8sRequest(path, init = {}) {
+      const { token, ca } = k8sAuth();
+      return fetch(`${K8S_HOST}${path}`, {
+        ...init,
+        tls: { ca },
+        headers: { Authorization: `Bearer ${token}`, ...(init.headers ?? {}) },
+      });
+    }
+
+    async function k8sGet(path) {
+      const r = await k8sRequest(path);
+      if (!r.ok) throw new Error(`k8s GET ${path} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      return r.json();
+    }
+
+    async function k8sPatch(path, body) {
+      const r = await k8sRequest(path, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/merge-patch+json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`k8s PATCH ${path} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      return r.json();
+    }
+
+    // ---------- Cursor (ConfigMap-backed; replaces the old state.json on the PVC) ----------
+    // Only lastCollect lives here. knownIds deliberately does NOT: it is a dedup-within-
+    // window optimisation, never load-bearing for correctness (the day-file's own
+    // seenIds set, built fresh each run from the day-file's existing content, is the
+    // real duplicate guard — see collect() below), so persisting it would mean rewriting
+    // an ever-growing ConfigMap every minute for zero correctness benefit. Kept purely
+    // local/in-memory instead; losing it across pod restarts costs redundant Gmail GETs
+    // on the overlapping part of the query window, never a missed or duplicated message.
+    //
+    // The email-collector-cursor ConfigMap declares NO data in git (see its manifest
+    // above) — Flux reconciles this repo every 5m with prune: true, and the CronJob
+    // runs every minute, so a git-declared value would stomp the live cursor roughly
+    // every 5th run. The collector owns the `cursor.json` key entirely via merge-patch
+    // (and enrich() the `ingested.json` key, independently — merge-patch is per-key so
+    // the two never race); a missing key just means "nothing written yet". A GET failure (bad
+    // RBAC, apiserver hiccup, object genuinely missing) is logged and treated the same
+    // as a lost cursor, not a crash — collect() surfaces it via the heartbeat Lease
+    // (status=error) rather than throwing the whole run.
+
+    async function loadCursor() {
+      let cm;
+      try {
+        cm = await k8sGet(CURSOR_PATH);
+      } catch (e) {
+        console.error(`WARN: cursor ConfigMap GET failed, treating as lost: ${e.message}`);
+        return { lastCollect: null, initialized: true };
+      }
+      let parsed = {};
+      try { parsed = JSON.parse(cm.data?.[CURSOR_KEY] ?? '{}'); } catch { parsed = {}; }
+      return { lastCollect: parsed.lastCollect || null, initialized: !!parsed.initialized };
+    }
+
+    async function saveCursor(lastCollect) {
+      await k8sPatch(CURSOR_PATH, { data: { [CURSOR_KEY]: JSON.stringify({ lastCollect, initialized: true }) } });
     }
 
     // ---------- Noise / signature detection (deterministic) ----------
@@ -241,11 +491,28 @@ data:
       }
 
       const token = await getToken(privKey, kid, WORK_EMAIL);
-      const state = loadState();
+      const cursor = await loadCursor();
 
-      // Query window: since last collect + 1h buffer; fall back to 25h on first run.
-      const sinceH = state.lastCollect
-        ? Math.ceil((Date.now() - new Date(state.lastCollect).getTime()) / 3_600_000) + 1
+      // Query window: since last collect + 1h buffer. A missing cursor is only a safe
+      // 25h fallback on a genuinely first-ever run (cursor ConfigMap freshly seeded,
+      // never written by a real collect — initialized stays "false" until the first
+      // successful saveCursor()). If the ConfigMap was already initialized and
+      // lastCollect is missing anyway, the cursor was lost (wiped/corrupted): silently
+      // falling back to 25h here would silently drop any unprocessed mail older than
+      // that window. So this case fails LOUD instead — logged now, and folded into the
+      // heartbeat Lease by enrich() below (via CURSOR_LOST_FLAG) so the readiness probe
+      // goes NotReady and a human runs a manual backfill rather than trusting the gap
+      // was harmless.
+      const cursorLost = cursor.initialized && !cursor.lastCollect;
+      if (cursorLost) {
+        const msg = 'cursor lost: email-collector-cursor ConfigMap is initialized but ' +
+          'lastCollect is empty; falling back to a 25h window but reporting UNHEALTHY ' +
+          'so this gets fixed with a manual backfill instead of silently trusted';
+        console.error(`ALERT: ${msg}`);
+        try { writeFileSync(CURSOR_LOST_FLAG, msg); } catch { /* best-effort advisory only */ }
+      }
+      const sinceH = cursor.lastCollect
+        ? Math.ceil((Date.now() - new Date(cursor.lastCollect).getTime()) / 3_600_000) + 1
         : 25;
       const q = `newer_than:${sinceH}h`;
 
@@ -254,9 +521,11 @@ data:
         gmailList(token, `in:sent ${q}`),
       ]);
 
-      // Sent thread IDs → mark replied-to inbox threads
+      // Sent thread IDs → mark replied-to inbox threads. knownIds is process-local only
+      // (see loadCursor's comment above) — reset fresh every run, never persisted.
+      const knownIds = {};
       const sentThreads = new Set(sent.map(m => m.threadId));
-      for (const m of sent) state.knownIds[m.id] = { sent: true };
+      for (const m of sent) knownIds[m.id] = { sent: true };
 
       const today = new Date().toISOString().slice(0, 10);
       mkdirSync(MESSAGES, { recursive: true });
@@ -268,7 +537,7 @@ data:
 
       let added = 0;
       for (const ref of inbox) {
-        if (state.knownIds[ref.id]) continue;
+        if (knownIds[ref.id]) continue;
         const msg = await gmailGet(token, ref.id);
         const from = hdr(msg, 'From'), subj = hdr(msg, 'Subject'), date = hdr(msg, 'Date');
         const rec = {
@@ -281,7 +550,7 @@ data:
           gmail_link: gmailLink(ref.id, WORK_EMAIL),
           account: WORK_EMAIL,
         };
-        state.knownIds[ref.id] = { collected: today };
+        knownIds[ref.id] = { collected: today };
         if (!seenIds.has(ref.id)) { existing.push(rec); seenIds.add(ref.id); added++; }
         // Small delay to stay well within Gmail API quota (250 units/user/sec)
         await new Promise(r => setTimeout(r, 50));
@@ -291,30 +560,44 @@ data:
       writeFileSync(tmp, JSON.stringify(existing, null, 2));
       renameSync(tmp, dayFile);
 
-      state.lastCollect = new Date().toISOString();
-      saveState(state);
-      console.log(`collect [${WORK_EMAIL}]: +${added} new (${inbox.length} inbox, ${sent.length} sent checked)`);
+      try {
+        await saveCursor(new Date().toISOString());
+      } catch (e) {
+        // Self-healing: don't fail the run over a cursor write hiccup — next run's
+        // window arithmetic (based on the OLD, still-intact cursor) naturally re-covers
+        // whatever gap this causes. Only a wiped/missing lastCollect (cursorLost, above)
+        // needs a loud alert; a transient PATCH failure does not.
+        console.error(`WARN: cursor ConfigMap patch failed, will retry next run: ${e.message}`);
+      }
+      console.log(`collect [${WORK_EMAIL}]: +${added} new (${inbox.length} inbox, ${sent.length} sent checked)${cursorLost ? ' [CURSOR LOST]' : ''}`);
     }
 
     // ---------- backfill ----------
     // One-shot historical re-pull for a closed date window. `collect` only ever walks
-    // forward from state.lastCollect, so a gap in the day-files is structurally
-    // unrecoverable by the normal cadence — nothing ever looks backwards. backfill
-    // re-pulls the window straight from Gmail (the authoritative source) and files each
-    // message under the day-file for its own internalDate, which is where enrich already
-    // looks. Records are byte-identical in shape to collect's, so digest/enrich need no
-    // knowledge that a backfill happened.
+    // forward from the cursor, so a gap in the day-files is structurally unrecoverable
+    // by the normal cadence — nothing ever looks backwards. backfill re-pulls the window
+    // straight from Gmail (the authoritative source) and files each message under the
+    // day-file for its own internalDate, which is where enrich already looks. Records
+    // are byte-identical in shape to collect's, so digest/enrich need no knowledge that
+    // a backfill happened.
     //
-    // Deliberately never writes state.json. The every-minute collector owns that file and
-    // a slow backfill would clobber its concurrent knownIds/lastCollect updates on save.
-    // Skipping it is safe because the two never contend for the same message: collect's
-    // window is `newer_than:~2h` and backfill's is strictly historical. Worst case on
-    // overlap is a redundant Gmail fetch — the day-file and ingested.json both dedup by id.
+    // IMPORTANT (post-PVC): day-files now live on a pod-scoped emptyDir, not a shared
+    // PVC. backfill runs as its own one-off Pod/Job, separate from the every-minute
+    // CronJob, so anything it writes to /data would vanish with that pod before any
+    // later scheduled run could ever see it — there is no "next enrich run" to pick it
+    // up anymore. So backfill calls enrich() itself at the end, in-process, in the same
+    // pod, closing that gap without inventing new durable infrastructure (no new PVC, no
+    // database, no keeping the old PVC around as a fallback).
+    //
+    // Deliberately never touches the cursor ConfigMap — collect() owns lastCollect and
+    // the two never contend for the same message: collect's window is `newer_than:~2h`
+    // and backfill's is strictly historical. Worst case on overlap is a redundant Gmail
+    // fetch — the day-file and ingested.json both dedup by id.
     //
     // Window is given as UTC dates, both ends inclusive, and converted to epoch seconds
-    // for the Gmail query. Gmail's `after:`/`before:` accept Unix timestamps and interpret
-    // bare YYYY/MM/DD dates in the account's timezone; epoch keeps the window absolute and
-    // aligned with the UTC basis the day-file names already use.
+    // for the Gmail query. Gmail's `after:`/`before:` accept Unix timestamps and
+    // interpret bare YYYY/MM/DD dates in the account's timezone; epoch keeps the window
+    // absolute and aligned with the UTC basis the day-file names already use.
 
     function dayOf(msg, fallbackDate) {
       const ms = Number(msg.internalDate);
@@ -408,12 +691,21 @@ data:
       }
 
       if (undated) console.error(`WARN: ${undated} message(s) had no usable date and were skipped`);
-      console.log(`backfill: +${added} new across ${byDay.size} day-file(s); enrich will ingest on its next run`);
+      console.log(`backfill: +${added} new across ${byDay.size} day-file(s); running enrich now (same pod) to push into gbrain`);
+      await enrich();
     }
 
     // ---------- digest ----------
 
     async function digest() {
+      // NOTE (post-PVC): day-files live on a pod-scoped emptyDir now, so this can only
+      // ever see day-files written earlier in THIS pod's lifetime — today's file from
+      // this run's own collect() step, and (if backfill ran in this same invocation)
+      // whatever backfill just wrote. The "yesterday" half of the window is effectively
+      // always empty on the normal scheduled-CronJob path now; kept for the rare case a
+      // run straddles UTC midnight within one pod. This is a behavioural narrowing from
+      // the old PVC-backed rolling view, not a breakage: nothing else in this repo
+      // consumes the digest markdown output (verified by grep across manifests/).
       const today = new Date().toISOString().slice(0, 10);
       const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
       mkdirSync(DIGESTS, { recursive: true });
@@ -468,28 +760,77 @@ data:
     // are tracked in ingested.json so re-runs only push new mail (and the first run
     // backfills whatever the collector already accumulated). A run NEVER exits non-zero
     // on a gbrain outage — that would fail the Job and re-pull Gmail. Instead the outage
-    // is recorded in the heartbeat and surfaced by the readiness probe (NotReady).
+    // is recorded in the heartbeat Lease and surfaced by the readiness probe (NotReady).
+    //
+    // Post-PVC the cache lives in the email-collector-cursor ConfigMap, under its own
+    // `ingested.json` key alongside `cursor.json`. Both are written with JSON merge-patch,
+    // which merges into `data` per-key, so the two never clobber each other; one object
+    // means the collector's existing configmaps get/update/patch grant already covers it.
+    // On emptyDir it would start empty every run, and with a 1-minute schedule the whole
+    // of collect's ~2h overlap window would be re-pushed every single run — ~1400
+    // redundant put_page calls/day against gbrain's 60/min token budget, and ~20s of every
+    // 60s spent on upserts gbrain would just discard.
+    //
+    // Pruned by age, not by which IDs happen to be on this pod's emptyDir: backfill runs
+    // in its own pod whose day-files are entirely different, and pruning to that pod's ID
+    // set would wipe the scheduled collector's cache. 48h comfortably covers collect's ~2h
+    // window and keeps the object at a few tens of KB, far under the 1MB ConfigMap limit.
 
-    function loadIngested() {
-      if (!existsSync(INGESTED_FILE)) return {};
-      try { return JSON.parse(readFileSync(INGESTED_FILE, 'utf8')); }
-      catch { return {}; }
+    const INGESTED_KEY    = 'ingested.json';
+    const INGESTED_TTL_MS = 48 * 3_600_000;
+
+    async function loadIngested() {
+      let cm;
+      try {
+        cm = await k8sGet(CURSOR_PATH);
+      } catch (e) {
+        console.error(`WARN: ingested cache GET failed, treating as empty: ${e.message}`);
+        return {};
+      }
+      try { return JSON.parse(cm.data?.[INGESTED_KEY] ?? '{}'); } catch { return {}; }
     }
 
-    function saveIngested(obj) {
-      const tmp = `${INGESTED_FILE}.tmp`;
-      writeFileSync(tmp, JSON.stringify(obj, null, 2));
-      renameSync(tmp, INGESTED_FILE);
+    async function saveIngested(obj) {
+      const cutoff = Date.now() - INGESTED_TTL_MS;
+      const pruned = {};
+      for (const [id, v] of Object.entries(obj)) {
+        const at = Date.parse(v?.at ?? '');
+        if (Number.isFinite(at) && at >= cutoff) pruned[id] = v;
+      }
+      await k8sPatch(CURSOR_PATH, { data: { [INGESTED_KEY]: JSON.stringify(pruned) } });
+      return pruned;
     }
 
-    // Step 6 of the recipe: heartbeat. One overwrite file (for the probe) + an append
-    // log (for history/audit). Atomic write on the point-in-time file.
-    function writeHeartbeat(status, extra = {}) {
-      const rec = { ts: new Date().toISOString(), status, source_version: SOURCE_VERSION, ...extra };
-      const tmp = `${HEARTBEAT_JSON}.tmp`;
-      writeFileSync(tmp, JSON.stringify(rec, null, 2));
-      renameSync(tmp, HEARTBEAT_JSON);
-      try { appendFileSync(HEARTBEAT_LOG, JSON.stringify(rec) + '\n'); } catch { /* best-effort */ }
+    // Heartbeat: PATCH the Lease declared earlier in this file (merge-patch+json, so
+    // fields not mentioned here — e.g. acquireTime/leaseTransitions — are left alone).
+    // spec carries liveness (holderIdentity/renewTime/leaseDurationSeconds); the
+    // ingestion.simplesalt.company/ annotations carry the payload, matching
+    // calendar-collector.yaml's identical contract. Best-effort: a Lease write failure
+    // must not crash the caller (enrich always exits 0 — ingestion health lives in the
+    // probe, not Job status). If the Lease itself is unreachable, the readiness probe's
+    // own k8sGet will separately go stale and NotReady.
+    async function writeHeartbeat(status, { error, ingestedTotal, pushedThisRun } = {}) {
+      const now = new Date().toISOString();
+      const body = {
+        spec: {
+          holderIdentity: POD_NAME,
+          leaseDurationSeconds: HEARTBEAT_MAX_AGE_SEC,
+          renewTime: now,
+        },
+        metadata: {
+          annotations: {
+            [`${ANN}/status`]: status,
+            [`${ANN}/error`]: error ? String(error).slice(0, 800) : '',
+            [`${ANN}/ingested-total`]: String(ingestedTotal ?? ''),
+            [`${ANN}/pushed-this-run`]: String(pushedThisRun ?? ''),
+          },
+        },
+      };
+      try {
+        await k8sPatch(LEASE_PATH, body);
+      } catch (e) {
+        console.error(`WARN: heartbeat Lease patch failed: ${e.message}`);
+      }
     }
 
     // gbrain serves the MCP Streamable-HTTP transport in STATELESS mode
@@ -574,7 +915,7 @@ data:
     async function enrich() {
       try {
         if (!GBRAIN_TOKEN) {
-          writeHeartbeat('error', { error: 'GBRAIN_REMOTE_TOKEN not set', pushed_this_run: 0 });
+          await writeHeartbeat('error', { error: 'GBRAIN_REMOTE_TOKEN not set', pushedThisRun: 0 });
           console.error('enrich: GBRAIN_REMOTE_TOKEN not set — recorded in heartbeat, health will report NotReady');
           return;
         }
@@ -585,7 +926,7 @@ data:
           try { all.push(...JSON.parse(readFileSync(join(MESSAGES, f), 'utf8'))); } catch { /* skip bad file */ }
         }
         const byId = new Map(all.filter(m => m && m.id).map(m => [m.id, m]));
-        const ingested = loadIngested();
+        const ingested = await loadIngested();
         const pending = [...byId.values()].filter(m => !m.is_noise && !ingested[m.id]);
 
         let pushed = 0; const errors = [];
@@ -594,7 +935,6 @@ data:
             await gbrainPutPage(`email/${m.id}`, emailToMarkdown(m));
             ingested[m.id] = { at: new Date().toISOString() };
             pushed++;
-            saveIngested(ingested); // persist incrementally so a mid-run crash never re-pushes
           } catch (e) {
             errors.push(`${m.id}: ${e.message}`);
             // If the very first calls all fail, gbrain is likely down/misconfigured —
@@ -604,42 +944,64 @@ data:
           await new Promise(r => setTimeout(r, 1100)); // < 55/min, under gbrain's 60/min token limit
         }
 
-        const total = Object.keys(ingested).length;
-        const status = errors.length ? 'error' : 'ok';
-        writeHeartbeat(status, {
-          pushed_this_run: pushed,
-          ingested_total: total,
-          pending_remaining: pending.length - pushed,
-          errors: errors.slice(0, 5),
+        // One write per run, not one per push: a crash mid-loop just means the next run
+        // re-pushes what it already did, which put_page's upsert-by-slug absorbs, and a
+        // PATCH per message would be ~20 API writes a minute for nothing.
+        let total = Object.keys(ingested).length;
+        try {
+          total = Object.keys(await saveIngested(ingested)).length;
+        } catch (e) {
+          console.error(`enrich: saveIngested failed: ${e.message}`);
+          errors.push(`saveIngested: ${e.message}`);
+        }
+
+        const cursorLostNote = existsSync(CURSOR_LOST_FLAG) ? readFileSync(CURSOR_LOST_FLAG, 'utf8').trim() : '';
+        const errParts = errors.slice(0, 5);
+        if (cursorLostNote) errParts.unshift(cursorLostNote);
+        const status = errParts.length ? 'error' : 'ok';
+        await writeHeartbeat(status, {
+          pushedThisRun: pushed,
+          ingestedTotal: total,
+          error: errParts.join(' | '),
         });
-        console.log(`enrich: pushed ${pushed}/${pending.length} new → gbrain (total ${total})${errors.length ? `, ${errors.length} error(s)` : ''}`);
+        console.log(`enrich: pushed ${pushed}/${pending.length} new → gbrain (total ${total})${errors.length ? `, ${errors.length} error(s)` : ''}${cursorLostNote ? ', CURSOR LOST' : ''}`);
       } catch (e) {
-        writeHeartbeat('error', { error: e.message, pushed_this_run: 0 });
+        await writeHeartbeat('error', { error: e.message, pushedThisRun: 0 });
         console.error(`enrich: unexpected failure recorded in heartbeat: ${e.message}`);
       }
       // Always exit 0: ingestion health lives in the heartbeat/probe, not the Job status.
     }
 
     // ---------- healthcheck: k8s readiness probe target ----------
-    // Exit 0 = ingestion healthy (fresh heartbeat + last run ok). Exit 1 = NotReady.
-    function healthcheck() {
-      if (!existsSync(HEARTBEAT_JSON)) {
+    // Exit 0 = ingestion healthy (fresh Lease renewTime + last run status=ok). Exit 1 =
+    // NotReady. Reads the same Lease writeHeartbeat() patches, via the
+    // email-ingestion-health ServiceAccount's get-only Role (scoped to just this Lease).
+    async function healthcheck() {
+      let lease;
+      try {
+        lease = await k8sGet(LEASE_PATH);
+      } catch (e) {
+        console.error(`UNHEALTHY: cannot read heartbeat Lease: ${e.message}`);
+        process.exit(1);
+      }
+      const renewTime = lease.spec?.renewTime;
+      const leaseDurationSeconds = lease.spec?.leaseDurationSeconds ?? HEARTBEAT_MAX_AGE_SEC;
+      if (!renewTime) {
         console.error('UNHEALTHY: no heartbeat yet (pipeline has not completed a run)');
         process.exit(1);
       }
-      let hb;
-      try { hb = JSON.parse(readFileSync(HEARTBEAT_JSON, 'utf8')); }
-      catch (e) { console.error(`UNHEALTHY: heartbeat unreadable: ${e.message}`); process.exit(1); }
-      const ageSec = (Date.now() - new Date(hb.ts).getTime()) / 1000;
-      if (!Number.isFinite(ageSec) || ageSec > HEARTBEAT_MAX_AGE_SEC) {
-        console.error(`UNHEALTHY: heartbeat stale (${Math.round(ageSec)}s > ${HEARTBEAT_MAX_AGE_SEC}s max)`);
+      const ageSec = (Date.now() - new Date(renewTime).getTime()) / 1000;
+      if (!Number.isFinite(ageSec) || ageSec > leaseDurationSeconds) {
+        console.error(`UNHEALTHY: heartbeat stale (${Math.round(ageSec)}s > ${leaseDurationSeconds}s max)`);
         process.exit(1);
       }
-      if (hb.status !== 'ok') {
-        console.error(`UNHEALTHY: last run status=${hb.status} — ${(hb.errors ?? []).join('; ') || hb.error || 'see heartbeat'}`);
+      const ann = lease.metadata?.annotations ?? {};
+      const status = ann[`${ANN}/status`];
+      if (status !== 'ok') {
+        console.error(`UNHEALTHY: last run status=${status || '(none)'} — ${ann[`${ANN}/error`] || 'see Lease annotations'}`);
         process.exit(1);
       }
-      console.log(`OK: status=ok ingested_total=${hb.ingested_total ?? '?'} age=${Math.round(ageSec)}s`);
+      console.log(`OK: status=ok ingested_total=${ann[`${ANN}/ingested-total`] ?? '?'} age=${Math.round(ageSec)}s`);
     }
 
     // ---------- diagnose ----------
@@ -707,12 +1069,13 @@ data:
     else if (cmd === 'backfill')    await backfill();
     else if (cmd === 'digest')      await digest();
     else if (cmd === 'enrich')      await enrich();
-    else if (cmd === 'healthcheck') healthcheck();
+    else if (cmd === 'healthcheck') await healthcheck();
     else if (cmd === 'diagnose')    await diagnose();
     else { console.error('Usage: email-collector.mjs collect|backfill <from> <to>|digest|enrich|healthcheck|diagnose'); process.exit(1); }
 ---
-# CronJob runs the deterministic collector every 30 minutes.
-# concurrencyPolicy: Forbid ensures no overlapping runs (safe for state.json and atomic digest writes).
+# CronJob runs the deterministic collector every minute (schedule below).
+# concurrencyPolicy: Forbid ensures no overlapping runs (safe for the cursor ConfigMap
+# patch and the atomic digest/day-file writes within the pod's own emptyDir).
 # The pod uses the same SA credentials already in hermes-secrets (GOOGLE_PRIVATE_KEY_B64 +
 # GOOGLE_PRIVATE_KEY_ID), so no new Secrets are required.
 #
@@ -742,6 +1105,7 @@ spec:
           labels:
             app: email-collector
         spec:
+          serviceAccountName: email-collector
           restartPolicy: OnFailure
           containers:
             - name: collector
@@ -756,6 +1120,11 @@ spec:
               env:
                 - name: DATA_DIR
                   value: /data
+                # Lease holderIdentity — who is currently writing the heartbeat.
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
                 # Impersonated work-account identity, from the google-dwd-key Secret
                 # (declared above in this file). optional: true → pod still schedules
                 # when unset; script exits 1 with a clear FATAL message.
@@ -802,21 +1171,25 @@ spec:
                   mountPath: /scripts
                   readOnly: true
           volumes:
+            # Pod-scoped scratch space only (per-day message JSON, digests). Nothing here
+            # needs to survive past this pod — durable cross-pod state is the Lease +
+            # ConfigMap declared above.
             - name: email-data
-              persistentVolumeClaim:
-                claimName: email-collector-data
+              emptyDir: {}
             - name: collector-script
               configMap:
                 name: email-collector-script
 ---
-# K8s-native ingestion healthcheck. A minimal always-on pod that mounts the shared
-# PVC read-only and runs the collector script's `healthcheck` mode as a readinessProbe.
-# The probe passes only when the pipeline heartbeat is fresh (updated within
-# HEARTBEAT_MAX_AGE_SEC — 70 min = ~2 missed 30-min cycles) AND the last enrich run
-# reported status=ok. Result: `kubectl get pods` shows this pod 1/1 Ready when Gmail→gbrain
-# ingestion is healthy and 0/1 NotReady when it stalls — the same probe-based signal every
-# other Deployment in the cluster uses. No liveness probe: restarting this pod can't fix a
-# stalled pipeline, so ingestion failure must not churn it; readiness carries the signal.
+# K8s-native ingestion healthcheck. A minimal always-on pod that runs the collector
+# script's `healthcheck` mode as a readinessProbe, reading the email-collector-heartbeat
+# Lease via its own email-ingestion-health ServiceAccount/Role (get-only, scoped to that
+# one Lease by resourceNames). The probe passes only when the Lease's renewTime is fresh
+# (within leaseDurationSeconds — 900s = 15min = ~15 missed cycles at the 1-run/min
+# cadence) AND the last enrich run's status annotation is "ok". Result: `kubectl get
+# pods` shows this pod 1/1 Ready when Gmail→gbrain ingestion is healthy and 0/1 NotReady
+# when it stalls — the same probe-based signal every other Deployment in the cluster
+# uses. No liveness probe: restarting this pod can't fix a stalled pipeline, so
+# ingestion failure must not churn it; readiness carries the signal.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -828,10 +1201,11 @@ metadata:
     capability: ai
 spec:
   replicas: 1
-  # Recreate: the RWO PVC is fine to co-mount on this single node, but avoid keeping two
-  # health pods around across rollouts.
+  # RollingUpdate (the default): safe now that there's no RWO PVC forcing single-node
+  # co-mounting across rollouts. Was `Recreate` only because of the old
+  # email-collector-data PVC, now removed.
   strategy:
-    type: Recreate
+    type: RollingUpdate
   selector:
     matchLabels:
       app: email-ingestion-health
@@ -840,16 +1214,15 @@ spec:
       labels:
         app: email-ingestion-health
     spec:
+      serviceAccountName: email-ingestion-health
       containers:
         - name: health
           image: oven/bun:1-alpine
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c", "sleep infinity"]
           env:
-            - name: DATA_DIR
-              value: /data
             - name: HEARTBEAT_MAX_AGE_SEC
-              value: "4200"
+              value: "900"
           readinessProbe:
             exec:
               command: ["bun", "/scripts/email-collector.mjs", "healthcheck"]
@@ -865,16 +1238,10 @@ spec:
             limits:
               memory: 128Mi
           volumeMounts:
-            - name: email-data
-              mountPath: /data
-              readOnly: true
             - name: collector-script
               mountPath: /scripts
               readOnly: true
       volumes:
-        - name: email-data
-          persistentVolumeClaim:
-            claimName: email-collector-data
         - name: collector-script
           configMap:
             name: email-collector-script
