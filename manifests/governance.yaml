@@ -9,7 +9,7 @@
 # board-config Secret; the `governance` sidecar container itself (image,
 # volumes, env) is wired up in ai.yaml's hermes-agent Deployment, alongside
 # the init container that installs `gov` (from governance-cli-script) onto
-# the shared hermes-home PVC.
+# the shared ephemeral home volume.
 #
 # Fully generic/reusable: no target-repo, board, or personal-identity values
 # are hardcoded here. The project-tracking Secret's board-config.json (out-of-
@@ -1490,7 +1490,7 @@ data:
         srv = _start_uds_server()
         srv.serve_forever()
 ---
-# Thin CLI installed onto the shared hermes-home PVC as `gov` (see the
+# Thin CLI installed onto the shared ephemeral home volume as `gov` (see the
 # install-governance-cli init container in ai.yaml) so Hermes's terminal
 # tooling can run `gov status` / `gov sweep` / `gov check <issue>` without
 # any GitHub auth of its own — all API access happens sidecar-side, this

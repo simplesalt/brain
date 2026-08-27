@@ -52,28 +52,6 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
-# Persistent home for the hermes-agent (UID 10000). Stores session history,
-# kanban SQLite DB, skills, logs, and installed CLI binaries (claude, gh).
-# Init containers overwrite git-managed files (config.yaml, gh auth, .bashrc)
-# on every rollout, so those always match git; everything else persists across
-# restarts. storageClassName: local-path matches the cluster's provisioner.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: hermes-home
-  namespace: ssint-main-ai
-  labels:
-    entity: ssint
-    env: main
-    capability: ai
-spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: 5Gi
----
 # External PostgreSQL for hindsight, hosted as a CloudNativePG (CNPG) instance.
 # CNPG auto-generates the "hindsight-pg-app" secret (keys: uri, username,
 # password, dbname, host, port, ...) used by the hindsight deployment below.
@@ -463,10 +441,10 @@ spec:
         # container start. Same pattern as gbrain's restart-epoch above.
         simplesalt.company/restart-epoch: "2"
     spec:
-      # fsGroup ensures the hermes-home PVC is mounted with GID 10000 ownership
-      # so the hermes user (UID 10000) can write to it. fsGroupChangePolicy
-      # OnRootMismatch skips the recursive chown when the root dir already has
-      # the right GID, keeping restarts fast once the volume is initialised.
+      # fsGroup ensures the home volume is mounted with GID 10000 ownership so
+      # the hermes user (UID 10000) can write to it. emptyDir honours fsGroup the
+      # same way a PVC does. fsGroupChangePolicy OnRootMismatch skips the
+      # recursive chown when the root dir already has the right GID.
       securityContext:
         fsGroup: 10000
         fsGroupChangePolicy: OnRootMismatch
@@ -820,13 +798,13 @@ spec:
               # credential seeding above.
               #
               # The file lives on a tmpfs (the "secret-env" emptyDir, medium:
-              # Memory, mounted at /run/secret-env) — NOT on the hermes-home PVC.
+              # Memory, mounted at /run/secret-env) — NOT on the home volume.
               # The provider key is sourced from hermes-secrets and materialized
               # in RAM only: it is rewritten on every pod start and never
               # persisted to disk. $HERMES_HOME/.env is a symlink into that tmpfs
               # so Hermes still finds the real file its loader requires. `ln -sf`
               # also replaces any regular .env a previous revision left on the
-              # PVC, removing that stale on-disk secret on the next rollout.
+              # home volume, removing that stale file on the next rollout.
               mkdir -p /run/secret-env
               printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY" > /run/secret-env/.env
               chown 10000:10000 /run/secret-env/.env
@@ -1130,12 +1108,15 @@ spec:
               cpu: 200m
               memory: 128Mi
       volumes:
-        # Persistent home for session history, kanban DB, skills, logs, and
-        # installed CLI binaries. Init containers overwrite git-managed files
-        # (config.yaml, gh auth, .bashrc) on every rollout so those stay current.
+        # Ephemeral home. Every path under it is either seeded from a git-managed
+        # ConfigMap on each start (config.yaml, gh auth, .bashrc, SOUL/AGENTS) or
+        # re-fetched by a guarded init container (gov, claude, gh, skills). The
+        # only accumulated state was session history, logs, and the retired kanban
+        # DB, all of which are ephemeral by design — errors go to stderr for
+        # Kubernetes to persist. sizeLimit matches the retired PVC's 5Gi request.
         - name: home
-          persistentVolumeClaim:
-            claimName: hermes-home
+          emptyDir:
+            sizeLimit: 5Gi
         # Seed source for config.yaml (read-only ConfigMap); copied to the home
         # volume by the seed-hermes-config init container.
         - name: config-seed
@@ -1144,7 +1125,7 @@ spec:
         # RAM-backed (tmpfs) volume holding ONLY the provider-credential .env.
         # The seed-hermes-config init container writes it from hermes-secrets and
         # symlinks $HERMES_HOME/.env to it, so the OpenRouter key is materialized
-        # in memory on every start and never written to the hermes-home PVC.
+        # in memory on every start and never written to the home volume.
         # fsGroup (10000) makes the dir traversable by the hermes user.
         - name: secret-env
           emptyDir:
