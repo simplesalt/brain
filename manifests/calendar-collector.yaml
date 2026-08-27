@@ -7,35 +7,138 @@
 #
 # Pipeline (CronJob, every 6h): `sync` pulls a rolling window of events (default 90 days
 # back, 180 forward) for the primary calendar, writes structured per-day JSON + daily
-# markdown files to a PVC, then `enrich` pushes each event into gbrain via the MCP
-# put_page tool (SSE Streamable-HTTP transport). gbrain stores/searches the pages; entity
-# self-wiring is server-side-local-only (remote put_page reports auto_links: skipped), so
-# this populates searchable pages but not the graph — same tradeoff as email ingestion.
+# markdown files to an emptyDir (no PVC — see "Storage" below), then `enrich` pushes each
+# event into gbrain via the MCP put_page tool (SSE Streamable-HTTP transport). gbrain
+# stores/searches the pages; entity self-wiring is server-side-local-only (remote put_page
+# reports auto_links: skipped), so this populates searchable pages but not the graph —
+# same tradeoff as email ingestion.
 #
-# A companion Deployment (calendar-ingestion-health) runs the script's `healthcheck` mode
-# as a k8s readinessProbe over the pipeline heartbeat, so ingestion health shows up in
-# `kubectl get pods` like every other workload.
+# Storage: no PVC. `sync` re-fetches the ENTIRE rolling window every run (one API call
+# range, not incremental) and `enrich` runs in the SAME pod right after, so it always sees
+# a complete, freshly-written EVENTS/ tree — nothing depends on a day-file written by an
+# earlier invocation. ingested.json (the put_page idempotency cache) resets every pod too;
+# since gbrain's put_page is server-side idempotent, the only cost is redundant-but-
+# harmless re-pushes, never lost data. state.json is pure write-only telemetry (last-run
+# window/counts) — sync() computes its window from wall-clock time + CAL_DAYS_BACK/
+# CAL_DAYS_FWD and never reads state.json back, so it too is fully disposable. All of the
+# above → emptyDir, mounted in the CronJob pod only.
+#
+# The one thing that DOES need to cross pods is the ingestion heartbeat: both the CronJob
+# (writer) and the calendar-ingestion-health Deployment (reader, a separate pod/node) need
+# to see it. That's now a coordination.k8s.io/v1 Lease (calendar-collector-heartbeat,
+# pre-created below) instead of a shared PVC-backed file — the shared file is what
+# previously forced both pods onto the same node. holderIdentity/renewTime carry
+# freshness; the ingestion payload (status/error/ingested-total/pushed-this-run) rides in
+# annotations under the ingestion.simplesalt.company/ prefix, the same contract
+# email-collector uses. Pre-creating the Lease in git means the writer's RBAC needs only
+# get/update/patch, never create. The health Deployment mounts no /data volume at all — it
+# only reads the Lease.
 #
 # NOT implemented (documented simplifications vs the upstream calendar-to-brain v0.7.0
 # recipe): multi-year historical backfill (bounded to the rolling window — widen via
 # CAL_DAYS_BACK), multiple calendar accounts (primary only), and manual-note merge in
 # daily files (files are generated-only and overwritten each run).
-apiVersion: v1
-kind: PersistentVolumeClaim
+apiVersion: coordination.k8s.io/v1
+kind: Lease
 metadata:
-  name: calendar-collector-data
+  name: calendar-collector-heartbeat
   namespace: ssint-main-ai
   labels:
     entity: ssint
     env: main
     capability: ai
 spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: 2Gi
+  leaseDurationSeconds: 50400 # ~14h (>2 missed six-hour cycles); matches HEARTBEAT_MAX_AGE_SEC
+---
+# Dedicated identity for the CronJob pod — least privilege: may only get/update/patch the
+# one named heartbeat Lease below, never create or delete it, never touch anything else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: calendar-collector
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+---
+# Dedicated identity for the health Deployment — read-only: may only get the heartbeat
+# Lease to evaluate its own readinessProbe.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: calendar-ingestion-health
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: calendar-collector-heartbeat-writer
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "update", "patch"]
+    resourceNames: ["calendar-collector-heartbeat"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: calendar-collector-heartbeat-writer
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: calendar-collector-heartbeat-writer
+subjects:
+  - kind: ServiceAccount
+    name: calendar-collector
+    namespace: ssint-main-ai
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: calendar-collector-heartbeat-reader
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get"]
+    resourceNames: ["calendar-collector-heartbeat"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: calendar-collector-heartbeat-reader
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: calendar-collector-heartbeat-reader
+subjects:
+  - kind: ServiceAccount
+    name: calendar-ingestion-health
+    namespace: ssint-main-ai
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -56,7 +159,7 @@ data:
     // Usage: bun calendar-collector.mjs sync | enrich | healthcheck | diagnose
 
     import { createSign, createHash } from 'crypto';
-    import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, appendFileSync, readdirSync } from 'fs';
+    import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, readdirSync } from 'fs';
     import { join } from 'path';
 
     const DATA_DIR     = process.env.DATA_DIR ?? '/data';
@@ -78,13 +181,40 @@ data:
     ];
 
     // ---------- gbrain ingestion config ----------
+    // ingested.json is a pod-scoped idempotency cache (emptyDir): losing it costs
+    // redundant-but-idempotent put_page calls, never data (gbrain's put_page is
+    // server-side idempotent).
     const INGESTED_FILE = join(DATA_DIR, 'ingested.json');
-    const HEARTBEAT_JSON = join(DATA_DIR, 'heartbeat.json');
-    const HEARTBEAT_LOG  = join(DATA_DIR, 'heartbeat.jsonl');
     const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain:3131/mcp';
     const GBRAIN_TOKEN   = process.env.GBRAIN_REMOTE_TOKEN ?? '';
     const SOURCE_VERSION = 'cal-0.1.0';
+    // Fallback only when the Lease itself has no leaseDurationSeconds yet; the
+    // authoritative freshness window is the Lease's own spec field (see healthcheck()).
     const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 50400); // ~14h (>2 six-hour cycles)
+
+    // ---------- heartbeat: coordination.k8s.io/v1 Lease (cross-pod, no shared volume) ----------
+    // The Lease is pre-created in the manifest so this SA needs no `create` verb — only
+    // get/update/patch, scoped to this one resourceName. holderIdentity/renewTime are the
+    // freshness signal; the ingestion payload (status/error/ingested-total/pushed-this-run)
+    // rides in annotations under the ingestion.simplesalt.company/ prefix — same contract
+    // email-collector uses.
+    const K8S_API         = 'https://kubernetes.default.svc';
+    const SA_DIR           = '/var/run/secrets/kubernetes.io/serviceaccount';
+    const LEASE_NAMESPACE  = process.env.LEASE_NAMESPACE ?? 'ssint-main-ai';
+    const LEASE_NAME       = 'calendar-collector-heartbeat';
+    const LEASE_PATH       = `/apis/coordination.k8s.io/v1/namespaces/${LEASE_NAMESPACE}/leases/${LEASE_NAME}`;
+    const POD_NAME         = process.env.POD_NAME ?? 'unknown';
+
+    function k8sToken() { return readFileSync(join(SA_DIR, 'token'), 'utf8').trim(); }
+    function k8sCa()    { return readFileSync(join(SA_DIR, 'ca.crt'), 'utf8'); }
+
+    function k8sFetch(path, opts = {}) {
+      return fetch(`${K8S_API}${path}`, {
+        ...opts,
+        tls: { ca: k8sCa() },
+        headers: { Authorization: `Bearer ${k8sToken()}`, ...(opts.headers ?? {}) },
+      });
+    }
 
     // ---------- Google service-account JWT (DWD) ----------
 
@@ -280,10 +410,27 @@ data:
     }
     function saveIngested(obj) { saveJson(INGESTED_FILE, obj); }
 
-    function writeHeartbeat(status, extra = {}) {
-      const rec = { ts: new Date().toISOString(), status, source_version: SOURCE_VERSION, ...extra };
-      saveJson(HEARTBEAT_JSON, rec);
-      try { appendFileSync(HEARTBEAT_LOG, JSON.stringify(rec) + '\n'); } catch { /* best-effort */ }
+    async function writeHeartbeat(status, extra = {}) {
+      const ann = {
+        'ingestion.simplesalt.company/status': status,
+        'ingestion.simplesalt.company/error': extra.error ?? (extra.errors ?? []).join('; '),
+        'ingestion.simplesalt.company/ingested-total': String(extra.ingested_total ?? ''),
+        'ingestion.simplesalt.company/pushed-this-run': String(extra.pushed_this_run ?? ''),
+      };
+      const body = {
+        metadata: { annotations: ann },
+        spec: { holderIdentity: POD_NAME, renewTime: new Date().toISOString() },
+      };
+      try {
+        const r = await k8sFetch(LEASE_PATH, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/merge-patch+json' },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) console.error(`writeHeartbeat: Lease PATCH ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      } catch (e) {
+        console.error(`writeHeartbeat: Lease PATCH failed: ${e.message}`);
+      }
     }
 
     // gbrain MCP Streamable-HTTP transport (stateless): dual Accept header required,
@@ -372,7 +519,7 @@ data:
     async function enrich() {
       try {
         if (!GBRAIN_TOKEN) {
-          writeHeartbeat('error', { error: 'GBRAIN_REMOTE_TOKEN not set', pushed_this_run: 0 });
+          await writeHeartbeat('error', { error: 'GBRAIN_REMOTE_TOKEN not set', pushed_this_run: 0 });
           console.error('enrich: GBRAIN_REMOTE_TOKEN not set — recorded in heartbeat, health will report NotReady');
           return;
         }
@@ -409,7 +556,7 @@ data:
 
         const total = Object.keys(ingested).length;
         const status = errors.length ? 'error' : 'ok';
-        writeHeartbeat(status, {
+        await writeHeartbeat(status, {
           pushed_this_run: pushed,
           changed_pending: work.length,
           ingested_total: total,
@@ -417,31 +564,44 @@ data:
         });
         console.log(`enrich: pushed ${pushed}/${work.length} new-or-changed → gbrain (total ${total})${errors.length ? `, ${errors.length} error(s)` : ''}`);
       } catch (e) {
-        writeHeartbeat('error', { error: e.message, pushed_this_run: 0 });
+        await writeHeartbeat('error', { error: e.message, pushed_this_run: 0 });
         console.error(`enrich: unexpected failure recorded in heartbeat: ${e.message}`);
       }
       // Always exit 0: ingestion health lives in the heartbeat/probe, not the Job status.
     }
 
     // ---------- healthcheck: k8s readiness probe target ----------
-    function healthcheck() {
-      if (!existsSync(HEARTBEAT_JSON)) {
-        console.error('UNHEALTHY: no heartbeat yet (pipeline has not completed a run)');
+    async function healthcheck() {
+      let lease;
+      try {
+        const r = await k8sFetch(LEASE_PATH);
+        if (!r.ok) {
+          console.error(`UNHEALTHY: Lease GET ${r.status}: ${(await r.text()).slice(0, 200)}`);
+          process.exit(1);
+        }
+        lease = await r.json();
+      } catch (e) {
+        console.error(`UNHEALTHY: Lease GET failed: ${e.message}`);
         process.exit(1);
       }
-      let hb;
-      try { hb = JSON.parse(readFileSync(HEARTBEAT_JSON, 'utf8')); }
-      catch (e) { console.error(`UNHEALTHY: heartbeat unreadable: ${e.message}`); process.exit(1); }
-      const ageSec = (Date.now() - new Date(hb.ts).getTime()) / 1000;
-      if (!Number.isFinite(ageSec) || ageSec > HEARTBEAT_MAX_AGE_SEC) {
-        console.error(`UNHEALTHY: heartbeat stale (${Math.round(ageSec)}s > ${HEARTBEAT_MAX_AGE_SEC}s max)`);
+      const renewTime = lease.spec?.renewTime;
+      if (!renewTime) {
+        console.error('UNHEALTHY: no heartbeat yet (Lease has no renewTime — pipeline has not completed a run)');
         process.exit(1);
       }
-      if (hb.status !== 'ok') {
-        console.error(`UNHEALTHY: last run status=${hb.status} — ${(hb.errors ?? []).join('; ') || hb.error || 'see heartbeat'}`);
+      const maxAgeSec = lease.spec?.leaseDurationSeconds ?? HEARTBEAT_MAX_AGE_SEC;
+      const ageSec = (Date.now() - new Date(renewTime).getTime()) / 1000;
+      if (!Number.isFinite(ageSec) || ageSec > maxAgeSec) {
+        console.error(`UNHEALTHY: heartbeat stale (${Math.round(ageSec)}s > ${maxAgeSec}s max)`);
         process.exit(1);
       }
-      console.log(`OK: status=ok ingested_total=${hb.ingested_total ?? '?'} age=${Math.round(ageSec)}s`);
+      const ann = lease.metadata?.annotations ?? {};
+      const status = ann['ingestion.simplesalt.company/status'];
+      if (status !== 'ok') {
+        console.error(`UNHEALTHY: last run status=${status ?? 'unknown'} — ${ann['ingestion.simplesalt.company/error'] || 'see Lease annotations'}`);
+        process.exit(1);
+      }
+      console.log(`OK: status=ok ingested_total=${ann['ingestion.simplesalt.company/ingested-total'] ?? '?'} age=${Math.round(ageSec)}s`);
     }
 
     // ---------- diagnose ----------
@@ -472,7 +632,7 @@ data:
     const cmd = process.argv[2];
     if      (cmd === 'sync')        await sync();
     else if (cmd === 'enrich')      await enrich();
-    else if (cmd === 'healthcheck') healthcheck();
+    else if (cmd === 'healthcheck') await healthcheck();
     else if (cmd === 'diagnose')    await diagnose();
     else { console.error('Usage: calendar-collector.mjs sync|enrich|healthcheck|diagnose'); process.exit(1); }
 ---
@@ -502,6 +662,9 @@ spec:
             app: calendar-collector
         spec:
           restartPolicy: OnFailure
+          # Dedicated SA (calendar-collector RBAC block above): get/update/patch on the one
+          # named heartbeat Lease only, never `create` (the Lease is pre-created in git).
+          serviceAccountName: calendar-collector
           containers:
             - name: collector
               image: oven/bun:1-alpine
@@ -514,6 +677,11 @@ spec:
               env:
                 - name: DATA_DIR
                   value: /data
+                # Lease spec.holderIdentity — which pod last wrote the heartbeat.
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
                 # Impersonated work-account identity + service-account identity, from the
                 # google-dwd-key Secret (declared in email-collector.yaml, same namespace).
                 # optional: true → pod still schedules when unset; script exits 1 with a
@@ -562,17 +730,21 @@ spec:
                   mountPath: /scripts
                   readOnly: true
           volumes:
+            # Pod-scoped scratch (state.json/ingested.json/events/daily/raw) — see the
+            # "Storage" note in the file header for why none of this needs to survive a
+            # pod restart.
             - name: calendar-data
-              persistentVolumeClaim:
-                claimName: calendar-collector-data
+              emptyDir: {}
             - name: collector-script
               configMap:
                 name: calendar-collector-script
 ---
 # K8s-native ingestion healthcheck (see email-collector.yaml for the rationale). Readiness
 # passes only when the heartbeat is fresh (< HEARTBEAT_MAX_AGE_SEC — 14h ≈ 2 missed 6h
-# cycles) AND the last enrich reported status=ok. No liveness probe (restart can't fix a
-# stalled pipeline).
+# cycles) AND the last enrich reported status=ok. Reads the heartbeat via the
+# calendar-collector-heartbeat Lease (get-only RBAC) instead of a shared volume — this
+# Deployment mounts no /data at all. No liveness probe (restart can't fix a stalled
+# pipeline).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -584,8 +756,6 @@ metadata:
     capability: ai
 spec:
   replicas: 1
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
       app: calendar-ingestion-health
@@ -594,14 +764,15 @@ spec:
       labels:
         app: calendar-ingestion-health
     spec:
+      # Dedicated SA (calendar-ingestion-health RBAC block above): get-only on the one
+      # named heartbeat Lease, nothing else.
+      serviceAccountName: calendar-ingestion-health
       containers:
         - name: health
           image: oven/bun:1-alpine
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c", "sleep infinity"]
           env:
-            - name: DATA_DIR
-              value: /data
             - name: HEARTBEAT_MAX_AGE_SEC
               value: "50400"
           readinessProbe:
@@ -619,16 +790,10 @@ spec:
             limits:
               memory: 128Mi
           volumeMounts:
-            - name: calendar-data
-              mountPath: /data
-              readOnly: true
             - name: collector-script
               mountPath: /scripts
               readOnly: true
       volumes:
-        - name: calendar-data
-          persistentVolumeClaim:
-            claimName: calendar-collector-data
         - name: collector-script
           configMap:
             name: calendar-collector-script
