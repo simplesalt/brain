@@ -488,9 +488,13 @@ data:
         'ingestion.simplesalt.company/ingested-total': String(extra.ingested_total ?? ''),
         'ingestion.simplesalt.company/pushed-this-run': String(extra.pushed_this_run ?? ''),
       };
+      // Lease.spec.renewTime is a metav1.MicroTime, decoded with Go's RFC3339Micro layout
+      // ("...05.000000Z07:00"), which requires EXACTLY six fractional digits.
+      // toISOString() emits three, and the apiserver rejects the whole patch with 422
+      // Invalid rather than rounding. Pad the milliseconds out to microseconds.
       const body = {
         metadata: { annotations: ann },
-        spec: { holderIdentity: POD_NAME, renewTime: new Date().toISOString() },
+        spec: { holderIdentity: POD_NAME, renewTime: new Date().toISOString().replace('Z', '000Z') },
       };
       try {
         const r = await k8sFetch(LEASE_PATH, {

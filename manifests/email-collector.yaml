@@ -809,8 +809,14 @@ data:
     // must not crash the caller (enrich always exits 0 — ingestion health lives in the
     // probe, not Job status). If the Lease itself is unreachable, the readiness probe's
     // own k8sGet will separately go stale and NotReady.
+    // Lease.spec.renewTime is a metav1.MicroTime, decoded with Go's RFC3339Micro layout
+    // ("...05.000000Z07:00"), which requires EXACTLY six fractional digits. toISOString()
+    // emits three, and the apiserver rejects the whole patch with 422 Invalid rather than
+    // rounding. Pad the milliseconds out to microseconds.
+    function microNow() { return new Date().toISOString().replace('Z', '000Z'); }
+
     async function writeHeartbeat(status, { error, ingestedTotal, pushedThisRun } = {}) {
-      const now = new Date().toISOString();
+      const now = microNow();
       const body = {
         spec: {
           holderIdentity: POD_NAME,
