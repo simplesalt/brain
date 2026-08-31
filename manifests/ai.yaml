@@ -210,6 +210,14 @@ spec:
                 || echo "WARN: gbrain init failed; serve may not work correctly"
               $GBRAIN config set mcp.publish_advisor true \
                 || echo "WARN: config set mcp.publish_advisor failed (non-fatal)"
+              # ZeroEntropy's hosted API (the zerank-2 reranker default) shuts
+              # down 2026-09-04. Reranker config lives on the DB plane (unlike
+              # embedding config, which lives on file/env), so pinning it here
+              # is the correct, idempotent, git-tracked equivalent of the live
+              # `gbrain config set` gbrain itself suggests in its own
+              # deprecation banner.
+              $GBRAIN config set search.reranker.model voyage:rerank-2.5 \
+                || echo "WARN: config set search.reranker.model failed (non-fatal)"
               # Seed our own bearer. gbrain only accepts /mcp tokens that exist
               # in its DB (verifyAccessToken; static-env fallback was removed),
               # so we write sha256(GBRAIN_REMOTE_TOKEN) into access_tokens. Plain
@@ -271,13 +279,11 @@ spec:
                   name: gbrain-embedding-secret
                   key: OPENAI_API_KEY
                   optional: true
-            # Alternate embedding provider (gbrain's own default). Left wired but
-            # inactive — GBRAIN_EMBEDDING_MODEL selects OpenAI above.
-            - name: ZEROENTROPY_API_KEY
+            - name: VOYAGE_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: hermes-secrets
-                  key: ZEROENTROPY_API_KEY
+                  name: gbrain-reranker-secret
+                  key: VOYAGE_API_KEY
                   optional: true
             # Bearer token for the HTTP MCP endpoint (/mcp). Clients (including
             # hermes) must send `Authorization: Bearer <token>` on every request.

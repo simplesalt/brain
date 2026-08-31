@@ -6,6 +6,7 @@ resources:
   - manifests/big-agi.yaml
   - manifests/hermes-proxy.yaml
   - manifests/gbrain-embedding-secret.yaml
+  - manifests/gbrain-reranker-secret.yaml
   - manifests/email-collector.yaml
   - manifests/calendar-collector.yaml
   - manifests/hermes-msg.yaml
