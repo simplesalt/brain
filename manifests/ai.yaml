@@ -67,7 +67,6 @@ metadata:
     env: main
     capability: ai
 spec:
-  instances: 1
   imageName: ghcr.io/cloudnative-pg/postgresql:17
   bootstrap:
     initdb:
@@ -92,7 +91,6 @@ metadata:
     env: main
     capability: ai
 spec:
-  instances: 1
   imageName: ghcr.io/cloudnative-pg/postgresql:17
   bootstrap:
     initdb:
