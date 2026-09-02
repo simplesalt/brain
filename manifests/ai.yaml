@@ -417,6 +417,146 @@ spec:
       port: 3131
       targetPort: 3131
 ---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-migrate-embedding-dims
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+spec:
+  activeDeadlineSeconds: 14400
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: gbrain-migrate-embedding-dims
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-db
+          image: postgres:17-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - until pg_isready -h gbrain-pg-rw -p 5432; do echo "waiting for gbrain-pg-rw:5432"; sleep 2; done
+        - name: install-gbrain
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ ! -x /install/bin/gbrain ]; then
+                BUN_INSTALL=/install bun install -g github:garrytan/gbrain#492b5528238dfea0ed9e3ee491805d83af86f6a6 \
+                  || { echo "FATAL: gbrain install failed"; exit 1; }
+              fi
+          volumeMounts:
+            - name: gbrain-install
+              mountPath: /install
+      containers:
+        - name: migrate
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PATH="/install/bin:$PATH"
+              # Resolve the gbrain command exactly like the gbrain
+              # Deployment's entrypoint does (see the gbrain container
+              # above): the install shim at /install/bin/gbrain can be a
+              # dangling symlink for github installs (garrytan/gbrain#218),
+              # so probe it and fall back to invoking cli.ts directly via bun.
+              if [ -x /install/bin/gbrain ] && /install/bin/gbrain --version >/dev/null 2>&1; then
+                GBRAIN="/install/bin/gbrain"
+              else
+                CLI="$(find /install -maxdepth 8 -path '*/gbrain/src/cli.ts' 2>/dev/null | head -1)"
+                if [ -z "$CLI" ]; then
+                  echo "FATAL: gbrain CLI not found. /install layout:"
+                  ls -la /install /install/bin 2>&1
+                  find /install -maxdepth 8 -name cli.ts 2>/dev/null | head
+                  exit 1
+                fi
+                GBRAIN="bun $CLI"
+              fi
+              echo "Using gbrain command: $GBRAIN"
+
+              # Idempotency guard: read the CURRENT dimension of
+              # content_chunks.embedding before touching anything. Same
+              # Bun.SQL-against-DATABASE_URL idiom as the gbrain Deployment's
+              # token-seed step above (bun -e + Bun.SQL) — a read-only,
+              # parameterized query, not hand-built SQL.
+              CURRENT_DIM=$(bun -e '
+                import { SQL } from "bun";
+                const db = new SQL(process.env.DATABASE_URL);
+                const rows = await db`SELECT format_type(atttypid, atttypmod) AS t FROM pg_attribute WHERE attrelid = ${"content_chunks"}::regclass AND attname = ${"embedding"} AND NOT attisdropped`;
+                await db.end();
+                console.log(rows[0]?.t ?? "");
+              ') || { echo "FATAL: could not query content_chunks.embedding column type"; exit 1; }
+              echo "gbrain: content_chunks.embedding is currently ${CURRENT_DIM:-<not found>}"
+
+              if [ "$CURRENT_DIM" = "vector(1536)" ]; then
+                echo "gbrain: already vector(1536) -- migration already applied (safe Job retry); skipping destructive SQL and re-init, going straight to embed --stale."
+              else
+                echo "gbrain: migrating content_chunks.embedding from ${CURRENT_DIM:-<unset>} to vector(1536) (openai:text-embedding-3-small); this NULLs every existing embedding, backfilled by embed --stale below."
+                # The recipe gbrain's entrypoint prints on a dimension
+                # mismatch, run as one transaction via Bun.SQL's db.begin().
+                # NULL embeddings BEFORE the ALTER: pgvector refuses to cast
+                # existing vectors across dimensions and aborts the
+                # transaction; NULLs cast fine.
+                bun -e '
+                  import { SQL } from "bun";
+                  const db = new SQL(process.env.DATABASE_URL);
+                  await db.begin(async (tx) => {
+                    await tx`DROP INDEX IF EXISTS idx_chunks_embedding`;
+                    await tx`UPDATE content_chunks SET embedding = NULL, embedded_at = NULL`;
+                    await tx`ALTER TABLE content_chunks ALTER COLUMN embedding TYPE vector(1536)`;
+                    await tx`CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON content_chunks USING hnsw (embedding vector_cosine_ops)`;
+                  });
+                  await db.end();
+                  console.log("gbrain: schema migrated to vector(1536); embeddings nulled for re-embed.");
+                ' || { echo "FATAL: destructive dimension migration failed"; exit 1; }
+
+                # Re-init now that the column matches, so gbrain's own config
+                # (file plane is canonical post-v0.37) agrees with the schema.
+                $GBRAIN init --non-interactive --supabase --embedding-model openai:text-embedding-3-small --embedding-dimensions 1536 \
+                  || { echo "FATAL: gbrain init (post-migration reconfigure) failed"; exit 1; }
+              fi
+
+              echo 'gbrain: starting embed --stale backfill (long-running: hours, $1-100 in OpenAI API calls).'
+              exec $GBRAIN embed --stale
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+            - name: GBRAIN_EMBEDDING_MODEL
+              value: openai:text-embedding-3-small
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-embedding-secret
+                  key: OPENAI_API_KEY
+                  optional: true
+          resources:
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: gbrain-install
+              mountPath: /install
+      volumes:
+        - name: gbrain-install
+          emptyDir: {}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
