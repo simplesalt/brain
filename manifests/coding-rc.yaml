@@ -15,6 +15,20 @@ spec:
     tag: "0.4.24"
     digest: "sha256:9a482c27d14f9c2b47ebe13c7e5fe5457663933305be8c1f8565b305d3ac8a7a"
 ---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: simplesalt-charts
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  type: oci
+  url: oci://ghcr.io/simplesalt/charts
+  interval: 12h
+---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
@@ -26,10 +40,14 @@ metadata:
     capability: coding
 spec:
   interval: 5m
-  chartRef:
-    kind: OCIRepository
-    name: builder
-    namespace: flux-system
+  chart:
+    spec:
+      chart: builder
+      version: "0.4.27"
+      sourceRef:
+        kind: HelmRepository
+        name: simplesalt-charts
+        namespace: flux-system
   targetNamespace: ssint-main-coding
   install:
     createNamespace: false
