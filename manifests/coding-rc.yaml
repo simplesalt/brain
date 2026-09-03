@@ -172,10 +172,14 @@ metadata:
     capability: coding
 spec:
   interval: 5m
-  chartRef:
-    kind: OCIRepository
-    name: builder
-    namespace: flux-system
+  chart:
+    spec:
+      chart: builder
+      version: "0.4.27"
+      sourceRef:
+        kind: HelmRepository
+        name: simplesalt-charts
+        namespace: flux-system
   targetNamespace: ssint-main-coding
   install:
     createNamespace: false
