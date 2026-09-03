@@ -552,8 +552,6 @@ spec:
                   key: OPENAI_API_KEY
                   optional: true
           resources:
-            requests:
-              memory: 128Mi
             limits:
               memory: 2Gi
           volumeMounts:
