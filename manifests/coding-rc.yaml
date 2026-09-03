@@ -49,6 +49,10 @@ spec:
     oauthSecret:
       create: false
       name: claude-oauth-basis
+    resources:
+      builder:
+        requests:
+          memory: 512Mi
     hindsight:
       bankId: coding
     extraEnv:
@@ -95,6 +99,10 @@ spec:
     oauthSecret:
       create: false
       name: claude-oauth-brain
+    resources:
+      builder:
+        requests:
+          memory: 512Mi
     hindsight:
       bankId: coding
     extraEnv:
@@ -141,6 +149,10 @@ spec:
     oauthSecret:
       create: false
       name: claude-oauth-oci
+    resources:
+      builder:
+        requests:
+          memory: 512Mi
     hindsight:
       bankId: coding
     extraEnv:

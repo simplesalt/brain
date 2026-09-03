@@ -323,6 +323,8 @@ spec:
           # RSS watchdog sizes from the cgroup limit; an unbounded basis has
           # caused a respawn loop, so a memory limit gives it a sane basis.
           resources:
+            requests:
+              memory: 128Mi
             limits:
               memory: 2Gi
           volumeMounts:
@@ -391,6 +393,8 @@ spec:
                   key: OPENAI_API_KEY
                   optional: true
           resources:
+            requests:
+              memory: 128Mi
             limits:
               memory: 2Gi
           volumeMounts:
@@ -548,6 +552,8 @@ spec:
                   key: OPENAI_API_KEY
                   optional: true
           resources:
+            requests:
+              memory: 128Mi
             limits:
               memory: 2Gi
           volumeMounts:
