@@ -162,3 +162,50 @@ spec:
       enabled: true
       create: false
       existingConfigMap: claude-rc-skel-override
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: build-projects
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: builder
+      version: "0.4.30"
+      sourceRef:
+        kind: HelmRepository
+        name: simplesalt-charts
+        namespace: flux-system
+  targetNamespace: ssint-main-coding
+  install:
+    createNamespace: false
+    timeout: 10m
+    remediation:
+      retries: 3
+  upgrade:
+    timeout: 10m
+    remediation:
+      retries: 3
+  values:
+    repo:
+      slug: projects
+      ref: main
+    oauthSecret:
+      create: true
+    resources:
+      builder:
+        requests:
+          memory: 512Mi
+    extraEnv:
+      - name: HINDSIGHT_AUTO_RETAIN
+        value: "false"
+    skelOverride:
+      enabled: true
+      create: false
+      existingConfigMap: claude-rc-skel-override
