@@ -54,7 +54,7 @@ spec:
         requests:
           memory: 512Mi
     hindsight:
-      bankId: coding
+      bankId: ssint-build-basis
     extraEnv:
       - name: HINDSIGHT_AUTO_RETAIN
         value: "false"
@@ -104,7 +104,7 @@ spec:
         requests:
           memory: 512Mi
     hindsight:
-      bankId: coding
+      bankId: ssint-build-brain
     extraEnv:
       - name: HINDSIGHT_AUTO_RETAIN
         value: "false"
@@ -154,7 +154,7 @@ spec:
         requests:
           memory: 512Mi
     hindsight:
-      bankId: coding
+      bankId: ssint-build-oci
     extraEnv:
       - name: HINDSIGHT_AUTO_RETAIN
         value: "false"
@@ -202,6 +202,8 @@ spec:
       builder:
         requests:
           memory: 512Mi
+    hindsight:
+      bankId: ssint-build-projects
     extraEnv:
       - name: HINDSIGHT_AUTO_RETAIN
         value: "false"
