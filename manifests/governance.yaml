@@ -59,6 +59,7 @@ data:
     import re
     import socket
     import socketserver
+    import ssl
     import sys
     import threading
     import time
@@ -99,15 +100,6 @@ data:
     SOCKET_PATH = os.environ.get("SOCKET_PATH", "/var/run/governance/governance.sock")
     POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
     SWEEP_INTERVAL_HOURS = int(os.environ.get("SWEEP_INTERVAL_HOURS", "24"))
-
-    # Type ladder. Kept as rule logic (not board identity) — see docstring on
-    # lint_issue's S05 check for why Epic -> Task is deliberately permitted.
-    TYPE_ALLOWED_CHILDREN = {
-        "Epic": {"Epic", "Feature", "Task", "Bug"},
-        "Feature": {"Task", "Bug"},
-        "Task": set(),
-        "Bug": set(),
-    }
 
     _run_lock = threading.Lock()          # serializes sweep/check/poll against each other
     _state_lock = threading.Lock()        # guards _state
@@ -184,29 +176,31 @@ data:
     # Generic board-template conventions used to match resolved names — not
     # identifying data, just the shape any deployer of this template shares.
 
-    ISSUE_TYPE_NAMES = ("Epic", "Feature", "Task", "Bug")
+    ISSUE_TYPE_NAMES = ("Feature", "Bug", "Analysis", "Advisory")
 
     FIELD_NAMES = {
         "status": "Status",
         "priority": "Priority",
-        "start_date": "Start Date",
-        "target_date": "Target Date",
-        "review_on": "Review On",
-        "initiative": "Initiative",
+        "assigned": "Assigned",
+        "in_use": "In Use",
     }
 
     STATUS_OPTION_NAMES = {
-        "upcoming": "Upcoming",
-        "in_progress": "In Progress",
+        "planning": "Planning",
+        "doing": "Doing",
         "blocked": "Blocked",
-        "monitoring": "Monitoring",
-        "complete": "Complete",
+        "done": "Done",
         "cancelled": "Cancelled",
     }
 
-    WORKSTREAM_LABEL_PREFIX = "workstream:"
     LABEL_BLOCKED_EXTERNAL_NAME = "blocked-external"
     LABEL_NEEDS_TRIAGE_NAME = "needs-triage"
+
+    # Namespace where coding pods run — used only by the B07 stale-lease check
+    # to ask the Kubernetes API whether an "In Use" holder pod still exists.
+    CODING_NAMESPACE = os.environ.get("GOVERNANCE_CODING_NAMESPACE", "ssint-main-coding")
+    K8S_SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    K8S_SA_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
 
     def resolve_board_config(cfg: dict) -> Optional[dict]:
@@ -244,23 +238,13 @@ data:
             repo_node = data["repository"]
             repo_id = repo_node["id"]
 
-            issue_types = {
-                it["name"]: it["id"] for it in repo_node["issueTypes"]["nodes"]
-                if it["name"] in ISSUE_TYPE_NAMES
-            }
-            missing_types = [n for n in ISSUE_TYPE_NAMES if n not in issue_types]
+            issue_type_names = {it["name"] for it in repo_node["issueTypes"]["nodes"]}
+            missing_types = [n for n in ISSUE_TYPE_NAMES if n not in issue_type_names]
             if missing_types:
                 print(f"[governance] repo {repo} is missing issue type(s): {missing_types}", file=sys.stderr)
                 return None
 
             labels_by_name = {lbl["name"]: lbl["id"] for lbl in repo_node["labels"]["nodes"]}
-            workstream_label_ids = [
-                lbl_id for lbl_name, lbl_id in labels_by_name.items()
-                if lbl_name.startswith(WORKSTREAM_LABEL_PREFIX)
-            ]
-            if not workstream_label_ids:
-                print(f"[governance] repo {repo} has no '{WORKSTREAM_LABEL_PREFIX}*' labels", file=sys.stderr)
-                return None
 
             required_label_names = (LABEL_BLOCKED_EXTERNAL_NAME, LABEL_NEEDS_TRIAGE_NAME, LABEL_GOVERNANCE_VIOLATION_NAME)
             missing_labels = [n for n in required_label_names if n not in labels_by_name]
@@ -339,11 +323,9 @@ data:
                 "repo": repo,
                 "repo_id": repo_id,
                 "board_id": board_id,
-                "issue_types": issue_types,
                 "fields": fields,
                 "status": status,
                 "labels": {
-                    "workstream": workstream_label_ids,
                     "blocked_external": labels_by_name[LABEL_BLOCKED_EXTERNAL_NAME],
                     "governance_violation": labels_by_name[LABEL_GOVERNANCE_VIOLATION_NAME],
                     "needs_triage": labels_by_name[LABEL_NEEDS_TRIAGE_NAME],
@@ -362,40 +344,32 @@ data:
     REPO_ID = (_resolved or {}).get("repo_id", "")
     BOARD_ID = (_resolved or {}).get("board_id", "")
 
-    ISSUE_TYPES = (_resolved or {}).get("issue_types", {}) or {}
-    ISSUE_TYPE_BY_ID = {v: k for k, v in ISSUE_TYPES.items()}
-
     _resolved_fields = (_resolved or {}).get("fields", {}) or {}
     FIELD_STATUS = _resolved_fields.get("status")
     FIELD_PRIORITY = _resolved_fields.get("priority")
-    FIELD_START_DATE = _resolved_fields.get("start_date")
-    FIELD_TARGET_DATE = _resolved_fields.get("target_date")
-    FIELD_REVIEW_ON = _resolved_fields.get("review_on")
-    FIELD_INITIATIVE = _resolved_fields.get("initiative")
+    FIELD_ASSIGNED = _resolved_fields.get("assigned")
+    FIELD_IN_USE = _resolved_fields.get("in_use")
 
     _resolved_status = (_resolved or {}).get("status", {}) or {}
-    STATUS_UPCOMING = _resolved_status.get("upcoming")
-    STATUS_IN_PROGRESS = _resolved_status.get("in_progress")
+    STATUS_PLANNING = _resolved_status.get("planning")
+    STATUS_DOING = _resolved_status.get("doing")
     STATUS_BLOCKED = _resolved_status.get("blocked")
-    STATUS_MONITORING = _resolved_status.get("monitoring")
-    STATUS_COMPLETE = _resolved_status.get("complete")
+    STATUS_DONE = _resolved_status.get("done")
     STATUS_CANCELLED = _resolved_status.get("cancelled")
 
-    STATUS_ACTIVE = {s for s in (STATUS_UPCOMING, STATUS_IN_PROGRESS, STATUS_BLOCKED, STATUS_MONITORING) if s}
-    STATUS_CLOSED = {s for s in (STATUS_COMPLETE, STATUS_CANCELLED) if s}
+    STATUS_ACTIVE = {s for s in (STATUS_PLANNING, STATUS_DOING, STATUS_BLOCKED) if s}
+    STATUS_CLOSED = {s for s in (STATUS_DONE, STATUS_CANCELLED) if s}
 
     STATUS_ID_TO_NAME = {
-        STATUS_UPCOMING: "Upcoming",
-        STATUS_IN_PROGRESS: "In Progress",
+        STATUS_PLANNING: "Planning",
+        STATUS_DOING: "Doing",
         STATUS_BLOCKED: "Blocked",
-        STATUS_MONITORING: "Monitoring",
-        STATUS_COMPLETE: "Complete",
+        STATUS_DONE: "Done",
         STATUS_CANCELLED: "Cancelled",
     }
     STATUS_ID_TO_NAME.pop(None, None)
 
     _resolved_labels = (_resolved or {}).get("labels", {}) or {}
-    WORKSTREAM_LABEL_IDS = set(_resolved_labels.get("workstream", []) or [])
     LABEL_BLOCKED_EXTERNAL = _resolved_labels.get("blocked_external")
     LABEL_GOVERNANCE_VIOLATION = _resolved_labels.get("governance_violation")
     LABEL_NEEDS_TRIAGE = _resolved_labels.get("needs_triage")
@@ -407,25 +381,16 @@ data:
       fragment IssueFields on Issue {
         id
         number
-        title
         state
         stateReason
         createdAt
         body
         issueType { id name }
         labels(first: 30) { nodes { id name } }
-        parent { id number title }
+        parent { id number }
         subIssues(first: 100) { nodes { id number state } totalCount }
         blockedBy(first: 50) { nodes { id number state } }
         blocking(first: 50) { nodes { id number state } }
-        timelineItems(first: 100, itemTypes: [LABELED_EVENT]) {
-          nodes {
-            ... on LabeledEvent {
-              createdAt
-              label { name }
-            }
-          }
-        }
       }
     """
 
@@ -517,10 +482,8 @@ data:
             "status_option_id": None,
             "status_name": None,
             "priority": None,
-            "start_date": None,
-            "target_date": None,
-            "review_on": None,
-            "initiative": None,
+            "assigned": None,
+            "in_use": None,
         }
         for fv in item.get("fieldValues", {}).get("nodes", []):
             field_id = (fv.get("field") or {}).get("id")
@@ -529,14 +492,10 @@ data:
                 parsed["status_name"] = fv.get("name")
             elif field_id == FIELD_PRIORITY:
                 parsed["priority"] = fv.get("number")
-            elif field_id == FIELD_START_DATE:
-                parsed["start_date"] = fv.get("date")
-            elif field_id == FIELD_TARGET_DATE:
-                parsed["target_date"] = fv.get("date")
-            elif field_id == FIELD_REVIEW_ON:
-                parsed["review_on"] = fv.get("date")
-            elif field_id == FIELD_INITIATIVE:
-                parsed["initiative"] = fv.get("text")
+            elif field_id == FIELD_ASSIGNED:
+                parsed["assigned"] = fv.get("name")
+            elif field_id == FIELD_IN_USE:
+                parsed["in_use"] = fv.get("text")
         return parsed
 
 
@@ -597,16 +556,6 @@ data:
         return ancestors
 
 
-    def get_root(issue: dict, issue_cache: dict) -> Optional[dict]:
-        """Return the root ancestor (no parent) of the issue."""
-        ancestors = get_ancestors(issue, issue_cache)
-        if ancestors:
-            return ancestors[-1]
-        if not issue.get("parent"):
-            return issue
-        return None
-
-
     def get_all_descendants(issue: dict, issue_cache: dict, visited: Optional[set] = None) -> list:
         """BFS of all sub-issues."""
         if visited is None:
@@ -628,19 +577,59 @@ data:
         return result
 
 
-    def get_type_name(issue: dict) -> Optional[str]:
-        it = issue.get("issueType")
-        if not it:
-            return None
-        return ISSUE_TYPE_BY_ID.get(it["id"], it.get("name"))
-
-
     def get_label_ids(issue: dict) -> set:
         return {lbl["id"] for lbl in issue.get("labels", {}).get("nodes", [])}
 
 
     def get_label_names(issue: dict) -> set:
         return {lbl["name"] for lbl in issue.get("labels", {}).get("nodes", [])}
+
+
+    # ── Coding-pod liveness (for B07) ───────────────────────────────────────────
+    #
+    # Backs the "In Use lease held by a session that no longer exists" check.
+    # Fails safe: with no ServiceAccount token mounted, or no RBAC to list pods
+    # in CODING_NAMESPACE (403), returns None so B07 skips rather than guessing
+    # a lease is stale. See simplesalt/projects#431 for the RBAC grant this
+    # needs to actually fire; until it lands, B07 stays silent.
+
+    _coding_pods_cache = {"names": None}
+
+    def _reset_coding_pods_cache():
+        _coding_pods_cache["names"] = None
+
+    def _list_coding_pod_names() -> Optional[set]:
+        if _coding_pods_cache["names"] is not None:
+            return _coding_pods_cache["names"]
+        if not os.path.exists(K8S_SA_TOKEN_PATH):
+            return None
+        try:
+            with open(K8S_SA_TOKEN_PATH, encoding="utf-8") as f:
+                token = f.read().strip()
+            host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+            port = int(os.environ.get("KUBERNETES_SERVICE_PORT", "443"))
+            ctx = ssl.create_default_context(cafile=K8S_SA_CA_PATH)
+            conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=10)
+            try:
+                conn.request(
+                    "GET",
+                    f"/api/v1/namespaces/{CODING_NAMESPACE}/pods",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                resp = conn.getresponse()
+                raw = resp.read()
+                status = resp.status
+            finally:
+                conn.close()
+            if status != 200:
+                return None
+            data = json.loads(raw.decode("utf-8"))
+            names = {pod["metadata"]["name"] for pod in data.get("items", [])}
+            _coding_pods_cache["names"] = names
+            return names
+        except Exception as e:
+            print(f"[governance] B07 pod-liveness check unavailable: {e}", file=sys.stderr)
+            return None
 
 
     # ── Violation / repair collectors ───────────────────────────────────────────
@@ -679,7 +668,6 @@ data:
 
     def lint_issue(issue: dict, board_index: dict, report: Report, issue_cache: dict, do_repair: bool):
         num = issue["number"]
-        issue_type = get_type_name(issue)
         label_ids = get_label_ids(issue)
         label_names = get_label_names(issue)
         is_open = issue["state"] == "OPEN"
@@ -693,40 +681,9 @@ data:
 
         # S02: (API disallows multiple types; rule ID reserved, not checked here.)
 
-        # S03: Non-Epic must have exactly one parent. Open issues only — a closed
-        # orphan is unactionable history. Epics are exempt in both directions.
-        if is_open and issue_type != "Epic" and issue.get("parent") is None:
-            report.violation(num, "S03", "error",
-                              f"{issue_type or 'Issue'} has no parent — non-Epic must have exactly one parent")
-
-        # S04: Ancestor chain does not terminate in an Epic
-        if issue_type != "Epic" and issue.get("parent"):
-            ancestors = get_ancestors(issue, issue_cache)
-            if ancestors:
-                root = ancestors[-1]
-                root_type = get_type_name(root)
-                if root_type != "Epic":
-                    report.violation(num, "S04", "error",
-                                      f"Ancestor chain terminates in {root_type} #{root['number']}, not an Epic (orphan)")
-
-        # S05: Type ladder
-        if issue_type and issue.get("subIssues", {}).get("totalCount", 0) > 0:
-            allowed = TYPE_ALLOWED_CHILDREN.get(issue_type, set())
-            if not allowed:
-                report.violation(num, "S05", "error",
-                                  f"{issue_type} should be a leaf but has sub-issues")
-            for child_stub in issue.get("subIssues", {}).get("nodes", []):
-                c_num = child_stub["number"]
-                if c_num not in issue_cache:
-                    try:
-                        issue_cache[c_num] = fetch_issue(c_num)
-                    except Exception:
-                        continue
-                child = issue_cache[c_num]
-                child_type = get_type_name(child)
-                if child_type and child_type not in allowed:
-                    report.violation(num, "S05", "error",
-                                      f"{issue_type} contains {child_type} #{c_num} — type ladder violation")
+        # S03/S04/S05: retired. An Effort of any type may be top-level (no
+        # parent) or nested under an Effort of any type — there is no required
+        # root type and no type ladder (see docs/governance.md, "Issue Types").
 
         # S06: Depth > 6 (policy limit; platform hard cap is 8)
         if issue.get("parent"):
@@ -755,23 +712,23 @@ data:
                     except Exception as e:
                         print(f"  [repair R01 failed] #{num}: {e}", file=sys.stderr)
             else:
-                # B02: On board but no Status
-                if board_item["status_option_id"] is None:
-                    report.violation(num, "B02", "error", "Issue is on board but has no Status set")
+                # B02: retired — blank Status is a legal, untriaged Effort state.
+                # B03: Assigned not set (replaces the deleted workstream:* label check)
+                if board_item.get("assigned") is None:
+                    report.violation(num, "B03", "error", "Assigned is not set on board")
                 # B05: Priority not set
                 if board_item["priority"] is None:
                     report.violation(num, "B05", "error", "Priority not set on board")
-
-            ws_labels = label_ids & WORKSTREAM_LABEL_IDS
-
-            # B03: No workstream:* label
-            if not ws_labels:
-                report.violation(num, "B03", "error", "Issue has no workstream:* label")
-
-            # B04: Multiple workstream:* labels (warn)
-            if len(ws_labels) > 1:
-                report.violation(num, "B04", "warn",
-                                  f"Issue has {len(ws_labels)} workstream:* labels (expected 1)")
+                # B07: In Use lease held by a pod that no longer exists. Report
+                # only — releasing a stale lease is scripts/lease-sweep.mjs's
+                # job. Skips (no violation) when pod existence can't be
+                # verified, rather than guessing.
+                in_use = board_item.get("in_use")
+                if in_use:
+                    live_pods = _list_coding_pod_names()
+                    if live_pods is not None and in_use not in live_pods:
+                        report.violation(num, "B07", "error",
+                                          f"In Use lease held by pod '{in_use}' which no longer exists")
 
         # ── STATUS ────────────────────────────────────────────────────────────────
 
@@ -786,24 +743,15 @@ data:
                 report.violation(num, "ST01", "error",
                                   "Status=Blocked but no open blockedBy edges and no blocked-external label")
 
-        # ST02: Monitoring but Review On not set or in the past
-        if status_id == STATUS_MONITORING:
-            review_on = (board_item or {}).get("review_on")
-            if not review_on:
-                report.violation(num, "ST02", "error", "Status=Monitoring but Review On date is not set")
-            else:
-                review_date = datetime.fromisoformat(review_on).replace(tzinfo=timezone.utc)
-                if review_date < datetime.now(timezone.utc):
-                    report.violation(num, "ST02", "error",
-                                      f"Status=Monitoring but Review On date {review_on} is in the past")
+        # ST02: retired — Monitoring status and Review On field are both gone.
 
-        # ST03: In Progress but has open blockers
-        if status_id == STATUS_IN_PROGRESS:
+        # ST03: Doing but has open blockers
+        if status_id == STATUS_DOING:
             open_blockers = [b for b in issue.get("blockedBy", {}).get("nodes", []) if b["state"] == "OPEN"]
             if open_blockers:
                 blocker_nums = [str(b["number"]) for b in open_blockers]
                 report.violation(num, "ST03", "error",
-                                  f"Status=In Progress but has open blocker(s): #{', #'.join(blocker_nums)}")
+                                  f"Status=Doing but has open blocker(s): #{', #'.join(blocker_nums)}")
 
         # ST04: Closed issue with open sub-issues
         if not is_open:
@@ -815,8 +763,8 @@ data:
 
         # ST05: Status/state mismatch
         if status_id is not None:
-            if status_id == STATUS_COMPLETE and is_open:
-                report.violation(num, "ST05", "error", "Status=Complete but issue is open")
+            if status_id == STATUS_DONE and is_open:
+                report.violation(num, "ST05", "error", "Status=Done but issue is open")
                 if do_repair:
                     try:
                         _repair_close_issue(num, "completed", report)
@@ -1001,48 +949,6 @@ data:
                 print(f"  [repair R06 failed] #{num}: {e}", file=sys.stderr)
 
 
-    def repair_initiative_fields(board_index: dict, issue_cache: dict, report: Report):
-        """R02: Sync stale Initiative field to root Epic title."""
-        for num, item in board_index.items():
-            issue = issue_cache.get(num)
-            if issue is None:
-                continue
-            root = get_root(issue, issue_cache)
-            if root is None:
-                continue
-            if get_type_name(root) != "Epic":
-                continue
-            expected = root["title"]
-            current = item.get("initiative")
-            if current != expected:
-                try:
-                    _set_board_field_text(item["board_item_id"], FIELD_INITIATIVE, expected)
-                    report.repair(num, "R02", f"Updated Initiative from {repr(current)} to {repr(expected)}")
-                except Exception as e:
-                    print(f"  [repair R02 failed] #{num}: {e}", file=sys.stderr)
-
-
-    def repair_backfill_start_dates(board_index: dict, issue_cache: dict, report: Report):
-        """R05: Backfill missing Start Date from first In Progress label event."""
-        for num, item in board_index.items():
-            if item.get("start_date") is not None:
-                continue
-            issue = issue_cache.get(num)
-            if issue is None:
-                continue
-            for event in issue.get("timelineItems", {}).get("nodes", []):
-                lbl = event.get("label", {})
-                if lbl and lbl.get("name") == "In Progress":
-                    start = event["createdAt"]
-                    try:
-                        _set_board_field_date(item["board_item_id"], FIELD_START_DATE, start[:10])
-                        report.repair(num, "R05",
-                                      f"Backfilled Start Date from first In Progress label event: {start[:10]}")
-                    except Exception as e:
-                        print(f"  [repair R05 failed] #{num}: {e}", file=sys.stderr)
-                    break
-
-
     # ── Board mutation helpers ──────────────────────────────────────────────────
 
     def _repair_add_to_board(issue: dict, report: Report):
@@ -1065,30 +971,6 @@ data:
           updateProjectV2ItemFieldValue(input: {
             projectId: $boardId, itemId: $itemId, fieldId: $fieldId,
             value: { number: $value }
-          }) { projectV2Item { id } }
-        }
-        """
-        graphql(mutation, {"boardId": BOARD_ID, "itemId": item_id, "fieldId": field_id, "value": value})
-
-
-    def _set_board_field_text(item_id: str, field_id: str, value: str):
-        mutation = """
-        mutation($boardId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
-          updateProjectV2ItemFieldValue(input: {
-            projectId: $boardId, itemId: $itemId, fieldId: $fieldId,
-            value: { text: $value }
-          }) { projectV2Item { id } }
-        }
-        """
-        graphql(mutation, {"boardId": BOARD_ID, "itemId": item_id, "fieldId": field_id, "value": value})
-
-
-    def _set_board_field_date(item_id: str, field_id: str, value: str):
-        mutation = """
-        mutation($boardId: ID!, $itemId: ID!, $fieldId: ID!, $value: Date!) {
-          updateProjectV2ItemFieldValue(input: {
-            projectId: $boardId, itemId: $itemId, fieldId: $fieldId,
-            value: { date: $value }
           }) { projectV2Item { id } }
         }
         """
@@ -1193,6 +1075,7 @@ data:
 
     def run_check(issue_number: int, do_repair: bool, post_comments: bool = True) -> Report:
         """Check a single issue and its immediate context."""
+        _reset_coding_pods_cache()
         report = Report()
         issue_cache = {}
 
@@ -1220,6 +1103,7 @@ data:
 
     def run_sweep(do_repair: bool, post_comments: bool = True) -> Report:
         """Check all board issues plus all open repo issues."""
+        _reset_coding_pods_cache()
         report = Report()
         issue_cache = {}
 
@@ -1246,8 +1130,6 @@ data:
         if do_repair:
             repair_priority_ties(board_index, report)
             repair_renormalize_priorities(board_index, report)
-            repair_initiative_fields(board_index, issue_cache, report)
-            repair_backfill_start_dates(board_index, issue_cache, report)
 
         if post_comments:
             issues_with_violations = {v["issue"] for v in report.violations}
@@ -1265,6 +1147,7 @@ data:
     def run_poll(since: Optional[str]) -> Report:
         """Lint only open issues updated since `since` — the near-real-time
         replacement for the old webhook-triggered per-issue check."""
+        _reset_coding_pods_cache()
         report = Report()
         issue_cache = {}
 
