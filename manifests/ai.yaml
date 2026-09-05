@@ -663,12 +663,15 @@ spec:
               # removed/renamed skills don't linger.
               #
               # The whole sync stages beside the live directory on the same
-              # filesystem and lands with a rename, so /opt/data/skills is never
-              # absent: a failed download, a truncated tarball or an empty
-              # extract leaves the previous skills in place instead of deleting
-              # them first and hoping the copy succeeds. The tarball is written
-              # to a file rather than piped into tar, because a pipeline reports
-              # only tar's exit status and would hide a curl failure.
+              # filesystem and lands with a rename, so a failed download, a
+              # truncated tarball or an empty extract leaves whatever is already
+              # there instead of deleting it first and hoping the copy succeeds.
+              # The home volume is an emptyDir and this init runs once per pod, so
+              # there is normally nothing to lose here; the point of the guard is
+              # that a partial sync can never land, and can never write a version
+              # marker claiming a generation it did not extract. The tarball is
+              # written to a file rather than piped into tar, because a pipeline
+              # reports only tar's exit status and would hide a curl failure.
               #
               # The staging steps chain on `&&` rather than `set -e`: POSIX
               # disables -e for a command that forms an `if` condition, and a
@@ -854,13 +857,14 @@ spec:
               chmod 644 /opt/data/.claude/CLAUDE.md
 
               # Seed the hand-authored `build` skill (Autonomous Claude Code
-              # loop) onto the home volume. /opt/data/skills is rewritten by the
-              # gbrain/curator skill re-bundle, which silently deleted this
-              # skill on 2026-06-27 because it lived only on the PVC and not in
-              # git. Sourcing it from the hermes-config ConfigMap (/seed) and
-              # copying on every rollout makes git the source of truth, same as
-              # config.yaml above. (A curator run can still remove it between
-              # rollouts; the next rollout restores it.)
+              # loop) onto the home volume. /opt/data/skills is replaced wholesale
+              # by the gbrain skill sync in install-cli-tools above, which silently
+              # deleted this skill on 2026-06-27 back when it existed only on the
+              # volume and not in git. Sourcing it from the hermes-config ConfigMap
+              # (/seed) makes git the source of truth, same as config.yaml above.
+              # The home volume is an emptyDir (see `volumes:` below), so this runs
+              # on every pod start; a curator run can still remove the skill
+              # mid-lifetime and the next rollout restores it.
               mkdir -p /opt/data/skills/build
               cp /seed/build-skill.md /opt/data/skills/build/SKILL.md
               chown -R 10000:10000 /opt/data/skills/build
