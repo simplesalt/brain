@@ -1180,25 +1180,27 @@ data:
 
     # ── Locked wrappers shared by the scheduler thread and the UDS handlers ────
 
-    def _run_sweep_locked() -> Report:
+    def _run_sweep_locked(dry_run: bool = False) -> Report:
         with _run_lock:
-            report = run_sweep(do_repair=True, post_comments=True)
-            with _state_lock:
-                _state["last_sweep_at"] = datetime.now(timezone.utc).isoformat()
-                _state["sweep_count"] += 1
-                _state["last_report"] = report.to_dict()
-                _state["last_error"] = None
+            report = run_sweep(do_repair=not dry_run, post_comments=not dry_run)
+            if not dry_run:
+                with _state_lock:
+                    _state["last_sweep_at"] = datetime.now(timezone.utc).isoformat()
+                    _state["sweep_count"] += 1
+                    _state["last_report"] = report.to_dict()
+                    _state["last_error"] = None
             return report
 
 
-    def _run_check_locked(issue_number: int) -> Report:
+    def _run_check_locked(issue_number: int, dry_run: bool = False) -> Report:
         with _run_lock:
-            report = run_check(issue_number, do_repair=True, post_comments=True)
-            with _state_lock:
-                _state["last_check_at"] = datetime.now(timezone.utc).isoformat()
-                _state["check_count"] += 1
-                _state["last_report"] = report.to_dict()
-                _state["last_error"] = None
+            report = run_check(issue_number, do_repair=not dry_run, post_comments=not dry_run)
+            if not dry_run:
+                with _state_lock:
+                    _state["last_check_at"] = datetime.now(timezone.utc).isoformat()
+                    _state["check_count"] += 1
+                    _state["last_report"] = report.to_dict()
+                    _state["last_error"] = None
             return report
 
 
@@ -1283,26 +1285,30 @@ data:
                 return {"ok": True, "report": _state["last_report"]}
 
         if action == "sweep":
+            dry_run = bool(cmd.get("dry_run", False))
             try:
-                report = _run_sweep_locked()
+                report = _run_sweep_locked(dry_run=dry_run)
                 return {"ok": True, "report": report.to_dict()}
             except Exception as e:
-                with _state_lock:
-                    _state["last_error"] = f"sweep: {e}"
+                if not dry_run:
+                    with _state_lock:
+                        _state["last_error"] = f"sweep: {e}"
                 return {"ok": False, "error": str(e)}
 
         if action == "check":
             raw_issue = cmd.get("issue")
+            dry_run = bool(cmd.get("dry_run", False))
             try:
                 issue_number = int(raw_issue)
             except (TypeError, ValueError):
                 return {"ok": False, "error": "missing/invalid 'issue' number"}
             try:
-                report = _run_check_locked(issue_number)
+                report = _run_check_locked(issue_number, dry_run=dry_run)
                 return {"ok": True, "report": report.to_dict()}
             except Exception as e:
-                with _state_lock:
-                    _state["last_error"] = f"check: {e}"
+                if not dry_run:
+                    with _state_lock:
+                        _state["last_error"] = f"check: {e}"
                 return {"ok": False, "error": str(e)}
 
         return {"ok": False, "error": f"unknown cmd: {action}"}
@@ -1450,9 +1456,13 @@ data:
         sub = parser.add_subparsers(dest="command", required=True)
         sub.add_parser("status", help="Show sidecar configuration and last-run state")
         sub.add_parser("report", help="Show the full last sweep/check report")
-        sub.add_parser("sweep", help="Run a full board sweep now")
+        sweep_p = sub.add_parser("sweep", help="Run a full board sweep now")
+        sweep_p.add_argument("--dry-run", action="store_true",
+                              help="Report violations without repairing or posting comments")
         check_p = sub.add_parser("check", help="Lint a single issue now")
         check_p.add_argument("issue", type=int, help="Issue number")
+        check_p.add_argument("--dry-run", action="store_true",
+                              help="Report violations without repairing or posting comments")
 
         args = parser.parse_args()
 
@@ -1461,9 +1471,9 @@ data:
         elif args.command == "report":
             resp = _send({"cmd": "report"})
         elif args.command == "sweep":
-            resp = _send({"cmd": "sweep"})
+            resp = _send({"cmd": "sweep", "dry_run": args.dry_run})
         elif args.command == "check":
-            resp = _send({"cmd": "check", "issue": args.issue})
+            resp = _send({"cmd": "check", "issue": args.issue, "dry_run": args.dry_run})
         else:
             parser.error("unknown command")
             return
