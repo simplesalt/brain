@@ -9,6 +9,7 @@ resources:
   - manifests/gbrain-reranker-secret.yaml
   - manifests/email-collector.yaml
   - manifests/calendar-collector.yaml
+  - manifests/lease-sweep.yaml
   - manifests/hermes-msg.yaml
   - manifests/coding.yaml
   - manifests/coding-rc.yaml
@@ -41,6 +42,10 @@ configMapGenerator:
       #               /opt/data via the HERMES_ORIG_CWD env var in ai.yaml).
       - SOUL.md=manifests/SOUL.md
       - AGENTS.md=manifests/AGENTS.md
+  - name: lease-sweep-script
+    namespace: ssint-main-ai
+    files:
+      - lease-sweep.mjs=scripts/lease-sweep.mjs
 generatorOptions:
   labels:
     entity: ssint

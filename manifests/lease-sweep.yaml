@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lease-sweep
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lease-sweep-pods-reader
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lease-sweep-pods-reader
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lease-sweep-pods-reader
+subjects:
+  - kind: ServiceAccount
+    name: lease-sweep
+    namespace: ssint-main-ai
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lease-sweep
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: lease-sweep
+        spec:
+          serviceAccountName: lease-sweep
+          automountServiceAccountToken: true
+          restartPolicy: OnFailure
+          containers:
+            - name: lease-sweep
+              image: node:20-alpine
+              imagePullPolicy: IfNotPresent
+              command: ["node", "/scripts/lease-sweep.mjs"]
+              env:
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hermes-secrets
+                      key: GITHUB_TOKEN
+              volumeMounts:
+                - name: lease-sweep-script
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: lease-sweep-script
+              configMap:
+                name: lease-sweep-script
