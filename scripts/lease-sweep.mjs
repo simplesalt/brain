@@ -126,11 +126,12 @@ async function main() {
   const projId = await projectId();
   const fieldId = await leaseFieldId();
   for (const item of items) {
+    const podName = item.holder.split('/', 1)[0];
     let exists;
     try {
-      exists = await podExists(item.holder);
+      exists = await podExists(podName);
     } catch (err) {
-      console.warn(`skip ${item.ref}: cannot verify pod ${item.holder} (${err.message})`);
+      console.warn(`skip ${item.ref}: cannot verify pod ${podName} (${err.message})`);
       continue;
     }
     if (exists) {
@@ -138,7 +139,7 @@ async function main() {
       continue;
     }
     await clearLease(projId, fieldId, item.itemId);
-    console.log(`${item.ref}: pod ${item.holder} gone, released lease`);
+    console.log(`${item.ref}: pod ${podName} gone, released lease`);
   }
 }
 

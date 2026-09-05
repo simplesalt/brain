@@ -725,10 +725,11 @@ data:
                 # verified, rather than guessing.
                 in_use = board_item.get("in_use")
                 if in_use:
+                    pod_name = in_use.split("/", 1)[0]
                     live_pods = _list_coding_pod_names()
-                    if live_pods is not None and in_use not in live_pods:
+                    if live_pods is not None and pod_name not in live_pods:
                         report.violation(num, "B07", "error",
-                                          f"In Use lease held by pod '{in_use}' which no longer exists")
+                                          f"In Use lease held by pod '{pod_name}' which no longer exists")
 
         # ── STATUS ────────────────────────────────────────────────────────────────
 
