@@ -716,9 +716,7 @@ data:
                 # B03: Assigned not set (replaces the deleted workstream:* label check)
                 if board_item.get("assigned") is None:
                     report.violation(num, "B03", "error", "Assigned is not set on board")
-                # B05: Priority not set
-                if board_item["priority"] is None:
-                    report.violation(num, "B05", "error", "Priority not set on board")
+                # B05: retired — unset Priority is a legal, untriaged Effort state.
                 # B07: In Use lease held by a pod that no longer exists. Report
                 # only — releasing a stale lease is scripts/lease-sweep.mjs's
                 # job. Skips (no violation) when pod existence can't be
