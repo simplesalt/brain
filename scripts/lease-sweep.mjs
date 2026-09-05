@@ -11,18 +11,15 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
 const K8S_HOST = 'https://kubernetes.default.svc';
 
-let _k8sToken, _k8sCa;
-function k8sAuth() {
+let _k8sToken;
+function k8sToken() {
   if (!_k8sToken) _k8sToken = readFileSync(join(SA_DIR, 'token'), 'utf8').trim();
-  if (!_k8sCa) _k8sCa = readFileSync(join(SA_DIR, 'ca.crt'), 'utf8');
-  return { token: _k8sToken, ca: _k8sCa };
+  return _k8sToken;
 }
 
 async function podExists(name) {
-  const { token, ca } = k8sAuth();
   const r = await fetch(`${K8S_HOST}/api/v1/namespaces/${POD_NAMESPACE}/pods/${name}`, {
-    tls: { ca },
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${k8sToken()}` },
   });
   if (r.status === 200) return true;
   if (r.status === 404) return false;
@@ -125,13 +122,15 @@ async function main() {
   }
   const projId = await projectId();
   const fieldId = await leaseFieldId();
+  let skipped = 0;
   for (const item of items) {
     const podName = item.holder.split('/', 1)[0];
     let exists;
     try {
       exists = await podExists(podName);
     } catch (err) {
-      console.warn(`skip ${item.ref}: cannot verify pod ${podName} (${err.message})`);
+      console.warn(`skip ${item.ref}: cannot verify pod ${podName} (${err.message})`, err.cause ?? '');
+      skipped++;
       continue;
     }
     if (exists) {
@@ -140,6 +139,9 @@ async function main() {
     }
     await clearLease(projId, fieldId, item.itemId);
     console.log(`${item.ref}: pod ${podName} gone, released lease`);
+  }
+  if (skipped === items.length) {
+    throw new Error(`all ${items.length} leased effort(s) were skipped, no pod could be verified`);
   }
 }
 

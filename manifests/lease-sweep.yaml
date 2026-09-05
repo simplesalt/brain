@@ -75,6 +75,8 @@ spec:
                     secretKeyRef:
                       name: hermes-secrets
                       key: GITHUB_TOKEN
+                - name: NODE_EXTRA_CA_CERTS
+                  value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
               volumeMounts:
                 - name: lease-sweep-script
                   mountPath: /scripts
