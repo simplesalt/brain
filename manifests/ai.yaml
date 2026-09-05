@@ -687,22 +687,46 @@ spec:
 
               # gbrain skills (garrytan/gbrain). The bundled skills/ directory is
               # just markdown files in the public repo — no bun or gbrain CLI
-              # needed. Download the repo tarball, extract skills/, and write
-              # a version marker. Re-extracts destructively when the upstream
-              # VERSION changes so removed/renamed skills don't linger.
+              # needed. Download the repo tarball, extract skills/, and write a
+              # version marker. Re-syncs when the upstream VERSION changes so
+              # removed/renamed skills don't linger.
+              #
+              # The whole sync stages beside the live directory on the same
+              # filesystem and lands with a rename, so /opt/data/skills is never
+              # absent: a failed download, a truncated tarball or an empty
+              # extract leaves the previous skills in place instead of deleting
+              # them first and hoping the copy succeeds. The tarball is written
+              # to a file rather than piped into tar, because a pipeline reports
+              # only tar's exit status and would hide a curl failure.
+              #
+              # The staging steps chain on `&&` rather than `set -e`: POSIX
+              # disables -e for a command that forms an `if` condition, and a
+              # subshell there inherits that, so `set -e` would silently do
+              # nothing and every step would run after the first failure.
               GBRAIN_VER=$(curl -fsSL https://raw.githubusercontent.com/garrytan/gbrain/master/VERSION 2>/dev/null || echo "")
               STORED_VER=$(cat /opt/data/skills/.gbrain-version 2>/dev/null || echo "")
               if [ -n "$GBRAIN_VER" ] && [ "$GBRAIN_VER" != "$STORED_VER" ]; then
-                (
-                  mkdir -p /tmp/gbrain-extract
-                  curl -fsSL https://github.com/garrytan/gbrain/archive/refs/heads/master.tar.gz \
-                    | tar -xz -C /tmp/gbrain-extract \
-                  && rm -rf /opt/data/skills \
-                  && cp -rT /tmp/gbrain-extract/gbrain-master/skills /opt/data/skills \
-                  && echo "$GBRAIN_VER" > /opt/data/skills/.gbrain-version \
-                  && chown -R 10000:10000 /opt/data/skills \
-                  && rm -rf /tmp/gbrain-extract
-                ) || echo "WARN: gbrain skills sync failed"
+                if (
+                  rm -rf /opt/data/skills.stage /opt/data/skills.old /tmp/gbrain.tar.gz \
+                  && mkdir -p /opt/data/skills.stage \
+                  && curl -fsSL -o /tmp/gbrain.tar.gz https://github.com/garrytan/gbrain/archive/refs/heads/master.tar.gz \
+                  && gzip -t /tmp/gbrain.tar.gz \
+                  && tar -xzf /tmp/gbrain.tar.gz -C /opt/data/skills.stage gbrain-master/skills \
+                  && test -n "$(ls -A /opt/data/skills.stage/gbrain-master/skills 2>/dev/null)" \
+                  && echo "$GBRAIN_VER" > /opt/data/skills.stage/gbrain-master/skills/.gbrain-version \
+                  && chown -R 10000:10000 /opt/data/skills.stage \
+                  && { [ ! -d /opt/data/skills ] || mv /opt/data/skills /opt/data/skills.old; } \
+                  && mv /opt/data/skills.stage/gbrain-master/skills /opt/data/skills
+                ); then
+                  rm -rf /opt/data/skills.stage /opt/data/skills.old /tmp/gbrain.tar.gz
+                  echo "gbrain skills synced to $GBRAIN_VER"
+                else
+                  if [ ! -d /opt/data/skills ] && [ -d /opt/data/skills.old ]; then
+                    mv /opt/data/skills.old /opt/data/skills
+                  fi
+                  rm -rf /opt/data/skills.stage /opt/data/skills.old /tmp/gbrain.tar.gz
+                  echo "ERROR: gbrain skills sync failed; kept skills at ${STORED_VER:-unknown}"
+                fi
               fi
 
               # Claude Code Hindsight plugin (best-effort; may fail without auth)
