@@ -1,0 +1,66 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: winshell
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: winshell
+  template:
+    metadata:
+      labels:
+        app: winshell
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      containers:
+        - name: winshell
+          image: ghcr.io/simplesalt/oci/winshell@sha256:7e0929b2b28ae84932bfdb2b8e3929812022ad455fdfcc57e5c8aa292cfd7b94
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 7681
+          env:
+            - name: WINSHELL_TARGET
+              value: "192.168.1.196"
+          readinessProbe:
+            tcpSocket:
+              port: 7681
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 7681
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: winshell
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  selector:
+    app: winshell
+  ports:
+    - name: http
+      port: 7681
+      targetPort: 7681
