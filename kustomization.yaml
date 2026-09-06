@@ -4,7 +4,6 @@ resources:
   - manifests/ai.yaml
   - manifests/hindsight-chart.yaml
   - manifests/big-agi.yaml
-  - manifests/winshell.yaml
   - manifests/hermes-proxy.yaml
   - manifests/gbrain-embedding-secret.yaml
   - manifests/gbrain-reranker-secret.yaml
