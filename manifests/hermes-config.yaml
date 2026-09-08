@@ -87,7 +87,15 @@ agent:
     - skills          # ← the bloat source: removes the global skill index entirely
     - search          # web_search already provided by the `web` toolset
     - x_search
-    - vision
+    # `vision` is intentionally NOT in this list. It carries exactly one tool,
+    # vision_analyze. The auto-substitution path (see auxiliary.vision below) does
+    # NOT depend on it — vision_message_prep imports vision_analyze_tool directly
+    # from tools.vision_tools, bypassing tool dispatch, so images are described
+    # either way. What the toolset controls is the follow-up: the injected
+    # description ends with a hint to call vision_analyze for a closer look, and the
+    # hardcoded describe-everything prompt cannot know what the user actually asked,
+    # so a targeted second read is the only way to get e.g. receipt line items.
+    # While vision sat in this list that hint pointed at a tool that did not exist.
     - video
     - image_gen
     - video_gen
@@ -124,6 +132,14 @@ agent:
 # lacked it because it was set before hindsight was approved.
 # NOTE: this must be a TOP-LEVEL key (not nested under agent:) — load_config()
 # reads the top-level platform_toolsets; the one inside agent: is ignored.
+# Only `cli` is listed. A platform with NO entry here is not empty: _get_platform_tools
+# falls back to that platform's default composite bundle. The OpenAI-compatible API
+# server on 8642 (platform key "api_server", the path big-AGI uses) therefore gets
+# `hermes-api-server`, which already carries vision_analyze — for that surface,
+# dropping vision from disabled_toolsets above is the whole fix. `cli` is an explicit
+# list, and an explicit list is a true allowlist: a toolset absent from it is never
+# admitted and disabled_toolsets can only subtract, never add it back. So `vision`
+# has to be named here as well or the CLI surface alone would still lack it.
 platform_toolsets:
   cli:
     - clarify
@@ -133,6 +149,7 @@ platform_toolsets:
     - memory
     - messaging
     - terminal
+    - vision
     - web
 
 # Terminal: run shell + coding commands directly in this pod. The default
@@ -182,12 +199,31 @@ memory:
 web:
   backend: firecrawl
 
-# Auxiliary (side-task) models: pin to the main provider/model instead of the
+# Auxiliary (side-task) models: pin an explicit provider/model instead of the
 # default "auto" fallback chain, which probes the Nous Portal and spams
 # "no Nous authentication found" warnings when we have no Nous credentials.
+#
+# vision is the one block that canNOT be `provider: main`: the main model
+# (minimax-m2.7) and the fallback (gpt-oss-120b) are both text-only per the live
+# OpenRouter catalog, so pinning vision to main left Hermes unable to read images
+# at all. Because the main model lacks vision, Hermes rewrites image parts into a
+# text description via this auxiliary model before the main call — pixels never
+# reach minimax. Gemini Flash leads on the heterogeneous real-world documents this
+# is for (business cards, receipts, screenshots, scans) and is the only shortlisted
+# model that accepts native PDF input; Qwen3-VL leads the clean academic sets
+# (DocVQA, ScreenSpot-Pro) and is a third the price, hence its fallback slot.
+# Both support tool calling and JSON-schema structured output.
+#
+# NOTE the key is `model:` here, not `default:` — auxiliary blocks and the
+# top-level model: block disagree upstream. fallback_chain is valid on any
+# auxiliary block.
 auxiliary:
   vision:
-    provider: main
+    provider: openrouter
+    model: google/gemini-3.8-flash
+    fallback_chain:
+      - provider: openrouter
+        model: qwen/qwen3-vl-235b-a22b-instruct
   web_extract:
     provider: main
   compression:
