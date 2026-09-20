@@ -177,7 +177,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.4.39"
+      version: "0.4.47"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -207,6 +207,10 @@ spec:
     extraEnv:
       - name: HINDSIGHT_AUTO_RETAIN
         value: "false"
+      - name: BUILDER_SB_POLICY
+        value: wwwhw
+      - name: BSB_MISSION
+        value: keep the SimpleSalt Delivery board an accurate, current record of every Effort and coordinate cross-repo delivery through it.
     skelOverride:
       enabled: true
       create: false
