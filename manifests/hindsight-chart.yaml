@@ -41,7 +41,7 @@ spec:
   interval: 12h
   url: oci://ghcr.io/simplesalt/charts/hindsight
   ref:
-    tag: "0.1.0"
+    tag: "0.2.0"
   # Uncomment if ghcr.io/simplesalt/charts is a private package:
   # secretRef:
   #   name: ghcr-pull-secret
