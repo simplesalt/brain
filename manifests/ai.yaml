@@ -20,25 +20,6 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
-# Team roster, populated out-of-band (never committed to git — see AGENTS.md
-# for why). Single key, roster.json, an array of objects with this schema:
-#   [
-#     {
-#       "username": "<slug>",
-#       "name": "<Full Name>",
-#       "display_name": "<First Name>",
-#       "email": "<email>",
-#       "role": "<role-title, e.g. principal>",
-#       "description": "<short description, or null>",
-#       "admin": true,
-#       "apiKeyOwner": false
-#     }
-#   ]
-# This schema is shared with the independently-populated team-roster Secret
-# in cal.yaml (namespace ssint-main-cal) — keep both in sync if the shape
-# changes. The seed-hermes-config init container below only reads
-# display_name/role/description (used to render the AGENTS.md team roster);
-# username/email/admin/apiKeyOwner are for the cal.yaml consumer.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -52,11 +33,6 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
-# External PostgreSQL for hindsight, hosted as a CloudNativePG (CNPG) instance.
-# CNPG auto-generates the "hindsight-pg-app" secret (keys: uri, username,
-# password, dbname, host, port, ...) used by the hindsight deployment below.
-# pgvector is bundled in the default CNPG operand image and enabled via
-# postInitApplicationSQL.
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -77,10 +53,6 @@ spec:
   storage:
     size: 5Gi
 ---
-# External PostgreSQL for gbrain, hosted as a CloudNativePG (CNPG) instance.
-# CNPG auto-generates the "gbrain-pg-app" secret (keys: uri, username,
-# password, dbname, host, port, ...) used by the gbrain deployment below.
-# pgvector is required by gbrain's embedding/similarity search layer.
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -98,17 +70,6 @@ spec:
       owner: gbrain
       postInitApplicationSQL:
         - CREATE EXTENSION IF NOT EXISTS vector;
-  # gbrain expects to own its database with superuser-level privileges: its
-  # schema migrations need BYPASSRLS (v24/v29 RAISE EXCEPTION without it) AND
-  # SUPERUSER (v35 auto_rls_event_trigger does CREATE EVENT TRIGGER, which
-  # Postgres restricts to superusers; migrate.ts has no privilege pre-check and
-  # fails loud). The CNPG bootstrap owner role has neither, which stalled the
-  # schema at v34/119. This cluster is dedicated to gbrain (db gbrain, sole
-  # consumer), so granting the role SUPERUSER is acceptable. managed.roles is
-  # reconciled continuously (unlike bootstrap.postInitSQL, which only runs at
-  # first cluster init), so this also fixes the already-bootstrapped cluster.
-  # passwordSecret pins the existing app credential so the role's auth is
-  # unchanged. (superuser implies bypassrls; both kept for clarity.)
   managed:
     roles:
       - name: gbrain
@@ -121,9 +82,6 @@ spec:
   storage:
     size: 5Gi
 ---
-# gbrain MCP server (https://github.com/garrytan/gbrain).
-# Installed from the public GitHub repo via bun (no published container image).
-# Uses the gbrain-pg CNPG cluster for persistent storage.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -141,9 +99,6 @@ spec:
   template:
     metadata:
       annotations:
-        # Bump to force a rollout (e.g. to re-run schema migrations after a DB
-        # role/privilege change). gbrain runs pending migrations only at serve
-        # startup, so a restart is needed to pick up the BYPASSRLS grant.
         simplesalt.company/restart-epoch: "1"
       labels:
         app: gbrain
@@ -152,9 +107,6 @@ spec:
         capability: ai
     spec:
       initContainers:
-        # Install gbrain from the public GitHub repo using bun. BUN_INSTALL=/install
-        # puts the bun-managed global bin at /install/bin/gbrain. The emptyDir
-        # volume caches the install across soft restarts (pod eviction clears it).
         - name: install-gbrain
           image: oven/bun:1-alpine
           imagePullPolicy: IfNotPresent
@@ -237,21 +189,13 @@ spec:
               # interfaces to be reachable by other pods in the cluster.
               exec $GBRAIN serve --http --bind 0.0.0.0
           env:
-            # PostgreSQL connection string from the CNPG-managed secret.
-            # DATABASE_URL confirmed from garrytan/gbrain .env.testing.example.
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: gbrain-pg-app
                   key: uri
-            # Chat model: minimax-m2.7 via OpenRouter, with gpt-oss-120b as the
-            # fallback (GBRAIN_CHAT_FALLBACK_CHAIN below). GBRAIN_CHAT_MODEL uses
-            # the `provider:modelId` format; `openrouter` is a first-class gbrain
-            # provider (src/core/ai/recipes/).
             - name: GBRAIN_CHAT_MODEL
               value: openrouter:minimax/minimax-m2.7
-            # Fallback chat model (maps to gbrain's chat_fallback_chain config
-            # field). Same OpenRouter key; used if the primary model errors.
             - name: GBRAIN_CHAT_FALLBACK_CHAIN
               value: openrouter:openai/gpt-oss-120b
             - name: OPENROUTER_API_KEY
@@ -259,18 +203,8 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: HINDSIGHT_API_LLM_API_KEY
-            # Embedding model, `provider:modelId` format. text-embedding-3-small
-            # emits 1536-dim vectors natively, which is an exact match for
-            # gbrain's static `embedding vector(1536)` page column
-            # (src/schema.sql) — no GBRAIN_EMBEDDING_DIMENSIONS override needed.
-            # Cheapest OpenAI embedding model; env wins over DB/file config.
             - name: GBRAIN_EMBEDDING_MODEL
               value: openai:text-embedding-3-small
-            # Active embedding provider key. Dedicated single-value Secret
-            # (gbrain-embedding-secret) rather than a hermes-secrets key — the
-            # start of breaking hermes-secrets out into per-key secrets. Value
-            # is populated out-of-band. optional:true so the pod still boots if
-            # the value isn't present yet (embed no-ops until it is).
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -283,26 +217,11 @@ spec:
                   name: gbrain-reranker-secret
                   key: VOYAGE_API_KEY
                   optional: true
-            # Bearer token for the HTTP MCP endpoint (/mcp). Clients (including
-            # hermes) must send `Authorization: Bearer <token>` on every request.
-            # Inlined deliberately (NOT a Secret): this is an in-cluster shared
-            # credential whose only boundary is the network — gbrain is reachable
-            # only from inside ssint-main-ai. The same literal MUST match the
-            # hermes Deployment's GBRAIN_REMOTE_TOKEN below. The gbrain init step
-            # hashes this value into access_tokens; hermes sends it as the bearer.
             - name: GBRAIN_REMOTE_TOKEN
               value: "gbrain-mcp"
-            # Silences the startup CORS warning that fires whenever --bind
-            # 0.0.0.0 is used without an OAuth CORS allowlist. We have no
-            # cross-origin browser use: hermes is a server-to-server MCP client
-            # (no Origin header, so it always passes the CORS gate regardless of
-            # this value). Set to the localhost origin so a future
-            # `kubectl port-forward` to the /admin dashboard works; any other
-            # browser origin stays denied.
             - name: GBRAIN_HTTP_CORS_ORIGIN
               value: "http://localhost:3131"
           ports:
-            # Default port for `gbrain serve --http` (hardcoded in src/commands/serve.ts).
             - name: mcp
               containerPort: 3131
           livenessProbe:
@@ -319,9 +238,6 @@ spec:
             httpGet:
               path: /health
               port: 3131
-          # Not for I/O throttling (DB tuning owns that) — the autopilot worker's
-          # RSS watchdog sizes from the cgroup limit; an unbounded basis has
-          # caused a respawn loop, so a memory limit gives it a sane basis.
           resources:
             requests:
               memory: 128Mi
@@ -330,14 +246,6 @@ spec:
           volumeMounts:
             - name: gbrain-install
               mountPath: /install
-        # Autopilot sidecar: gbrain's self-maintaining daemon. Shares the
-        # /install emptyDir (same gbrain binary) and coordinates with the serve
-        # container via Postgres advisory locks, so co-running is safe. Its
-        # dispatch loop polls for new/stale pages every --interval and enqueues
-        # extract (links + timeline) + embed jobs; a forked worker drains the
-        # queue continuously. --interval 60 gives ~1-min freshness — effectively
-        # immediate relative to the collector cadence. On the Postgres engine the
-        # fs phases (sync/lint/backlinks) are auto-skipped (src/core/cycle.ts).
         - name: autopilot
           image: oven/bun:1-alpine
           imagePullPolicy: IfNotPresent
@@ -583,41 +491,13 @@ spec:
         env: main
         capability: ai
       annotations:
-        # Bump to force a rollout when an out-of-band change (ConfigMap fix,
-        # secret rotation) needs picking up but the pod spec itself is
-        # unchanged — Kubernetes only re-reads env/config-mounted secrets at
-        # container start. Same pattern as gbrain's restart-epoch above.
         simplesalt.company/restart-epoch: "3"
     spec:
-      # fsGroup ensures the home volume is mounted with GID 10000 ownership so
-      # the hermes user (UID 10000) can write to it. emptyDir honours fsGroup the
-      # same way a PVC does. fsGroupChangePolicy OnRootMismatch skips the
-      # recursive chown when the root dir already has the right GID.
       securityContext:
         fsGroup: 10000
         fsGroupChangePolicy: OnRootMismatch
       initContainers:
-        # Install the CLI tools Hermes drives via the local terminal backend
-        # onto the writable home volume (/opt/data/.local/bin, on PATH). Each
-        # step is guarded by an existence check so it is a no-op when the binary
-        # is already present (the PVC persists installs across restarts, so
-        # downloads only happen on first boot or after a manual binary removal).
-        # No `set -e`: a transient failure of one tool must not hard-block the
-        # pod from starting (init must exit 0).
-        #   - claude (Claude Code): installed UNAUTHENTICATED. hermes-agent
-        #     does not need Claude auth, so no OAuth token is injected; the
-        #     binary is present for plugin tooling only.
-        #   - gh (GitHub CLI): auth seeded into ~/.config/gh/hosts.yml by
-        #     seed-hermes-config (GITHUB_TOKEN is blocked from subprocess env
-        #     by the Copilot provider blocklist; file-based auth is the fix).
-        # Google Workspace (Gmail, Calendar, Drive) is handled by the
-        # google-workspace-mcp Deployment (MCP server) — no CLI needed here.
         - name: install-cli-tools
-          # Tracks :latest with the digest pinned in git, auto-bumped by
-          # .github/workflows/bump-image-digests.yml (commits to main). Same
-          # ref as the main container so the init reuses the cached layer; a
-          # changing digest + IfNotPresent rolls cleanly each bump without the
-          # stuck-pull risk of :latest + Always.
           image: docker.io/nousresearch/hermes-agent:latest@sha256:192c6d84eccfbc14959df4084a14dd5d3c5fda7be57579282689c9ecd2b00f4d
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
@@ -723,27 +603,7 @@ spec:
           volumeMounts:
             - name: home
               mountPath: /opt/data
-        # Seed the GitOps'd hermes config and CLI credentials onto the home
-        # volume on every start (overwrite) so git changes take effect on each
-        # rollout regardless of what the PVC already contains.
-        #
-        # ~/.bashrc repairs PATH (the local terminal backend snapshots PATH from
-        # `bash -l`; /etc/profile resets it for non-root users, dropping
-        # /opt/data/.local/bin where gh/claude install).
-        #
-        # ~/.config/gh/hosts.yml pre-authenticates the gh CLI. GITHUB_TOKEN is
-        # permanently blocked from terminal/execute_code subprocesses: it is
-        # registered as an API-key env var by the Copilot provider, so
-        # _build_provider_env_blocklist() adds it to the hard blocklist and
-        # env_passthrough.py refuses to re-allow any provider credential. gh
-        # falls back to ~/.config/gh/hosts.yml when GITHUB_TOKEN is absent from
-        # env — same pattern as seed-google-token for gws.
         - name: seed-hermes-config
-          # Uses the hermes-agent image (which has Python + PyYAML) instead of
-          # busybox so we can deep-merge the seed config into the existing one
-          # rather than wiping it. This preserves runtime state Hermes has
-          # written to config.yaml (skill enable/disable, curator state, etc.)
-          # while still applying git-managed updates on every rollout.
           image: docker.io/nousresearch/hermes-agent:latest@sha256:192c6d84eccfbc14959df4084a14dd5d3c5fda7be57579282689c9ecd2b00f4d
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
@@ -964,25 +824,15 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: GITHUB_TOKEN
-            # OpenRouter inference key (same secret the main container maps to
-            # OPENROUTER_API_KEY); used by the .env seeding step above.
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
                   key: GENERAL_API_LLM_API_KEY
-            # Hindsight connection, mirrored from the main container's env (below)
-            # so the Claude Code plugin config and the memory-provider config.json
-            # this init container writes stay in sync with it — single source of
-            # truth is the Deployment, not either seeded file.
             - name: HINDSIGHT_API_URL
               value: http://hindsight:8888
             - name: HINDSIGHT_API_KEY
               value: local
-            # Bank scoping for BOTH the Claude Code plugin and Hermes' own memory
-            # provider — "hermes" is the shared cross-agent bank (see 4.ss/AGENTS.md
-            # and hindsight-hygiene.yaml's bank config). Override per-deployment if
-            # this agent should use an isolated bank instead.
             - name: HINDSIGHT_BANK_ID
               value: hermes
           volumeMounts:
@@ -991,138 +841,64 @@ spec:
             - name: config-seed
               mountPath: /seed
               readOnly: true
-            # tmpfs target for the provider-credential .env (see above).
             - name: secret-env
               mountPath: /run/secret-env
-            # Team roster (see team-roster Secret above). optional: true at the
-            # volume level means this mounts as an empty dir with no roster.json
-            # if the Secret is absent/unpopulated — handled gracefully below.
             - name: team-roster
               mountPath: /secrets/team-roster
               readOnly: true
       containers:
         - name: hermes-agent
-          # Tracks :latest with the digest pinned in git and auto-bumped by
-          # .github/workflows/bump-image-digests.yml (commits to main). A
-          # changing digest + IfNotPresent rolls the pod cleanly on each new
-          # build, without the stuck-pull risk of :latest + Always.
           image: docker.io/nousresearch/hermes-agent:latest@sha256:192c6d84eccfbc14959df4084a14dd5d3c5fda7be57579282689c9ecd2b00f4d
           imagePullPolicy: IfNotPresent
-          # Keep the image's native s6-overlay entrypoint (/init): it runs as
-          # root only to seed config and chown the data volume on first boot,
-          # then drops to the non-root "hermes" user (UID 10000). We run the
-          # GATEWAY as the supervised long-lived process (`gateway run`): s6
-          # restarts it on crash, and it connects every enabled messaging
-          # adapter (incl. the webhook server) and exposes the OpenAI-compatible
-          # API server. The default image CMD is the interactive `hermes` CLI,
-          # which exits 0 on a non-TTY (Completed) and crashloops the pod, so we
-          # pass `gateway run` explicitly. The web dashboard runs ALONGSIDE the
-          # gateway as a second supervised s6 service via HERMES_DASHBOARD=1
-          # (host/port/insecure set in env below) — no port clash now because
-          # the gateway, not the dashboard, is the foreground PID. Insecure for
-          # now; to be gated externally via Cloudflare Zero Trust + tunnel.
-          # Secrets are injected as env vars below and inherited by the hermes
-          # process; nothing is written to the PVC.
           args:
             - gateway
             - run
           env:
-            # Pin the gateway's working directory to HERMES_HOME so the agent's
-            # project-context file is loaded: prompt assembly's _load_agents_md()
-            # reads <cwd>/AGENTS.md (cwd only, no git-root walk), and AGENTS.md is
-            # seeded to /opt/data by the seed-hermes-config init container above.
-            # The image entrypoint wrapper (docker/main-wrapper.sh) execs the CMD
-            # with `cd "${HERMES_ORIG_CWD:-$PWD}"` as its final step, so setting
-            # this var deterministically lands `gateway run` in /opt/data —
-            # independent of how s6 hands cwd to the supervised service (the
-            # systemd-WorkingDirectory caveat in NousResearch/hermes-agent#11312).
-            # SOUL.md loads from $HERMES_HOME regardless of cwd.
             - name: HERMES_ORIG_CWD
               value: /opt/data
-            # Inference: deepseek-v4-flash via OpenRouter. The provider and model
-            # are selected in config.yaml (model.provider/model.default); this
-            # only supplies the OpenRouter API key (GENERAL_API_LLM_API_KEY).
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
                   key: GENERAL_API_LLM_API_KEY
-            # Memory provider connection (self-hosted hindsight). The provider
-            # is *selected* in config.yaml (memory.provider: hindsight) via the
-            # hermes-config ConfigMap; these env vars only point the plugin at
-            # our in-cluster instance.
             - name: HINDSIGHT_MODE
               value: local_external
             - name: HINDSIGHT_API_URL
               value: http://hindsight:8888
             - name: HINDSIGHT_API_KEY
               value: local
-            # Web search via Firecrawl (backend selected in config.yaml).
             - name: FIRECRAWL_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
                   key: FIRECRAWL_API_KEY
-            # GitHub auth for the `gh` CLI (replaces the removed GitHub MCP).
-            # gh reads GITHUB_TOKEN natively, so no `gh auth login` is needed.
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
                   key: GITHUB_TOKEN
-            # Cloudflare MCP token, referenced from the mcp_servers header
-            # via ${VAR}.
             - name: CLOUDFLARE_API_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
                   key: CLOUDFLARE_API_TOKEN
-            # Cloudflare account id, surfaced to the agent via config.yaml
-            # (agent.environment_hint uses ${CLOUDFLARE_ACCOUNT_ID}) so it can
-            # pass account_id to Cloudflare MCP tools that require it.
             - name: CLOUDFLARE_ACCOUNT_ID
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
                   key: CLOUDFLARE_ACCOUNT_ID
-            # --- Gateway services (started by `gateway run`, see args above) ---
-            # Web dashboard: run as a supervised s6 service alongside the gateway
-            # (this replaces the old `dashboard` foreground command). HOST/PORT
-            # reproduce the previous 0.0.0.0:9119 bind.
-            #
-            # As of the newer hermes image, HERMES_DASHBOARD_INSECURE is a no-op:
-            # a non-loopback (0.0.0.0) bind now REQUIRES a registered auth
-            # provider, otherwise the dashboard refuses to bind :9119. Because the
-            # readiness/liveness probes are tcpSocket:9119, an unbound dashboard
-            # fails them (connection refused) and wedges the rollout (new pod
-            # stuck 0/1, old pod kept). We register basic auth below so the
-            # dashboard binds and the pod goes Ready; it is still intended to be
-            # fronted by Cloudflare Zero Trust.
-            # TODO(harden): move HERMES_DASHBOARD_BASIC_AUTH_PASSWORD to a
-            # hermes-secrets key (sealed) instead of this literal. Real access
-            # control for the dashboard is Cloudflare Zero Trust in front of
-            # it; this password only satisfies the image's "must have basic
-            # auth to bind 0.0.0.0" requirement, so the repo's standard dummy
-            # value (NotARealSecret-1) is used below.
             - name: HERMES_DASHBOARD
               value: "1"
             - name: HERMES_DASHBOARD_HOST
               value: 0.0.0.0
             - name: HERMES_DASHBOARD_PORT
               value: "9119"
-            # Legacy no-op in the current image (kept for clarity); the basic-auth
-            # provider below is what actually allows the 0.0.0.0 bind.
             - name: HERMES_DASHBOARD_INSECURE
               value: "1"
             - name: HERMES_DASHBOARD_BASIC_AUTH_USERNAME
               value: hermes
             - name: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
               value: "NotARealSecret-1"
-            # API server: OpenAI-compatible endpoint exposed by the gateway,
-            # bearer-auth gated. Bind 0.0.0.0 so it is reachable in-cluster (the
-            # default is 127.0.0.1). The bearer token lives in hermes-secrets
-            # (HERMES_BEARER_TOKEN). config.yaml support for the API server does
-            # not exist yet, so it is env-only.
             - name: API_SERVER_ENABLED
               value: "true"
             - name: API_SERVER_HOST
@@ -1134,11 +910,6 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: HERMES_BEARER_TOKEN
-            # Webhook adapter: also enabled in config.yaml
-            # (platforms.webhook.enabled), but set here too because the env path
-            # is the reliable one (config.yaml webhook port handling has known
-            # bugs upstream). A global HMAC secret can be added later as
-            # WEBHOOK_SECRET (per-route secrets go in config.yaml).
             - name: WEBHOOK_ENABLED
               value: "true"
             - name: WEBHOOK_PORT
@@ -1148,25 +919,8 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: GITHUB_TOKEN
-            # gbrain MCP bearer token — substituted into mcp_servers.gbrain.headers
-            # in hermes-config.yaml as ${GBRAIN_REMOTE_TOKEN}. Inlined (NOT a
-            # Secret): in-cluster shared credential, network-isolated. MUST match
-            # the literal on the gbrain Deployment above.
             - name: GBRAIN_REMOTE_TOKEN
               value: "gbrain-mcp"
-            # NOTE: deliberately NO `PATH` (and no S6_KEEP_ENV) override here.
-            # The image's Dockerfile already sets
-            #   ENV PATH=/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:$PATH
-            # so /opt/data/.local/bin (where the install-cli-tools init drops
-            # claude/gh/gws) is already on PATH BY THE IMAGE — that dir is the
-            # image's intended user-tools location. s6-overlay runs the
-            # supervised services (main-hermes, dashboard) with a reset env but
-            # re-imports the container-start environment via `with-contenv`
-            # (/run/s6/container_environment), which carries that Dockerfile
-            # PATH. Setting a Pod-level PATH here would OVERWRITE the image's
-            # value at container start and drop /opt/hermes/bin (the
-            # privilege-drop shim) and /opt/hermes/.venv/bin (the hermes venv),
-            # breaking `hermes` itself — so we leave PATH to the image.
           ports:
             - name: webui
               containerPort: 9119
@@ -1189,38 +943,19 @@ spec:
           volumeMounts:
             - name: home
               mountPath: /opt/data
-            # tmpfs holding the provider-credential .env that $HERMES_HOME/.env
-            # symlinks to. Must be mounted here too so the symlink resolves for
-            # the gateway/session model client (the consumer of the key).
             - name: secret-env
               mountPath: /run/secret-env
       volumes:
-        # Ephemeral home. Every path under it is either seeded from a git-managed
-        # ConfigMap on each start (config.yaml, gh auth, .bashrc, SOUL/AGENTS) or
-        # re-fetched by a guarded init container (gov, claude, gh, skills). The
-        # only accumulated state was session history, logs, and the retired kanban
-        # DB, all of which are ephemeral by design — errors go to stderr for
-        # Kubernetes to persist. sizeLimit matches the retired PVC's 5Gi request.
         - name: home
           emptyDir:
             sizeLimit: 5Gi
-        # Seed source for config.yaml (read-only ConfigMap); copied to the home
-        # volume by the seed-hermes-config init container.
         - name: config-seed
           configMap:
             name: hermes-config
-        # RAM-backed (tmpfs) volume holding ONLY the provider-credential .env.
-        # The seed-hermes-config init container writes it from hermes-secrets and
-        # symlinks $HERMES_HOME/.env to it, so the OpenRouter key is materialized
-        # in memory on every start and never written to the home volume.
-        # fsGroup (10000) makes the dir traversable by the hermes user.
         - name: secret-env
           emptyDir:
             medium: Memory
             sizeLimit: 1Mi
-        # Team roster (see team-roster Secret above). optional: true so the pod
-        # still mounts (as an empty dir) and reaches Ready even if the Secret
-        # is missing or not yet populated out-of-band.
         - name: team-roster
           secret:
             secretName: team-roster
@@ -1242,8 +977,6 @@ spec:
     - name: http
       port: 80
       targetPort: 9119
-    # OpenAI-compatible API server (bearer-auth) and webhook receiver, exposed
-    # externally via the IngressRoute below on the same TLS host as the dashboard.
     - name: api
       port: 8642
       targetPort: 8642

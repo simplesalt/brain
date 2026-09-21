@@ -1,11 +1,3 @@
-# Claude Code coding pods — namespace-scoped credentials.
-#
-# Migrated from base-stack/4.ss/coding.yaml (ssint-named-coding) to brain repo
-#
-# `claude-auth`/`gh-auth`/`cf-secret`/`cf-id` are SSA-merge placeholders shared
-# across every coding pod in this namespace — Flux creates the empty shells,
-# real values are patched in OUT-OF-BAND (kubectl), never committed to git.
-#
 ---
 apiVersion: v1
 kind: Namespace
@@ -72,9 +64,6 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
-# Retained deliberately: the claude-rc-base-stack Deployment that used this
-# credential has been removed, but its stored OAuth credential is kept here
-# (SSA-merge placeholder) so Flux does NOT prune it.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -88,28 +77,6 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
-# Identity metadata for the Anthropic account these coding pods authenticate
-# as (user id, account/org UUIDs, email, org display name, display name).
-# Shared across all claude-rc-<repo> Deployments in this namespace. Populated
-# OUT-OF-BAND (kubectl) — never committed to git. The ssa: merge annotation
-# lets Flux own the resource without clobbering the out-of-band values.
-# Consumed via secretKeyRef (optional: true) as CLAUDE_USER_ID,
-# CLAUDE_ACCOUNT_UUID, CLAUDE_ORG_UUID, CLAUDE_EMAIL, CLAUDE_ORG_NAME,
-# CLAUDE_DISPLAY_NAME.
-#
-# kubectl create secret generic claude-identity -n ssint-main-coding \
-#   --from-literal=CLAUDE_USER_ID=<user-id> \
-#   --from-literal=CLAUDE_ACCOUNT_UUID=<account-uuid> \
-#   --from-literal=CLAUDE_ORG_UUID=<org-uuid> \
-#   --from-literal=CLAUDE_EMAIL=<email> \
-#   --from-literal=CLAUDE_ORG_NAME=<org-name> \
-#   --from-literal=CLAUDE_DISPLAY_NAME=<display-name> \
-#   --dry-run=client -o yaml | kubectl apply --server-side -f -
-#
-# NOTE: --server-side is required, not optional. Client-side `kubectl apply`
-# copies the full rendered manifest (including the base64 secret values) into
-# the kubectl.kubernetes.io/last-applied-configuration annotation, which is not
-# redacted by tooling that masks Secret data. See simplesalt/basis#3.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -123,10 +90,6 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
-# Skel override shared by the claude-rc-<repo> Deployments: injects extra MCP
-# servers into the Claude Code config without rebuilding the image. entrypoint.sh
-# does `cp -a /etc/claude-code/skel/. $HOME/` on every boot, so mounting a
-# single file here (subPath) is enough — the rest of skel is unaffected.
 apiVersion: v1
 kind: ConfigMap
 metadata:

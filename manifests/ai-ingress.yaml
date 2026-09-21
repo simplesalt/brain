@@ -1,6 +1,4 @@
 ---
-# Strip /webhook prefix so the hermes webhook server sees routes at their
-# configured paths (e.g. /my-handler) rather than /webhook/my-handler.
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
@@ -15,7 +13,6 @@ spec:
     prefixes:
       - /webhook
 ---
-# Rewrite /gbrain-ingestion to /ingest so gbrain sees its expected path.
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
@@ -30,10 +27,6 @@ spec:
     regex: ^/gbrain-ingestion
     replacement: /ingest
 ---
-# Standard Ingress retained so k8s-gateway (resources: Service Ingress) keeps
-# the ai.famevans.win DNS A record alive. Traefik's IngressRoute below takes
-# routing priority for /v1 and /webhook; this handles the catch-all / path
-# (dashboard) and serves as the DNS anchor.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -64,12 +57,6 @@ spec:
                 port:
                   number: 3000
 ---
-# Route ai.famevans.win traffic to three backend services via a single TLS
-# host. The IngressRoute takes routing priority over the standard Ingress above
-# for /v1 and /webhook; the standard Ingress handles / (dashboard) and DNS.
-#   /v1      → api_server (OpenAI-compatible; no path rewrite — /v1/... is correct)
-#   /webhook → webhook    (StripPrefix strips /webhook before forwarding)
-#   /        → dashboard  (catch-all, also covered by the standard Ingress)
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:

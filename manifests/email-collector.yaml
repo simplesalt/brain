@@ -1,61 +1,4 @@
-# Email-to-brain: deterministic Gmail collector for the ssint-main-ai namespace.
-# Architecture: a CronJob (every minute) pulls Gmail for the work account via the
-# existing service-account DWD credential, writes structured per-day JSON + a markdown
-# digest to a pod-scoped emptyDir, then deterministically pushes each (non-noise)
-# message into gbrain via the MCP server (put_page). gbrain self-wires
-# entities/links/timeline server-side, so ingestion no longer depends on the Hermes
-# agent loop.
-#
-# State that must survive across pods/invocations is NOT on a PVC (a PVC pins pods to a
-# single node and blocks kubectl drain / kured node-reboot compatibility — see
-# simplesalt/projects#346). Instead:
-#   - Heartbeat  → Lease "email-collector-heartbeat" (coordination.k8s.io/v1), declared
-#                  below. holderIdentity/renewTime/leaseDurationSeconds carry liveness;
-#                  status/error/ingested-total/pushed-this-run ride in annotations under
-#                  the ingestion.simplesalt.company/ prefix — same contract as
-#                  calendar-collector.yaml's heartbeat Lease.
-#   - Cursor (lastCollect) → ConfigMap "email-collector-cursor", key "cursor.json",
-#                  patched at the end of each collect() run.
-#   - gbrain idempotency cache → the SAME ConfigMap, key "ingested.json", patched once
-#                  at the end of each enrich() run and pruned to a 48h window. Merge-patch
-#                  is per-key, so the two writers never clobber each other.
-#   - Everything else (per-day message JSON, digests) → emptyDir at /data in the CronJob
-#     pod only; none of it needs to survive past that pod (see
-#     collect()/backfill()/enrich() comments below for why).
-# knownIds (dedup-within-collect-window) is intentionally NOT persisted anywhere — it's
-# a redundant-fetch optimisation only, never load-bearing for correctness.
-# A companion Deployment (email-ingestion-health) exposes a k8s readiness probe over the
-# heartbeat Lease so ingestion health shows up in `kubectl get pods` like every other
-# workload's probe. It mounts no data volume (the PVC is gone); it still mounts the
-# collector-script ConfigMap read-only, since its readinessProbe execs that same script
-# in `healthcheck` mode.
-#
-# PREREQUISITE (one-time, manual): In Google Admin Console → Security → API Controls
-# → Domain-wide Delegation, ensure the service account client-ID (the service
-# account configured via GOOGLE_CLIENT_EMAIL below, sourced from the google-dwd-key
-# Secret) is authorized with these scopes:
-#   https://mail.google.com/,
-#   https://www.googleapis.com/auth/drive,
-#   https://www.googleapis.com/auth/documents,
-#   https://www.googleapis.com/auth/spreadsheets,
-#   https://www.googleapis.com/auth/calendar,
-#   https://www.googleapis.com/auth/contacts
-# Without DWD authorization the collector fails 403 on first run; all other k8s
-# resources below are inert until that step is done.
-#
-# Personal Gmail: stubbed (disabled). Full RW on a personal @gmail.com account
-# requires an External OAuth app with restricted scopes (https://mail.google.com/,
-# drive, etc.), which triggers Google's OAuth verification + CASA security audit
-# before production tokens are issued. Add a second account entry here once that
-# OAuth client + refresh token is obtained and stored in hermes-secrets.
 ---
-# Holds the Google service-account identity used for Domain-wide Delegation:
-#   client_email       — the service-account's client email (iss claim of the DWD JWT)
-#   impersonate_email  — the work Google account being impersonated (sub claim)
-# Populated out-of-band (kept out of git). The ssa: merge annotation lets Flux own
-# the resource without clobbering the out-of-band value. Consumed via secretKeyRef
-# by email-collector.yaml (this file) and calendar-collector.yaml, both in this
-# namespace, as GOOGLE_CLIENT_EMAIL / WORK_EMAIL.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -69,9 +12,6 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
-# Dedicated ServiceAccounts (never `default`) for the two workloads below, each bound to
-# a Role scoped by resourceNames to only the one Lease/ConfigMap it needs — see the
-# Role/RoleBinding pairs following the Lease and ConfigMap.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -92,20 +32,6 @@ metadata:
     env: main
     capability: ai
 ---
-# Pipeline heartbeat, replacing the old PVC-backed heartbeat.json/.jsonl. Declared here
-# (not created by the writer) so the collector's Role needs only get/update/patch, never
-# create — RBAC-minimal GitOps.
-#
-# Only spec.leaseDurationSeconds is declared in git — holderIdentity, renewTime, and the
-# ingestion.simplesalt.company/* payload annotations are entirely collector-owned,
-# written by writeHeartbeat() via merge-patch. Same reasoning as the cursor ConfigMap
-# below: this repo's Flux Kustomization reconciles every 5m with prune: true, and if
-# those fields were declared here Flux would stomp the live heartbeat every reconcile.
-# The `kustomize.toolkit.fluxcd.io/ssa: merge` annotation (same idiom as the
-# google-dwd-key Secret above) keeps Flux from owning/pruning fields it didn't declare.
-# Payload keys (status/error/ingested-total/pushed-this-run) use the
-# ingestion.simplesalt.company/ prefix — the SAME prefix and keys calendar-collector.yaml
-# uses for its own heartbeat Lease, so both pipelines are legible the same way.
 apiVersion: coordination.k8s.io/v1
 kind: Lease
 metadata:
@@ -118,42 +44,8 @@ metadata:
   annotations:
     kustomize.toolkit.fluxcd.io/ssa: merge
 spec:
-  # 15m — ~15 missed runs at the 1-per-minute cadence, enough to ride out a node reboot
-  # or a slow backlog run without flapping, tight enough that a genuinely stopped
-  # CronJob shows up as NotReady within the quarter hour. Carried over from the old
-  # 30-minute schedule, 4200s would have tolerated 70 missed runs.
-  # Must match HEARTBEAT_MAX_AGE_SEC on the health Deployment below.
   leaseDurationSeconds: 900
 ---
-# Cross-pod collector state, replacing the old PVC-backed state.json and ingested.json.
-# Two keys, two independent writers, both JSON merge-patch (which merges into `data`
-# per-key, so neither clobbers the other):
-#   cursor.json   — collect()'s lastCollect, written at the end of every collect run.
-#   ingested.json — enrich()'s gbrain put_page idempotency cache, written once at the end
-#                   of every enrich run and pruned to a 48h window.
-# Declared here (metadata only, no `data:` block — see below) so the collector's Role
-# needs only get/update/patch, never create.
-#
-# Deliberately NO `data:` block in git: this repo is reconciled by the Flux
-# Kustomization `brain` (interval: 5m, prune: true). If the cursor value were declared
-# here, Flux would re-apply that committed value over the live one every reconcile —
-# and since the CronJob runs every minute, the cursor would be reset to its committed
-# (empty) value roughly every 5th run, re-triggering the exact newer_than:25h silent-
-# loss path #346 exists to fix. The `kustomize.toolkit.fluxcd.io/ssa: merge` annotation
-# (same idiom as the google-dwd-key Secret above) tells Flux to merge instead of
-# force-apply, so it never owns/prunes the keys the collector writes.
-#
-# knownIds does NOT live here: it's a dedup-within-window optimisation, never
-# load-bearing (see collect()'s comment in the script below), and this ConfigMap is
-# patched every minute (schedule: * * * * *), so anything unbounded here would be the
-# wrong shape for that cadence. ingested.json is bounded by its 48h prune.
-#
-# cursor.json holds {"lastCollect": "<ISO8601>", "initialized": true}. A missing key
-# (first-ever apply,
-# before the collector has run) reads as "genuinely never run". If the key is present
-# but lastCollect is empty, the cursor was lost (wiped/corrupted) — collect() treats
-# that as a loud failure (Lease status=error, readiness NotReady) instead of silently
-# trusting a 25h fallback window the way a genuine first-run does.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -248,17 +140,6 @@ metadata:
 data:
   email-collector.mjs: |
     #!/usr/bin/env bun
-    // Deterministic Gmail collector — gbrain email-to-brain recipe v0.7.0 (+enrich v0.8.0,
-    //   +Lease/ConfigMap state v0.9.0, no PVC).
-    // Code handles: auth, dedup, links, noise/sig detection, atomic writes, AND
-    //   deterministic ingestion into gbrain (put_page over MCP). gbrain does the
-    //   server-side self-wiring (entities, links, timeline). Hermes may still add
-    //   higher-order judgment (urgency, replies) on top, but ingestion no longer
-    //   depends on the agent loop. State that must survive across pods (heartbeat,
-    //   collect cursor) lives in a k8s Lease + ConfigMap, not a PVC — see the Lease/
-    //   ConfigMap manifests earlier in this file and collect()/writeHeartbeat()/
-    //   healthcheck() below for the client.
-    // Usage: bun email-collector.mjs collect | backfill | digest | enrich | healthcheck | diagnose
 
     import { createSign } from 'crypto';
     import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, readdirSync } from 'fs';
@@ -271,21 +152,12 @@ data:
     const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL ?? '';
     const POD_NAME    = process.env.POD_NAME ?? 'unknown';
 
-    // ---------- gbrain ingestion config ----------
-    // Same-pod advisory only (never read across pod invocations): collect() sets this
-    // when it detects a lost cursor (see collect()'s comment) so enrich() — a separate
-    // `bun` process later in the same pod's `collect && digest && enrich` chain — can
-    // fold it into the heartbeat it writes. Lives on the emptyDir, so it never survives
-    // past this pod, which is fine: it exists purely to hop between two processes in one
-    // pod, not to persist anything.
     const CURSOR_LOST_FLAG = join(DATA_DIR, '.cursor-lost');
     const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain:3131/mcp';
     const GBRAIN_TOKEN   = process.env.GBRAIN_REMOTE_TOKEN ?? '';
     const SOURCE_VERSION = '0.9.0';
     const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 900);
 
-    // Personal account stub — disabled until OAuth client + refresh token added.
-    // const PERSONAL_EMAIL = process.env.PERSONAL_EMAIL ?? '';
 
     const GMAIL_SCOPES = [
       'https://www.googleapis.com/auth/gmail.modify',
@@ -296,7 +168,6 @@ data:
       'https://www.googleapis.com/auth/calendar.calendars',
     ];
 
-    // ---------- Google service-account JWT (DWD) ----------
 
     function b64url(s) { return Buffer.from(s).toString('base64url'); }
 
@@ -331,11 +202,6 @@ data:
       return (await r.json()).access_token;
     }
 
-    // ---------- Kubernetes API client (Lease heartbeat + ConfigMap cursor) ----------
-    // No kubectl in this image; talk to the API server directly with the projected
-    // ServiceAccount token/CA, the same way every in-cluster client does. Both the Lease
-    // and the ConfigMap are pre-created in git (see this file's manifests above) so the
-    // collector's Role only ever needs get/update/patch, never create.
 
     const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
     const NAMESPACE = (() => {
@@ -380,24 +246,6 @@ data:
       return r.json();
     }
 
-    // ---------- Cursor (ConfigMap-backed; replaces the old state.json on the PVC) ----------
-    // Only lastCollect lives here. knownIds deliberately does NOT: it is a dedup-within-
-    // window optimisation, never load-bearing for correctness (the day-file's own
-    // seenIds set, built fresh each run from the day-file's existing content, is the
-    // real duplicate guard — see collect() below), so persisting it would mean rewriting
-    // an ever-growing ConfigMap every minute for zero correctness benefit. Kept purely
-    // local/in-memory instead; losing it across pod restarts costs redundant Gmail GETs
-    // on the overlapping part of the query window, never a missed or duplicated message.
-    //
-    // The email-collector-cursor ConfigMap declares NO data in git (see its manifest
-    // above) — Flux reconciles this repo every 5m with prune: true, and the CronJob
-    // runs every minute, so a git-declared value would stomp the live cursor roughly
-    // every 5th run. The collector owns the `cursor.json` key entirely via merge-patch
-    // (and enrich() the `ingested.json` key, independently — merge-patch is per-key so
-    // the two never race); a missing key just means "nothing written yet". A GET failure (bad
-    // RBAC, apiserver hiccup, object genuinely missing) is logged and treated the same
-    // as a lost cursor, not a crash — collect() surfaces it via the heartbeat Lease
-    // (status=error) rather than throwing the whole run.
 
     async function loadCursor() {
       let cm;
@@ -416,7 +264,6 @@ data:
       await k8sPatch(CURSOR_PATH, { data: { [CURSOR_KEY]: JSON.stringify({ lastCollect, initialized: true }) } });
     }
 
-    // ---------- Noise / signature detection (deterministic) ----------
 
     const NOISE_SENDERS = [
       'noreply', 'no-reply', 'notifications@', 'calendar-notification',
@@ -431,11 +278,9 @@ data:
     const isNoise = from => NOISE_SENDERS.some(p => (from ?? '').toLowerCase().includes(p));
     const isSig   = (from, subj) => SIG_PATTERNS.some(r => r.test(`${from ?? ''} ${subj ?? ''}`));
 
-    // Gmail deep-link with authuser=email (correct account even if not the default)
     const gmailLink = (id, email) =>
       `https://mail.google.com/mail/u/?authuser=${encodeURIComponent(email)}#inbox/${id}`;
 
-    // ---------- Gmail API ----------
 
     async function gmailList(token, query, max = 100) {
       const msgs = [];
@@ -468,7 +313,6 @@ data:
     const hdr = (msg, name) =>
       msg.payload?.headers?.find(h => h.name.toLowerCase() === name.toLowerCase())?.value ?? '';
 
-    // ---------- collect ----------
 
     async function collect() {
       const keyB64 = process.env.GOOGLE_PRIVATE_KEY_B64;
@@ -493,16 +337,6 @@ data:
       const token = await getToken(privKey, kid, WORK_EMAIL);
       const cursor = await loadCursor();
 
-      // Query window: since last collect + 1h buffer. A missing cursor is only a safe
-      // 25h fallback on a genuinely first-ever run (cursor ConfigMap freshly seeded,
-      // never written by a real collect — initialized stays "false" until the first
-      // successful saveCursor()). If the ConfigMap was already initialized and
-      // lastCollect is missing anyway, the cursor was lost (wiped/corrupted): silently
-      // falling back to 25h here would silently drop any unprocessed mail older than
-      // that window. So this case fails LOUD instead — logged now, and folded into the
-      // heartbeat Lease by enrich() below (via CURSOR_LOST_FLAG) so the readiness probe
-      // goes NotReady and a human runs a manual backfill rather than trusting the gap
-      // was harmless.
       const cursorLost = cursor.initialized && !cursor.lastCollect;
       if (cursorLost) {
         const msg = 'cursor lost: email-collector-cursor ConfigMap is initialized but ' +
@@ -521,8 +355,6 @@ data:
         gmailList(token, `in:sent ${q}`),
       ]);
 
-      // Sent thread IDs → mark replied-to inbox threads. knownIds is process-local only
-      // (see loadCursor's comment above) — reset fresh every run, never persisted.
       const knownIds = {};
       const sentThreads = new Set(sent.map(m => m.threadId));
       for (const m of sent) knownIds[m.id] = { sent: true };
@@ -552,7 +384,6 @@ data:
         };
         knownIds[ref.id] = { collected: today };
         if (!seenIds.has(ref.id)) { existing.push(rec); seenIds.add(ref.id); added++; }
-        // Small delay to stay well within Gmail API quota (250 units/user/sec)
         await new Promise(r => setTimeout(r, 50));
       }
 
@@ -563,41 +394,11 @@ data:
       try {
         await saveCursor(new Date().toISOString());
       } catch (e) {
-        // Self-healing: don't fail the run over a cursor write hiccup — next run's
-        // window arithmetic (based on the OLD, still-intact cursor) naturally re-covers
-        // whatever gap this causes. Only a wiped/missing lastCollect (cursorLost, above)
-        // needs a loud alert; a transient PATCH failure does not.
         console.error(`WARN: cursor ConfigMap patch failed, will retry next run: ${e.message}`);
       }
       console.log(`collect [${WORK_EMAIL}]: +${added} new (${inbox.length} inbox, ${sent.length} sent checked)${cursorLost ? ' [CURSOR LOST]' : ''}`);
     }
 
-    // ---------- backfill ----------
-    // One-shot historical re-pull for a closed date window. `collect` only ever walks
-    // forward from the cursor, so a gap in the day-files is structurally unrecoverable
-    // by the normal cadence — nothing ever looks backwards. backfill re-pulls the window
-    // straight from Gmail (the authoritative source) and files each message under the
-    // day-file for its own internalDate, which is where enrich already looks. Records
-    // are byte-identical in shape to collect's, so digest/enrich need no knowledge that
-    // a backfill happened.
-    //
-    // IMPORTANT (post-PVC): day-files now live on a pod-scoped emptyDir, not a shared
-    // PVC. backfill runs as its own one-off Pod/Job, separate from the every-minute
-    // CronJob, so anything it writes to /data would vanish with that pod before any
-    // later scheduled run could ever see it — there is no "next enrich run" to pick it
-    // up anymore. So backfill calls enrich() itself at the end, in-process, in the same
-    // pod, closing that gap without inventing new durable infrastructure (no new PVC, no
-    // database, no keeping the old PVC around as a fallback).
-    //
-    // Deliberately never touches the cursor ConfigMap — collect() owns lastCollect and
-    // the two never contend for the same message: collect's window is `newer_than:~2h`
-    // and backfill's is strictly historical. Worst case on overlap is a redundant Gmail
-    // fetch — the day-file and ingested.json both dedup by id.
-    //
-    // Window is given as UTC dates, both ends inclusive, and converted to epoch seconds
-    // for the Gmail query. Gmail's `after:`/`before:` accept Unix timestamps and
-    // interpret bare YYYY/MM/DD dates in the account's timezone; epoch keeps the window
-    // absolute and aligned with the UTC basis the day-file names already use.
 
     function dayOf(msg, fallbackDate) {
       const ms = Number(msg.internalDate);
@@ -636,8 +437,6 @@ data:
       const q = `after:${afterSec} before:${beforeSec}`;
       console.log(`backfill [${WORK_EMAIL}]: window ${from}..${to} inclusive (${q})`);
 
-      // MAX is a ceiling, not an expectation: gmailList's default of 100 would silently
-      // truncate a multi-week window into the first page of results.
       const MAX = Number(process.env.BACKFILL_MAX ?? 5000);
       const [inbox, sent] = await Promise.all([
         gmailList(token, `in:inbox ${q}`, MAX),
@@ -670,7 +469,6 @@ data:
         };
         if (!byDay.has(day)) byDay.set(day, []);
         byDay.get(day).push(rec);
-        // Same Gmail quota courtesy as collect (250 units/user/sec).
         await new Promise(r => setTimeout(r, 50));
       }
 
@@ -695,17 +493,8 @@ data:
       await enrich();
     }
 
-    // ---------- digest ----------
 
     async function digest() {
-      // NOTE (post-PVC): day-files live on a pod-scoped emptyDir now, so this can only
-      // ever see day-files written earlier in THIS pod's lifetime — today's file from
-      // this run's own collect() step, and (if backfill ran in this same invocation)
-      // whatever backfill just wrote. The "yesterday" half of the window is effectively
-      // always empty on the normal scheduled-CronJob path now; kept for the rare case a
-      // run straddles UTC midnight within one pod. This is a behavioural narrowing from
-      // the old PVC-backed rolling view, not a breakage: nothing else in this repo
-      // consumes the digest markdown output (verified by grep across manifests/).
       const today = new Date().toISOString().slice(0, 10);
       const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
       mkdirSync(DIGESTS, { recursive: true });
@@ -716,7 +505,6 @@ data:
         if (existsSync(f)) all.push(...JSON.parse(readFileSync(f, 'utf8')));
       }
 
-      // Dedup by message ID across the two-day window
       const msgs = [...new Map(all.map(m => [m.id, m])).values()];
 
       const signatures = msgs.filter(m =>  m.is_signature && !m.is_noise);
@@ -753,28 +541,6 @@ data:
       console.log(`digest: ${triage.length} triage, ${signatures.length} sig, ${noise.length} noise → ${out}`);
     }
 
-    // ---------- enrich: deterministic ingestion into gbrain ----------
-    // Reads every collected message (all day-files, dedup by id), skips noise, and
-    // pushes each not-yet-ingested message into gbrain via the MCP put_page tool.
-    // gbrain self-wires entities/links/timeline server-side. Idempotent: ingested IDs
-    // are tracked in ingested.json so re-runs only push new mail (and the first run
-    // backfills whatever the collector already accumulated). A run NEVER exits non-zero
-    // on a gbrain outage — that would fail the Job and re-pull Gmail. Instead the outage
-    // is recorded in the heartbeat Lease and surfaced by the readiness probe (NotReady).
-    //
-    // Post-PVC the cache lives in the email-collector-cursor ConfigMap, under its own
-    // `ingested.json` key alongside `cursor.json`. Both are written with JSON merge-patch,
-    // which merges into `data` per-key, so the two never clobber each other; one object
-    // means the collector's existing configmaps get/update/patch grant already covers it.
-    // On emptyDir it would start empty every run, and with a 1-minute schedule the whole
-    // of collect's ~2h overlap window would be re-pushed every single run — ~1400
-    // redundant put_page calls/day against gbrain's 60/min token budget, and ~20s of every
-    // 60s spent on upserts gbrain would just discard.
-    //
-    // Pruned by age, not by which IDs happen to be on this pod's emptyDir: backfill runs
-    // in its own pod whose day-files are entirely different, and pruning to that pod's ID
-    // set would wipe the scheduled collector's cache. 48h comfortably covers collect's ~2h
-    // window and keeps the object at a few tens of KB, far under the 1MB ConfigMap limit.
 
     const INGESTED_KEY    = 'ingested.json';
     const INGESTED_TTL_MS = 48 * 3_600_000;
@@ -801,18 +567,6 @@ data:
       return pruned;
     }
 
-    // Heartbeat: PATCH the Lease declared earlier in this file (merge-patch+json, so
-    // fields not mentioned here — e.g. acquireTime/leaseTransitions — are left alone).
-    // spec carries liveness (holderIdentity/renewTime/leaseDurationSeconds); the
-    // ingestion.simplesalt.company/ annotations carry the payload, matching
-    // calendar-collector.yaml's identical contract. Best-effort: a Lease write failure
-    // must not crash the caller (enrich always exits 0 — ingestion health lives in the
-    // probe, not Job status). If the Lease itself is unreachable, the readiness probe's
-    // own k8sGet will separately go stale and NotReady.
-    // Lease.spec.renewTime is a metav1.MicroTime, decoded with Go's RFC3339Micro layout
-    // ("...05.000000Z07:00"), which requires EXACTLY six fractional digits. toISOString()
-    // emits three, and the apiserver rejects the whole patch with 422 Invalid rather than
-    // rounding. Pad the milliseconds out to microseconds.
     function microNow() { return new Date().toISOString().replace('Z', '000Z'); }
 
     async function writeHeartbeat(status, { error, ingestedTotal, pushedThisRun } = {}) {
@@ -839,11 +593,6 @@ data:
       }
     }
 
-    // gbrain serves the MCP Streamable-HTTP transport in STATELESS mode
-    // (serve-http.ts: sessionIdGenerator undefined) — each POST is independent, no
-    // initialize/session handshake needed — BUT it requires the dual Accept header and
-    // replies as an SSE frame ("event: message\ndata: {json}"), not plain JSON. Parse
-    // the frame out; fall back to plain JSON for enableJsonResponse-style servers.
     function parseMcpResponse(text) {
       let msg = null;
       for (const block of text.split('\n\n')) {
@@ -883,9 +632,6 @@ data:
       return msg.result;
     }
 
-    // Provenance/source attribution baked in code (the recipe stresses: links + metadata
-    // are always code-generated, never LLM-generated). Remote put_page server-stamps its
-    // own source_kind, so we carry ours in the frontmatter for the audit trail.
     function emailToMarkdown(m) {
       const subj = m.subject || '(no subject)';
       const q = s => String(s ?? '').replace(/"/g, "'");
@@ -943,16 +689,11 @@ data:
             pushed++;
           } catch (e) {
             errors.push(`${m.id}: ${e.message}`);
-            // If the very first calls all fail, gbrain is likely down/misconfigured —
-            // stop early rather than grinding through the whole backlog against a dead endpoint.
             if (pushed === 0 && errors.length >= 3) break;
           }
-          await new Promise(r => setTimeout(r, 1100)); // < 55/min, under gbrain's 60/min token limit
+          await new Promise(r => setTimeout(r, 1100));
         }
 
-        // One write per run, not one per push: a crash mid-loop just means the next run
-        // re-pushes what it already did, which put_page's upsert-by-slug absorbs, and a
-        // PATCH per message would be ~20 API writes a minute for nothing.
         let total = Object.keys(ingested).length;
         try {
           total = Object.keys(await saveIngested(ingested)).length;
@@ -975,13 +716,8 @@ data:
         await writeHeartbeat('error', { error: e.message, pushedThisRun: 0 });
         console.error(`enrich: unexpected failure recorded in heartbeat: ${e.message}`);
       }
-      // Always exit 0: ingestion health lives in the heartbeat/probe, not the Job status.
     }
 
-    // ---------- healthcheck: k8s readiness probe target ----------
-    // Exit 0 = ingestion healthy (fresh Lease renewTime + last run status=ok). Exit 1 =
-    // NotReady. Reads the same Lease writeHeartbeat() patches, via the
-    // email-ingestion-health ServiceAccount's get-only Role (scoped to just this Lease).
     async function healthcheck() {
       let lease;
       try {
@@ -1010,9 +746,6 @@ data:
       console.log(`OK: status=ok ingested_total=${ann[`${ANN}/ingested-total`] ?? '?'} age=${Math.round(ageSec)}s`);
     }
 
-    // ---------- diagnose ----------
-    // Tests SA-only auth first (no sub/DWD), then DWD impersonation.
-    // Differentiates: bad credentials vs DWD not enabled in GCP Console.
 
     async function diagnose() {
       const keyB64 = process.env.GOOGLE_PRIVATE_KEY_B64;
@@ -1035,8 +768,6 @@ data:
       console.log(`Impersonate:     ${WORK_EMAIL}`);
       console.log('');
 
-      // Test 1: SA-only token (no sub, no DWD) — use cloud-platform scope which a SA can
-      // self-request. Validates that the private key and client_email are correct.
       console.log('Test 1: SA-only token (no DWD impersonation, scope=cloud-platform)...');
       try {
         const now = Math.floor(Date.now() / 1000);
@@ -1060,7 +791,6 @@ data:
         else      console.log(`  FAIL ${r.status}: ${JSON.stringify(body)}`);
       } catch(e) { console.log(`  ERROR: ${e.message}`); }
 
-      // Test 2: DWD token (with sub = work email, gmail.modify scope)
       console.log('Test 2: DWD token (sub=work email, scope=gmail.modify)...');
       try {
         const token = await getToken(privKey, kid, WORK_EMAIL);
@@ -1068,7 +798,6 @@ data:
       } catch(e) { console.log(`  FAIL: ${e.message}`); }
     }
 
-    // ---------- main ----------
 
     const cmd = process.argv[2];
     if      (cmd === 'collect')     await collect();
@@ -1079,15 +808,6 @@ data:
     else if (cmd === 'diagnose')    await diagnose();
     else { console.error('Usage: email-collector.mjs collect|backfill <from> <to>|digest|enrich|healthcheck|diagnose'); process.exit(1); }
 ---
-# CronJob runs the deterministic collector every minute (schedule below).
-# concurrencyPolicy: Forbid ensures no overlapping runs (safe for the cursor ConfigMap
-# patch and the atomic digest/day-file writes within the pod's own emptyDir).
-# The pod uses the same SA credentials already in hermes-secrets (GOOGLE_PRIVATE_KEY_B64 +
-# GOOGLE_PRIVATE_KEY_ID), so no new Secrets are required.
-#
-# If hermes-secrets does not yet have GOOGLE_PRIVATE_KEY_B64 populated (i.e. the Google
-# service account hasn't been configured), the Job will fail with a clear error message
-# and back off. It will not crashloop the Hermes pod.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -1098,8 +818,6 @@ metadata:
     env: main
     capability: ai
 spec:
-  # Every minute for near-realtime ingestion; concurrencyPolicy: Forbid keeps
-  # runs from overlapping if one exceeds a minute.
   schedule: "* * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
@@ -1126,38 +844,26 @@ spec:
               env:
                 - name: DATA_DIR
                   value: /data
-                # Lease holderIdentity — who is currently writing the heartbeat.
                 - name: POD_NAME
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.name
-                # Impersonated work-account identity, from the google-dwd-key Secret
-                # (declared above in this file). optional: true → pod still schedules
-                # when unset; script exits 1 with a clear FATAL message.
                 - name: WORK_EMAIL
                   valueFrom:
                     secretKeyRef:
                       name: google-dwd-key
                       key: impersonate_email
                       optional: true
-                # gbrain MCP endpoint + bearer for the enrich step. The token is an inline
-                # literal (matches the gbrain + hermes Deployments); the only security
-                # boundary is the in-cluster network, and the sent bearer and the
-                # DB-hashed value both derive from this same literal.
                 - name: GBRAIN_MCP_URL
                   value: http://gbrain:3131/mcp
                 - name: GBRAIN_REMOTE_TOKEN
                   value: "gbrain-mcp"
-                # Service-account identity, from the google-dwd-key Secret.
                 - name: GOOGLE_CLIENT_EMAIL
                   valueFrom:
                     secretKeyRef:
                       name: google-dwd-key
                       key: client_email
                       optional: true
-                # Private key from hermes-secrets (same keys the seed-google-token init uses).
-                # optional: true → pod still schedules when keys are absent; script exits 1 with
-                # a clear FATAL message so the Job history shows why it failed.
                 - name: GOOGLE_PRIVATE_KEY_ID
                   valueFrom:
                     secretKeyRef:
@@ -1177,25 +883,12 @@ spec:
                   mountPath: /scripts
                   readOnly: true
           volumes:
-            # Pod-scoped scratch space only (per-day message JSON, digests). Nothing here
-            # needs to survive past this pod — durable cross-pod state is the Lease +
-            # ConfigMap declared above.
             - name: email-data
               emptyDir: {}
             - name: collector-script
               configMap:
                 name: email-collector-script
 ---
-# K8s-native ingestion healthcheck. A minimal always-on pod that runs the collector
-# script's `healthcheck` mode as a readinessProbe, reading the email-collector-heartbeat
-# Lease via its own email-ingestion-health ServiceAccount/Role (get-only, scoped to that
-# one Lease by resourceNames). The probe passes only when the Lease's renewTime is fresh
-# (within leaseDurationSeconds — 900s = 15min = ~15 missed cycles at the 1-run/min
-# cadence) AND the last enrich run's status annotation is "ok". Result: `kubectl get
-# pods` shows this pod 1/1 Ready when Gmail→gbrain ingestion is healthy and 0/1 NotReady
-# when it stalls — the same probe-based signal every other Deployment in the cluster
-# uses. No liveness probe: restarting this pod can't fix a stalled pipeline, so
-# ingestion failure must not churn it; readiness carries the signal.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -1207,9 +900,6 @@ metadata:
     capability: ai
 spec:
   replicas: 1
-  # RollingUpdate (the default): safe now that there's no RWO PVC forcing single-node
-  # co-mounting across rollouts. Was `Recreate` only because of the old
-  # email-collector-data PVC, now removed.
   strategy:
     type: RollingUpdate
   selector:

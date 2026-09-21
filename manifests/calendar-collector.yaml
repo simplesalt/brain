@@ -1,53 +1,3 @@
-# Calendar-to-brain: deterministic Google Calendar collector for ssint-main-ai.
-# Sibling of email-collector.yaml — same design (deterministic code for data, gbrain for
-# self-wiring) and the SAME service-account DWD credential (hermes-secrets:
-# GOOGLE_PRIVATE_KEY_B64 + GOOGLE_PRIVATE_KEY_ID, impersonating WORK_EMAIL). The Gmail
-# collector's token request already includes calendar.events + calendar.calendars scopes
-# and succeeds, so those scopes are proven DWD-authorized — no new Google Admin step.
-#
-# Pipeline (CronJob, every 15m — see spec.schedule): `sync` pulls a rolling window of
-# events (default 90 days back, 180 forward) for the primary calendar, writes structured
-# per-day JSON + daily markdown files to an emptyDir (no PVC — see "Storage" below), then
-# `enrich` pushes each event into gbrain via the MCP put_page tool (SSE Streamable-HTTP
-# transport). gbrain stores/searches the pages; entity self-wiring is server-side-local-only
-# (remote put_page reports auto_links: skipped), so this populates searchable pages but not
-# the graph — same tradeoff as email ingestion.
-#
-# Storage: no PVC. `sync` re-fetches the ENTIRE rolling window every run (one API call
-# range, not incremental) and `enrich` runs in the SAME pod right after, so it always sees
-# a complete, freshly-written EVENTS/ tree — nothing depends on a day-file written by an
-# earlier invocation. state.json is pure write-only telemetry (last-run window/counts) —
-# sync() computes its window from wall-clock time + CAL_DAYS_BACK/CAL_DAYS_FWD and never
-# reads state.json back, so it's fully disposable. Both → emptyDir, mounted in the CronJob
-# pod only.
-#
-# Two things DO need to cross pods/invocations, so neither lives on the emptyDir:
-#
-# - The ingestion heartbeat: both the CronJob (writer) and the calendar-ingestion-health
-#   Deployment (reader, a separate pod/node) need to see it. That's a coordination.k8s.io/v1
-#   Lease (calendar-collector-heartbeat, pre-created below) instead of a shared PVC-backed
-#   file — the shared file is what previously forced both pods onto the same node.
-#   holderIdentity/renewTime carry freshness; the ingestion payload
-#   (status/error/ingested-total/pushed-this-run) rides in annotations under the
-#   ingestion.simplesalt.company/ prefix, the same contract email-collector uses.
-#
-# - The put_page idempotency cache (ingested.json): dropping it to pod-scoped storage would
-#   mean every 15-minute run re-pushes the ENTIRE 270-day window to gbrain — idempotent, but
-#   past roughly 800 events in the window one run exceeds 15 minutes, and
-#   concurrencyPolicy: Forbid then silently skips every run after that forever. So it's a
-#   ConfigMap (calendar-collector-ingested, pre-created below) instead: loaded once at the
-#   start of enrich(), patched once at the end (never inside the push loop), and pruned to
-#   the current run's event ids on every write so it self-bounds against the rolling window
-#   instead of growing into the 1MiB ConfigMap limit.
-#
-# Pre-creating both objects in git means the writer's RBAC needs only get/update/patch,
-# never create. The health Deployment mounts no /data volume and has no RBAC on the
-# ingested-cache ConfigMap — it only reads the heartbeat Lease.
-#
-# NOT implemented (documented simplifications vs the upstream calendar-to-brain v0.7.0
-# recipe): multi-year historical backfill (bounded to the rolling window — widen via
-# CAL_DAYS_BACK), multiple calendar accounts (primary only), and manual-note merge in
-# daily files (files are generated-only and overwritten each run).
 apiVersion: coordination.k8s.io/v1
 kind: Lease
 metadata:
@@ -58,18 +8,8 @@ metadata:
     env: main
     capability: ai
 spec:
-  leaseDurationSeconds: 3600 # 1h (>4 missed 15-minute runs); matches HEARTBEAT_MAX_AGE_SEC
+  leaseDurationSeconds: 3600
 ---
-# Pre-created idempotency cache for `enrich`'s gbrain put_page calls — see the "Storage"
-# note in the file header for why this is a ConfigMap (cross-pod, self-pruned) rather than
-# a PVC or the CronJob pod's own emptyDir. enrich() PATCHes it, never creates.
-#
-# The `data` key is deliberately NOT declared here. The brain Kustomization reconciles
-# every 5m while the CronJob runs every 15m, so any value committed to git would be
-# re-applied over the live cache before it was ever read — resetting it to empty roughly
-# twice per collector run and defeating the point of persisting it at all. Leaving data
-# undeclared keeps Flux from owning the field; loadIngested() already treats an absent
-# key as an empty map. ssa: merge stops Flux pruning what the collector writes.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -82,8 +22,6 @@ metadata:
     env: main
     capability: ai
 ---
-# Dedicated identity for the CronJob pod — least privilege: may only get/update/patch the
-# one named heartbeat Lease below, never create or delete it, never touch anything else.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -94,8 +32,6 @@ metadata:
     env: main
     capability: ai
 ---
-# Dedicated identity for the health Deployment — read-only: may only get the heartbeat
-# Lease to evaluate its own readinessProbe.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -120,8 +56,6 @@ rules:
     resources: ["leases"]
     verbs: ["get", "update", "patch"]
     resourceNames: ["calendar-collector-heartbeat"]
-  # Same least-privilege shape for the ingested-cache ConfigMap: get/update/patch the one
-  # named object, never create — it's pre-created above.
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "update", "patch"]
@@ -190,19 +124,14 @@ metadata:
 data:
   calendar-collector.mjs: |
     #!/usr/bin/env bun
-    // Deterministic Google Calendar collector — gbrain calendar-to-brain (recipe v0.7.0),
-    // ingest variant v0.1.0. Code handles: auth, pagination, attendee filtering, daily
-    // files, state, atomic writes, AND deterministic ingestion into gbrain (put_page over
-    // MCP). gbrain does server-side self-wiring. Mirrors email-collector.mjs.
-    // Usage: bun calendar-collector.mjs sync | enrich | healthcheck | diagnose
 
     import { createSign, createHash } from 'crypto';
     import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, readdirSync } from 'fs';
     import { join } from 'path';
 
     const DATA_DIR     = process.env.DATA_DIR ?? '/data';
-    const EVENTS       = join(DATA_DIR, 'events');   // structured per-day JSON (for enrich)
-    const DAILY        = join(DATA_DIR, 'daily');     // human/agent-readable markdown
+    const EVENTS       = join(DATA_DIR, 'events');
+    const DAILY        = join(DATA_DIR, 'daily');
     const RAW          = join(DATA_DIR, '.raw');
     const STATE_FILE   = join(DATA_DIR, 'state.json');
     const WORK_EMAIL   = process.env.WORK_EMAIL ?? '';
@@ -211,30 +140,16 @@ data:
     const DAYS_BACK    = Number(process.env.CAL_DAYS_BACK ?? 90);
     const DAYS_FWD     = Number(process.env.CAL_DAYS_FWD ?? 180);
 
-    // Proven-authorized DWD scopes (identical calendar scopes the Gmail collector already
-    // exchanges successfully). events.list is satisfied by calendar.events.
     const CAL_SCOPES = [
       'https://www.googleapis.com/auth/calendar.events',
       'https://www.googleapis.com/auth/calendar.calendars',
     ];
 
-    // ---------- gbrain ingestion config ----------
-    // ingested.json now lives in a cross-pod ConfigMap (see the "ingested cache" section
-    // below), not a local file: losing a read/write costs redundant-but-idempotent
-    // put_page calls, never data (gbrain's put_page is server-side idempotent).
     const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain:3131/mcp';
     const GBRAIN_TOKEN   = process.env.GBRAIN_REMOTE_TOKEN ?? '';
     const SOURCE_VERSION = 'cal-0.1.0';
-    // Fallback only when the Lease itself has no leaseDurationSeconds yet; the
-    // authoritative freshness window is the Lease's own spec field (see healthcheck()).
-    const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 3600); // 1h (>4 missed 15-minute runs)
+    const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 3600);
 
-    // ---------- heartbeat: coordination.k8s.io/v1 Lease (cross-pod, no shared volume) ----------
-    // The Lease is pre-created in the manifest so this SA needs no `create` verb — only
-    // get/update/patch, scoped to this one resourceName. holderIdentity/renewTime are the
-    // freshness signal; the ingestion payload (status/error/ingested-total/pushed-this-run)
-    // rides in annotations under the ingestion.simplesalt.company/ prefix — same contract
-    // email-collector uses.
     const K8S_API         = 'https://kubernetes.default.svc';
     const SA_DIR           = '/var/run/secrets/kubernetes.io/serviceaccount';
     const LEASE_NAMESPACE  = process.env.LEASE_NAMESPACE ?? 'ssint-main-ai';
@@ -253,17 +168,10 @@ data:
       });
     }
 
-    // ---------- ingested cache: ConfigMap (cross-pod idempotency, no shared volume) ----------
-    // Pre-created in the manifest (same reasoning as the Lease: get/update/patch RBAC only,
-    // never create). Loaded once at the start of enrich(), patched once at the end — never
-    // per-push — and pruned to the current run's event ids on every write so the object
-    // self-bounds against the rolling window instead of growing forever.
     const INGESTED_CM_NAME = 'calendar-collector-ingested';
     const INGESTED_CM_KEY  = 'ingested.json';
     const INGESTED_CM_PATH = `/api/v1/namespaces/${LEASE_NAMESPACE}/configmaps/${INGESTED_CM_NAME}`;
 
-    // Read failure degrades to an empty map (redundant-but-idempotent re-pushes), never a
-    // fatal error.
     async function loadIngested() {
       try {
         const r = await k8sFetch(INGESTED_CM_PATH);
@@ -279,9 +187,6 @@ data:
       }
     }
 
-    // Prunes to `currentIds` (this run's event ids) before writing, so the cache can never
-    // grow past the rolling window. Throws on failure — caller is responsible for surfacing
-    // it (write failures must not be silent).
     async function saveIngested(ingested, currentIds) {
       const pruned = {};
       for (const id of currentIds) if (ingested[id]) pruned[id] = ingested[id];
@@ -294,7 +199,6 @@ data:
       return pruned;
     }
 
-    // ---------- Google service-account JWT (DWD) ----------
 
     function b64url(s) { return Buffer.from(s).toString('base64url'); }
 
@@ -338,7 +242,6 @@ data:
       return { privKey, kid: process.env.GOOGLE_PRIVATE_KEY_ID ?? '' };
     }
 
-    // ---------- State (atomic writes) ----------
 
     function loadState() {
       if (!existsSync(STATE_FILE)) return { lastSync: null };
@@ -351,7 +254,6 @@ data:
       renameSync(tmp, path);
     }
 
-    // ---------- Calendar API ----------
 
     async function calList(token, calId, timeMin, timeMax) {
       const events = [];
@@ -374,7 +276,6 @@ data:
       return events;
     }
 
-    // Real attendees only (drop conference rooms + mailing lists), names not emails.
     function attendeeNames(ev) {
       return (ev.attendees ?? [])
         .filter(a => !a.resource
@@ -411,7 +312,6 @@ data:
       };
     }
 
-    // ---------- sync ----------
 
     async function sync() {
       const { privKey, kid } = loadPrivKey();
@@ -438,10 +338,8 @@ data:
       mkdirSync(DAILY, { recursive: true });
       mkdirSync(RAW, { recursive: true });
 
-      // Raw snapshot for provenance.
       saveJson(join(RAW, 'events-latest.json'), raw);
 
-      // Group by day → structured per-day JSON (enrich source) + daily markdown.
       const byDay = new Map();
       for (const e of events) {
         if (!e.date) continue;
@@ -450,7 +348,6 @@ data:
       }
 
       for (const [date, evs] of byDay) {
-        // All-day first, then timed sorted by start time.
         evs.sort((a, b) => (a.all_day === b.all_day ? String(a.start).localeCompare(String(b.start)) : (a.all_day ? -1 : 1)));
         saveJson(join(EVENTS, `${date}.json`), evs);
 
@@ -475,11 +372,9 @@ data:
       console.log(`sync [${CALENDAR_ID}]: ${events.length} events across ${byDay.size} days (${timeMin.slice(0,10)}..${timeMax.slice(0,10)})`);
     }
 
-    // Time helpers operating on stored records (start/end are ISO or date strings).
     const eventTimeFromRec = e => (e.all_day ? 'all-day' : String(e.start).slice(11, 16));
     const endTimeFromRec   = e => (String(e.end).includes('T') ? String(e.end).slice(11, 16) : '');
 
-    // ---------- gbrain ingestion (shared with email-collector pattern) ----------
 
     async function writeHeartbeat(status, extra = {}) {
       const ann = {
@@ -488,10 +383,6 @@ data:
         'ingestion.simplesalt.company/ingested-total': String(extra.ingested_total ?? ''),
         'ingestion.simplesalt.company/pushed-this-run': String(extra.pushed_this_run ?? ''),
       };
-      // Lease.spec.renewTime is a metav1.MicroTime, decoded with Go's RFC3339Micro layout
-      // ("...05.000000Z07:00"), which requires EXACTLY six fractional digits.
-      // toISOString() emits three, and the apiserver rejects the whole patch with 422
-      // Invalid rather than rounding. Pad the milliseconds out to microseconds.
       const body = {
         metadata: { annotations: ann },
         spec: { holderIdentity: POD_NAME, renewTime: new Date().toISOString().replace('Z', '000Z') },
@@ -508,8 +399,6 @@ data:
       }
     }
 
-    // gbrain MCP Streamable-HTTP transport (stateless): dual Accept header required,
-    // reply is an SSE frame (event: message\ndata: {json}); plain-JSON fallback kept.
     function parseMcpResponse(text) {
       let msg = null;
       for (const block of text.split('\n\n')) {
@@ -585,10 +474,6 @@ data:
 
     const contentHash = s => createHash('sha256').update(s).digest('hex').slice(0, 16);
 
-    // gbrain lowercases the stored page slug but its tag-reconciliation step looks the
-    // page up with the ORIGINAL-case slug → "addTag failed: page not found" for any slug
-    // with uppercase. Calendar recurring-instance IDs carry an uppercase `_YYYYMMDDTHHMMSSZ`
-    // suffix (from singleEvents expansion), so pre-normalize to lowercase + safe charset.
     const eventSlug = id => `calendar/${String(id).toLowerCase().replace(/[^a-z0-9_.-]/g, '-')}`;
 
     async function enrich() {
@@ -607,7 +492,6 @@ data:
         const byId = new Map(all.filter(e => e && e.id).map(e => [e.id, e]));
         const ingested = await loadIngested();
 
-        // Push new OR changed events (hash of the rendered page detects edits/reschedules).
         const work = [];
         for (const e of byId.values()) {
           const md = eventToMarkdown(e);
@@ -623,14 +507,11 @@ data:
             pushed++;
           } catch (err) {
             errors.push(`${e.id}: ${err.message}`);
-            if (pushed === 0 && errors.length >= 3) break; // gbrain likely down — stop early
+            if (pushed === 0 && errors.length >= 3) break;
           }
-          await new Promise(r => setTimeout(r, 1100)); // < 55/min, under gbrain's 60/min token limit
+          await new Promise(r => setTimeout(r, 1100));
         }
 
-        // One write for the whole run (never per-push), pruned to this run's event ids so
-        // the ConfigMap self-bounds against the rolling window. A write failure must not be
-        // silent: log it and force status=error via `errors` below.
         let total = Object.keys(ingested).length;
         try {
           const pruned = await saveIngested(ingested, byId.keys());
@@ -652,10 +533,8 @@ data:
         await writeHeartbeat('error', { error: e.message, pushed_this_run: 0 });
         console.error(`enrich: unexpected failure recorded in heartbeat: ${e.message}`);
       }
-      // Always exit 0: ingestion health lives in the heartbeat/probe, not the Job status.
     }
 
-    // ---------- healthcheck: k8s readiness probe target ----------
     async function healthcheck() {
       let lease;
       try {
@@ -689,7 +568,6 @@ data:
       console.log(`OK: status=ok ingested_total=${ann['ingestion.simplesalt.company/ingested-total'] ?? '?'} age=${Math.round(ageSec)}s`);
     }
 
-    // ---------- diagnose ----------
 
     async function diagnose() {
       const { privKey, kid } = loadPrivKey();
@@ -712,7 +590,6 @@ data:
       } catch (e) { console.log(`FAIL: ${e.message}`); }
     }
 
-    // ---------- main ----------
 
     const cmd = process.argv[2];
     if      (cmd === 'sync')        await sync();
@@ -721,8 +598,6 @@ data:
     else if (cmd === 'diagnose')    await diagnose();
     else { console.error('Usage: calendar-collector.mjs sync|enrich|healthcheck|diagnose'); process.exit(1); }
 ---
-# CronJob: sync + enrich every 15 minutes (spec.schedule below). Forbid overlap (safe for
-# state + atomic writes).
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -733,9 +608,6 @@ metadata:
     env: main
     capability: ai
 spec:
-  # Every 15 min: calendar changes slowly, so this avoids hammering the Google
-  # Calendar API for little gain. (Email + other channels stay every-minute for
-  # near-realtime digestion.) concurrencyPolicy: Forbid prevents overlap.
   schedule: "*/15 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
@@ -748,8 +620,6 @@ spec:
             app: calendar-collector
         spec:
           restartPolicy: OnFailure
-          # Dedicated SA (calendar-collector RBAC block above): get/update/patch on the one
-          # named heartbeat Lease only, never `create` (the Lease is pre-created in git).
           serviceAccountName: calendar-collector
           containers:
             - name: collector
@@ -763,15 +633,10 @@ spec:
               env:
                 - name: DATA_DIR
                   value: /data
-                # Lease spec.holderIdentity — which pod last wrote the heartbeat.
                 - name: POD_NAME
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.name
-                # Impersonated work-account identity + service-account identity, from the
-                # google-dwd-key Secret (declared in email-collector.yaml, same namespace).
-                # optional: true → pod still schedules when unset; script exits 1 with a
-                # clear FATAL message.
                 - name: WORK_EMAIL
                   valueFrom:
                     secretKeyRef:
@@ -790,13 +655,10 @@ spec:
                       name: google-dwd-key
                       key: client_email
                       optional: true
-                # gbrain MCP endpoint + inline bearer (matches gbrain + hermes Deployments).
                 - name: GBRAIN_MCP_URL
                   value: http://gbrain:3131/mcp
                 - name: GBRAIN_REMOTE_TOKEN
                   value: "gbrain-mcp"
-                # Same service-account key the Gmail collector uses (optional so the pod
-                # still schedules if absent; script exits with a clear FATAL otherwise).
                 - name: GOOGLE_PRIVATE_KEY_ID
                   valueFrom:
                     secretKeyRef:
@@ -816,21 +678,12 @@ spec:
                   mountPath: /scripts
                   readOnly: true
           volumes:
-            # Pod-scoped scratch (state.json/events/daily/raw) — see the "Storage" note in
-            # the file header for why none of this needs to survive a pod restart.
-            # ingested.json is NOT here — it's the calendar-collector-ingested ConfigMap.
             - name: calendar-data
               emptyDir: {}
             - name: collector-script
               configMap:
                 name: calendar-collector-script
 ---
-# K8s-native ingestion healthcheck (see email-collector.yaml for the rationale). Readiness
-# passes only when the heartbeat is fresh (< HEARTBEAT_MAX_AGE_SEC — 1h ≈ 4 missed
-# 15-minute cycles) AND the last enrich reported status=ok. Reads the heartbeat via the
-# calendar-collector-heartbeat Lease (get-only RBAC, no access to the ingested-cache
-# ConfigMap — it has no business reading that) instead of a shared volume — this Deployment
-# mounts no /data at all. No liveness probe (restart can't fix a stalled pipeline).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -850,8 +703,6 @@ spec:
       labels:
         app: calendar-ingestion-health
     spec:
-      # Dedicated SA (calendar-ingestion-health RBAC block above): get-only on the one
-      # named heartbeat Lease, nothing else.
       serviceAccountName: calendar-ingestion-health
       containers:
         - name: health

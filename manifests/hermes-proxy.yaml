@@ -1,11 +1,4 @@
 ---
-# Tiny SSE-filtering proxy that sits between big-AGI and the Hermes API server.
-# Hermes emits non-standard tool-status streaming events alongside the normal
-# OpenAI SSE stream; big-AGI fails to parse them. This proxy drops any SSE
-# data line whose JSON payload lacks a "choices" key (i.e. not an OpenAI
-# chat.completion.chunk) before forwarding the stream to the caller.
-#
-# Pure Python stdlib — no custom image build needed.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -95,11 +88,11 @@ data:
                     try:
                         d = json.loads(payload)
                         if 'choices' not in d:
-                            return True  # drop Hermes tool-status events
+                            return True
                     except json.JSONDecodeError:
                         pass
             elif s.strip() == '' and prev_dropped:
-                return False  # suppress the blank-line separator after a dropped event
+                return False
             self.wfile.write(line)
             self.wfile.flush()
             return False
