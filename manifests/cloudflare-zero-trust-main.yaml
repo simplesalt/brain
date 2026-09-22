@@ -105,7 +105,9 @@ spec:
 apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
 kind: TrustAccessApplication
 metadata:
-  name: cloudflare-app-appflowy-main
+  name: cloudflare-app-info-simplesalt-company
+  annotations:
+    crossplane.io/external-name: "1b7031b2-52ba-4c31-8913-53ccea37a6de"
   labels:
     entity: ssint
     env: main
