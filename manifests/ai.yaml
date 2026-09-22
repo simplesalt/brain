@@ -816,21 +816,3 @@ spec:
     - name: webhook
       port: 8644
       targetPort: 8644
----
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: ai-tls
-  namespace: ssint-main-ai
-  labels:
-    entity: ssint
-    env: main
-    capability: ai
-spec:
-  secretName: ai-tls
-  issuerRef:
-    name: famevans
-    kind: ClusterIssuer
-  commonName: ai.famevans.win
-  dnsNames:
-    - ai.famevans.win
