@@ -148,6 +148,8 @@ spec:
                 || echo "WARN: config set mcp.publish_advisor failed (non-fatal)"
               $GBRAIN config set search.reranker.model voyage:rerank-2.5 \
                 || echo "WARN: config set search.reranker.model failed (non-fatal)"
+              $GBRAIN config set facts.extraction_model openrouter:minimax/minimax-m2.7 \
+                || echo "WARN: config set facts.extraction_model failed (non-fatal)"
               bun -e '
                 import { SQL } from "bun";
                 const t = process.env.GBRAIN_REMOTE_TOKEN;
