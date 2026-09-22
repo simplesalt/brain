@@ -128,13 +128,6 @@ spec:
           args:
             - |
               export PATH="/install/bin:$PATH"
-              # Resolve the gbrain command. `bun install -g github:...` links a
-              # shim at /install/bin/gbrain, but for github installs that shim can
-              # be a dangling symlink (presents as "gbrain: not found" on PATH;
-              # see garrytan/gbrain#218). Probe the shim, else run the installed
-              # package's cli.ts directly via bun (resolves deps from the global
-              # node_modules). Dump the layout and stall if neither works so the
-              # cause is visible in logs instead of a fast crashloop.
               if [ -x /install/bin/gbrain ] && /install/bin/gbrain --version >/dev/null 2>&1; then
                 GBRAIN="/install/bin/gbrain"
               else
@@ -148,33 +141,13 @@ spec:
                 GBRAIN="bun $CLI"
               fi
               echo "Using gbrain command: $GBRAIN"
-              # gbrain serve does not auto-initialize the schema; init must run
-              # first. Container home (/root) resets on restart so we always
-              # attempt init. Embeddings are now enabled (OPENAI_API_KEY +
-              # GBRAIN_EMBEDDING_MODEL below), so --no-embedding is dropped;
-              # --migrate-only is the safe fallback if config already exists
-              # from a prior run in the same pod lifecycle (emptyDir survives
-              # container restarts).
               $GBRAIN init --non-interactive \
                 || $GBRAIN init --migrate-only \
                 || echo "WARN: gbrain init failed; serve may not work correctly"
               $GBRAIN config set mcp.publish_advisor true \
                 || echo "WARN: config set mcp.publish_advisor failed (non-fatal)"
-              # ZeroEntropy's hosted API (the zerank-2 reranker default) shuts
-              # down 2026-09-04. Reranker config lives on the DB plane (unlike
-              # embedding config, which lives on file/env), so pinning it here
-              # is the correct, idempotent, git-tracked equivalent of the live
-              # `gbrain config set` gbrain itself suggests in its own
-              # deprecation banner.
               $GBRAIN config set search.reranker.model voyage:rerank-2.5 \
                 || echo "WARN: config set search.reranker.model failed (non-fatal)"
-              # Seed our own bearer. gbrain only accepts /mcp tokens that exist
-              # in its DB (verifyAccessToken; static-env fallback was removed),
-              # so we write sha256(GBRAIN_REMOTE_TOKEN) into access_tokens. Plain
-              # SHA-256, no salt (utils.ts:hashToken); a matching row is
-              # grandfathered as full read/write/admin, ~never expires. Idempotent
-              # (ON CONFLICT), so it re-asserts on every boot and self-heals if a
-              # re-init ever drops the row. Bun.SQL is built into the bun image.
               bun -e '
                 import { SQL } from "bun";
                 const t = process.env.GBRAIN_REMOTE_TOKEN;
@@ -185,8 +158,6 @@ spec:
                 await db.end();
                 console.log("gbrain: hermes-mcp bearer asserted");
               ' || echo "WARN: token seed failed; hermes /mcp calls will 401"
-              # --bind 0.0.0.0: gbrain serve defaults to loopback; must bind all
-              # interfaces to be reachable by other pods in the cluster.
               exec $GBRAIN serve --http --bind 0.0.0.0
           env:
             - name: DATABASE_URL
@@ -253,7 +224,6 @@ spec:
           args:
             - |
               export PATH="/install/bin:$PATH"
-              # Wait for the shared install (initContainer + serve's first boot).
               for i in $(seq 1 60); do
                 if [ -x /install/bin/gbrain ] && /install/bin/gbrain --version >/dev/null 2>&1; then
                   GBRAIN="/install/bin/gbrain"; break
@@ -264,18 +234,12 @@ spec:
               done
               if [ -z "$GBRAIN" ]; then echo "FATAL: gbrain CLI not found for autopilot"; sleep 120; exit 1; fi
               echo "autopilot using: $GBRAIN"
-              # autopilot's worker-fork uses `which gbrain` to spawn the child
-              # process, so gbrain must be on PATH as an executable. The
-              # /install/bin/gbrain shim can be dangling (garrytan/gbrain#218);
-              # write a wrapper that resolves to the bun + cli.ts invocation.
               CLI="$(find /install -maxdepth 8 -path '*/gbrain/src/cli.ts' 2>/dev/null | head -1)"
               if [ -n "$CLI" ]; then
                 printf '#!/bin/sh\nexec bun %s "$@"\n' "$CLI" > /usr/local/bin/gbrain
                 chmod +x /usr/local/bin/gbrain
                 GBRAIN=/usr/local/bin/gbrain
               fi
-              # --repo /tmp: Postgres engine auto-skips fs phases; /tmp satisfies
-              # the repo-arg check without doing any filesystem work.
               exec $GBRAIN autopilot --repo /tmp --interval 60
           env:
             - name: DATABASE_URL
@@ -382,11 +346,6 @@ spec:
           args:
             - |
               export PATH="/install/bin:$PATH"
-              # Resolve the gbrain command exactly like the gbrain
-              # Deployment's entrypoint does (see the gbrain container
-              # above): the install shim at /install/bin/gbrain can be a
-              # dangling symlink for github installs (garrytan/gbrain#218),
-              # so probe it and fall back to invoking cli.ts directly via bun.
               if [ -x /install/bin/gbrain ] && /install/bin/gbrain --version >/dev/null 2>&1; then
                 GBRAIN="/install/bin/gbrain"
               else
@@ -401,11 +360,6 @@ spec:
               fi
               echo "Using gbrain command: $GBRAIN"
 
-              # Idempotency guard: read the CURRENT dimension of
-              # content_chunks.embedding before touching anything. Same
-              # Bun.SQL-against-DATABASE_URL idiom as the gbrain Deployment's
-              # token-seed step above (bun -e + Bun.SQL) — a read-only,
-              # parameterized query, not hand-built SQL.
               CURRENT_DIM=$(bun -e '
                 import { SQL } from "bun";
                 const db = new SQL(process.env.DATABASE_URL);
@@ -419,11 +373,6 @@ spec:
                 echo "gbrain: already vector(1536) -- migration already applied (safe Job retry); skipping destructive SQL and re-init, going straight to embed --stale."
               else
                 echo "gbrain: migrating content_chunks.embedding from ${CURRENT_DIM:-<unset>} to vector(1536) (openai:text-embedding-3-small); this NULLs every existing embedding, backfilled by embed --stale below."
-                # The recipe gbrain's entrypoint prints on a dimension
-                # mismatch, run as one transaction via Bun.SQL's db.begin().
-                # NULL embeddings BEFORE the ALTER: pgvector refuses to cast
-                # existing vectors across dimensions and aborts the
-                # transaction; NULLs cast fine.
                 bun -e '
                   import { SQL } from "bun";
                   const db = new SQL(process.env.DATABASE_URL);
@@ -437,8 +386,6 @@ spec:
                   console.log("gbrain: schema migrated to vector(1536); embeddings nulled for re-embed.");
                 ' || { echo "FATAL: destructive dimension migration failed"; exit 1; }
 
-                # Re-init now that the column matches, so gbrain's own config
-                # (file plane is canonical post-v0.37) agrees with the schema.
                 $GBRAIN init --non-interactive --supabase --embedding-model openai:text-embedding-3-small --embedding-dimensions 1536 \
                   || { echo "FATAL: gbrain init (post-migration reconfigure) failed"; exit 1; }
               fi
@@ -503,26 +450,14 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              # Best-effort installs onto the data volume. This init MUST exit 0
-              # even when a download fails (blocked egress, missing pip, etc.):
-              # a non-zero exit crashloops the container and the whole pod never
-              # rolls. NOTE: a shell script's exit status is that of its LAST
-              # command, so without the trailing `exit 0` a failed gws/gh install
-              # becomes the container's exit code and wedges the rollout
-              # (CrashLoopBackOff on install-cli-tools). Failures are logged as
-              # WARN; check these logs to confirm whether each tool landed.
               export HOME=/opt/data
               mkdir -p /opt/data/.local/bin
 
-              # Claude Code CLI (installed unauthenticated -- no OAuth token injected)
               if [ ! -x /opt/data/.local/bin/claude ]; then
                 curl -fsSL https://claude.ai/install.sh | bash \
                   || echo "WARN: claude install failed"
               fi
 
-              # GitHub CLI (auth via ~/.config/gh/hosts.yml seeded below;
-              # GITHUB_TOKEN is permanently blocked from subprocess env by
-              # Hermes's Copilot provider blocklist)
               if [ ! -x /opt/data/.local/bin/gh ]; then
                 GH_VER=2.63.2
                 case "$(uname -m)" in
@@ -536,27 +471,6 @@ spec:
                   || echo "WARN: gh install failed"
               fi
 
-              # gbrain skills (garrytan/gbrain). The bundled skills/ directory is
-              # just markdown files in the public repo — no bun or gbrain CLI
-              # needed. Download the repo tarball, extract skills/, and write a
-              # version marker. Re-syncs when the upstream VERSION changes so
-              # removed/renamed skills don't linger.
-              #
-              # The whole sync stages beside the live directory on the same
-              # filesystem and lands with a rename, so a failed download, a
-              # truncated tarball or an empty extract leaves whatever is already
-              # there instead of deleting it first and hoping the copy succeeds.
-              # The home volume is an emptyDir and this init runs once per pod, so
-              # there is normally nothing to lose here; the point of the guard is
-              # that a partial sync can never land, and can never write a version
-              # marker claiming a generation it did not extract. The tarball is
-              # written to a file rather than piped into tar, because a pipeline
-              # reports only tar's exit status and would hide a curl failure.
-              #
-              # The staging steps chain on `&&` rather than `set -e`: POSIX
-              # disables -e for a command that forms an `if` condition, and a
-              # subshell there inherits that, so `set -e` would silently do
-              # nothing and every step would run after the first failure.
               GBRAIN_VER=$(curl -fsSL https://raw.githubusercontent.com/garrytan/gbrain/master/VERSION 2>/dev/null || echo "")
               STORED_VER=$(cat /opt/data/skills/.gbrain-version 2>/dev/null || echo "")
               if [ -n "$GBRAIN_VER" ] && [ "$GBRAIN_VER" != "$STORED_VER" ]; then
@@ -583,22 +497,17 @@ spec:
                 fi
               fi
 
-              # Claude Code Hindsight plugin (best-effort; may fail without auth)
               if [ -x /opt/data/.local/bin/claude ]; then
                 /opt/data/.local/bin/claude plugin marketplace add vectorize-io/hindsight 2>/dev/null \
                   || echo "WARN: hindsight plugin marketplace add failed"
                 /opt/data/.local/bin/claude plugin install hindsight-memory 2>/dev/null \
                   || echo "WARN: hindsight plugin install failed"
-                # Plugin install runs as root and clones git repos; chown the
-                # entire .claude tree so the hermes user (UID 10000) can write
-                # runtime state (plugins/data/, .in_use, etc.).
                 chown -R 10000:10000 /opt/data/.claude 2>/dev/null \
                   || echo "WARN: chown .claude failed"
               else
                 echo "WARN: claude not installed, skipping hindsight plugin install"
               fi
 
-              # Optional tool installs must never fail the pod.
               exit 0
           volumeMounts:
             - name: home
@@ -609,11 +518,6 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              # NOTE: the python below is indented to live inside this YAML
-              # block scalar. YAML strips the common leading indentation, so
-              # python receives the code at column 0. Do NOT de-indent these
-              # lines to column 0 — that breaks out of the scalar and produces
-              # MalformedYAMLError at kustomize build time.
               python3 -c '
               import os, sys, yaml
 
@@ -630,11 +534,9 @@ spec:
                           merged[key] = val
                   return merged
 
-              # Load seed (required)
               with open(seed_path) as f:
                   seed = yaml.safe_load(f) or {}
 
-              # Load live config if it exists
               if os.path.exists(live_path):
                   with open(live_path) as f:
                       live = yaml.safe_load(f) or {}
@@ -662,12 +564,6 @@ spec:
               chmod 700 /opt/data/.config/gh
               chmod 600 /opt/data/.config/gh/hosts.yml
 
-              # Hindsight config for Claude Code — points at the in-cluster
-              # hindsight service (same one Hermes uses). The plugin reads this
-              # on start to know where to recall/retain. Values come from env
-              # (HINDSIGHT_API_URL/_API_KEY/_BANK_ID below), NOT hardcoded here,
-              # so the Deployment is the single source of truth — same pattern
-              # as every other environment-specific value in this manifest.
               mkdir -p /opt/data/.hindsight
               printf '{"hindsightApiUrl":"%s","hindsightApiToken":"%s","bankId":"%s"}\n' \
                 "$HINDSIGHT_API_URL" "$HINDSIGHT_API_KEY" "$HINDSIGHT_BANK_ID" \
@@ -676,21 +572,6 @@ spec:
               chmod 700 /opt/data/.hindsight
               chmod 600 /opt/data/.hindsight/claude-code.json
 
-              # Hindsight config for the Hermes memory PROVIDER (distinct from the
-              # Claude Code plugin file above). The provider loads config from
-              # $HERMES_HOME/hindsight/config.json (plugins/memory/hindsight reads
-              # hermes_constants.get_hermes_home()); HERMES_HOME=/opt/data here, so the
-              # path is /opt/data/hindsight/config.json — the PREFERRED path, checked
-              # before the legacy ~/.hindsight/config.json fallback. NOTE: this is NOT
-              # ~/.hermes/hindsight/config.json; that README path assumes the *default*
-              # home, but this deploy overrides HERMES_HOME to /opt/data, so a file
-              # under .hermes/ would be ignored.
-              # recall_prefetch_method: "recall" (not "reflect") — the provider auto-injects
-              # hindsight context each turn via a background thread + 3s join window. "reflect"
-              # requires an internal LLM call on the hindsight server (~30s) which always
-              # misses the 3s window, silently returning empty. "recall" is pure vector
-              # search (<1s) and reliably delivers context on turn 2 onwards. "contextCadence"
-              # is a Honcho key; the hindsight plugin ignores it (no effect).
               mkdir -p /opt/data/hindsight
               printf '{"mode":"local_external","apiKey":"%s","api_url":"%s","banks":{"%s":{"bankId":"%s","budget":"mid","enabled":true}},"recall_budget":"low","recall_prefetch_method":"recall","recall_max_tokens":250,"recall_max_input_chars":300,"recall_types":"observation"}\n' \
                 "$HINDSIGHT_API_KEY" "$HINDSIGHT_API_URL" "$HINDSIGHT_BANK_ID" "$HINDSIGHT_BANK_ID" \
@@ -699,11 +580,6 @@ spec:
               chmod 700 /opt/data/hindsight
               chmod 600 /opt/data/hindsight/config.json
 
-              # Claude Code MCP config — exposes Hermes' tools (incl. hindsight_*)
-              # as MCP tools so spawned Claude instances can call them directly.
-              # The chown -R on .claude is deliberate: Claude's plugin runtime
-              # creates runtime state under .claude/plugins/data/ and needs write
-              # access as the hermes user.
               mkdir -p /opt/data/.claude
               printf '%s\n' '{"mcpServers":{"hermes":{"command":"hermes","args":["mcp","serve"]}}}' \
                 > /opt/data/.claude/claude.json
@@ -716,38 +592,14 @@ spec:
               chmod 644 /opt/data/.claude/settings.json
               chmod 644 /opt/data/.claude/CLAUDE.md
 
-              # Seed the hand-authored `build` skill (Autonomous Claude Code
-              # loop) onto the home volume. /opt/data/skills is replaced wholesale
-              # by the gbrain skill sync in install-cli-tools above, which silently
-              # deleted this skill on 2026-06-27 back when it existed only on the
-              # volume and not in git. Sourcing it from the hermes-config ConfigMap
-              # (/seed) makes git the source of truth, same as config.yaml above.
-              # The home volume is an emptyDir (see `volumes:` below), so this runs
-              # on every pod start; a curator run can still remove the skill
-              # mid-lifetime and the next rollout restores it.
               mkdir -p /opt/data/skills/build
               cp /seed/build-skill.md /opt/data/skills/build/SKILL.md
               chown -R 10000:10000 /opt/data/skills/build
               chmod 775 /opt/data/skills/build
               chmod 664 /opt/data/skills/build/SKILL.md
 
-              # Seed Hermes' own identity + project context onto the home volume,
-              # same git-source-of-truth pattern as the files above.
-              #   SOUL.md   -> $HERMES_HOME/SOUL.md (/opt/data); load_soul_md()
-              #     reads get_hermes_home()/SOUL.md and always injects it as the
-              #     agent identity.
-              #   AGENTS.md -> the project-context file. _load_agents_md() checks
-              #     <cwd>/AGENTS.md (cwd only, no git-root walk); the gateway cwd
-              #     is pinned to /opt/data via the HERMES_ORIG_CWD env var below so
-              #     this is found.
               cp /seed/SOUL.md /opt/data/SOUL.md
 
-              # AGENTS.md's "# Team" section carries a <!-- TEAM_ROSTER -->
-              # marker (no real names in git — see team-roster Secret above).
-              # Render it from roster.json if the Secret is mounted/populated;
-              # otherwise substitute a placeholder line. Never crash the init
-              # container over this — a missing/bad roster must still let the
-              # pod reach Ready, so failures fall back to a raw seed copy.
               python3 -c '
               import json, sys
 
@@ -791,27 +643,6 @@ spec:
               chown 10000:10000 /opt/data/SOUL.md /opt/data/AGENTS.md
               chmod 644 /opt/data/SOUL.md /opt/data/AGENTS.md
 
-              # Seed the OpenRouter credential into the .env that every hermes
-              # entrypoint loads (load_hermes_dotenv -> $HERMES_HOME/.env). The
-              # raw OPENROUTER_API_KEY container env var is NOT sufficient on its
-              # own under the hardened image: config.py reload_env() deletes known
-              # provider vars from os.environ when they are absent from this .env,
-              # and OPENROUTER_API_KEY is on _HERMES_PROVIDER_ENV_BLOCKLIST (scrubbed
-              # from execute_code / terminal child shells; see GHSA-rhgp-j443-p4rf).
-              # Without this the gateway/agent resolves no model client
-              # ("openrouter requested but OPENROUTER_API_KEY not set") and the TUI
-              # reports "needs a model provider". Writing it here is the supported
-              # channel (the one `hermes setup` uses); mirrors the gh / Google
-              # credential seeding above.
-              #
-              # The file lives on a tmpfs (the "secret-env" emptyDir, medium:
-              # Memory, mounted at /run/secret-env) — NOT on the home volume.
-              # The provider key is sourced from hermes-secrets and materialized
-              # in RAM only: it is rewritten on every pod start and never
-              # persisted to disk. $HERMES_HOME/.env is a symlink into that tmpfs
-              # so Hermes still finds the real file its loader requires. `ln -sf`
-              # also replaces any regular .env a previous revision left on the
-              # home volume, removing that stale file on the next rollout.
               mkdir -p /run/secret-env
               printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY" > /run/secret-env/.env
               chown 10000:10000 /run/secret-env/.env
