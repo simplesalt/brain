@@ -116,7 +116,7 @@ spec:
   deletionPolicy: Orphan
   forProvider:
     accountId: ba92fe12c6c1275f965c7c86e3b392ac
-    name: appflowy-main
+    name: info-simplesalt-company
     type: self_hosted
     destinations:
       - type: public
