@@ -150,6 +150,8 @@ spec:
                 || echo "WARN: config set search.reranker.model failed (non-fatal)"
               $GBRAIN config set facts.extraction_model openrouter:minimax/minimax-m2.7 \
                 || echo "WARN: config set facts.extraction_model failed (non-fatal)"
+              $GBRAIN config set cycle.conversation_facts_backfill.enabled true \
+                || echo "WARN: config set cycle.conversation_facts_backfill.enabled failed (non-fatal)"
               bun -e '
                 import { SQL } from "bun";
                 const t = process.env.GBRAIN_REMOTE_TOKEN;
