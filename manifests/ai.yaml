@@ -298,7 +298,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-migrate-embedding-dims
+  name: gbrain-migrate-embedding-dims-2
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -313,7 +313,7 @@ spec:
   template:
     metadata:
       labels:
-        app: gbrain-migrate-embedding-dims
+        app: gbrain-migrate-embedding-dims-2
         entity: ssint
         env: main
         capability: ai
@@ -372,7 +372,7 @@ spec:
               echo "gbrain: content_chunks.embedding is currently ${CURRENT_DIM:-<not found>}"
 
               if [ "$CURRENT_DIM" = "vector(1536)" ]; then
-                echo "gbrain: already vector(1536) -- migration already applied (safe Job retry); skipping destructive SQL and re-init, going straight to embed --stale."
+                echo "gbrain: already vector(1536) -- migration already applied (safe Job retry); skipping destructive SQL, still reconfirming gbrain config below."
               else
                 echo "gbrain: migrating content_chunks.embedding from ${CURRENT_DIM:-<unset>} to vector(1536) (openai:text-embedding-3-small); this NULLs every existing embedding, backfilled by embed --stale below."
                 bun -e '
@@ -387,10 +387,10 @@ spec:
                   await db.end();
                   console.log("gbrain: schema migrated to vector(1536); embeddings nulled for re-embed.");
                 ' || { echo "FATAL: destructive dimension migration failed"; exit 1; }
-
-                $GBRAIN init --non-interactive --supabase --embedding-model openai:text-embedding-3-small --embedding-dimensions 1536 \
-                  || { echo "FATAL: gbrain init (post-migration reconfigure) failed"; exit 1; }
               fi
+
+              $GBRAIN init --non-interactive --supabase --embedding-model openai:text-embedding-3-small --embedding-dimensions 1536 \
+                || { echo "FATAL: gbrain init (post-migration reconfigure) failed"; exit 1; }
 
               echo 'gbrain: starting embed --stale backfill (long-running: hours, $1-100 in OpenAI API calls).'
               exec $GBRAIN embed --stale
