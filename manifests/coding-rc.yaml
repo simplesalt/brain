@@ -27,7 +27,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.4.76"
+      version: "0.4.78"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -77,7 +77,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.4.76"
+      version: "0.4.78"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -177,7 +177,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.4.76"
+      version: "0.4.78"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -204,13 +204,6 @@ spec:
           memory: 512Mi
     hindsight:
       bankId: ssint-build-projects
-    extraEnv:
-      - name: HINDSIGHT_AUTO_RETAIN
-        value: "false"
-      - name: BUILDER_SB_POLICY
-        value: wwwhw
-      - name: BSB_MISSION
-        value: keep the SimpleSalt Delivery board an accurate, current record of every Effort and coordinate cross-repo delivery through it.
     skelOverride:
       enabled: true
       create: false
@@ -230,7 +223,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.4.76"
+      version: "0.4.78"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
