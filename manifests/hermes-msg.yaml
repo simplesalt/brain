@@ -603,7 +603,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "1"
+        simplesalt.company/restart-epoch: "2"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
