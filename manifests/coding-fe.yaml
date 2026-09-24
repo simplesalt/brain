@@ -90,3 +90,111 @@ data:
         }
       }
     }
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: fe-build-apps
+  namespace: flux-system
+  labels:
+    entity: fe
+    env: main
+    capability: coding
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: builder
+      version: "0.4.78"
+      sourceRef:
+        kind: HelmRepository
+        name: simplesalt-charts
+        namespace: flux-system
+  targetNamespace: fe-main-coding
+  install:
+    createNamespace: false
+    timeout: 10m
+    remediation:
+      retries: 3
+  upgrade:
+    timeout: 10m
+    remediation:
+      retries: 3
+  values:
+    commonLabels:
+      entity: fe
+      env: main
+      capability: coding
+    repo:
+      slug: apps
+      url: https://github.com/dylannevans/apps.git
+      ref: main
+    oauthSecret:
+      create: true
+    resources:
+      builder:
+        requests:
+          memory: 512Mi
+    hindsight:
+      bankId: fe-build-apps
+    extraEnv:
+      - name: HINDSIGHT_AUTO_RETAIN
+        value: "false"
+    skelOverride:
+      enabled: true
+      create: false
+      existingConfigMap: claude-rc-skel-override
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: fe-build-cloud-basis
+  namespace: flux-system
+  labels:
+    entity: fe
+    env: main
+    capability: coding
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: builder
+      version: "0.4.78"
+      sourceRef:
+        kind: HelmRepository
+        name: simplesalt-charts
+        namespace: flux-system
+  targetNamespace: fe-main-coding
+  install:
+    createNamespace: false
+    timeout: 10m
+    remediation:
+      retries: 3
+  upgrade:
+    timeout: 10m
+    remediation:
+      retries: 3
+  values:
+    commonLabels:
+      entity: fe
+      env: main
+      capability: coding
+    repo:
+      slug: cloud-basis
+      url: https://github.com/dylannevans/cloud-basis.git
+      ref: main
+    oauthSecret:
+      create: true
+    resources:
+      builder:
+        requests:
+          memory: 512Mi
+    hindsight:
+      bankId: fe-build-cloud-basis
+    extraEnv:
+      - name: HINDSIGHT_AUTO_RETAIN
+        value: "false"
+    skelOverride:
+      enabled: true
+      create: false
+      existingConfigMap: claude-rc-skel-override
