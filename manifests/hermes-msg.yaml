@@ -109,6 +109,7 @@ data:
     #!/usr/bin/env bun
 
     import { createSign, createHmac } from 'crypto';
+    import { lookup } from 'dns/promises';
 
     const PORT = Number(process.env.PORT ?? 8080);
     const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL ?? '';
@@ -382,6 +383,67 @@ data:
     };
 
 
+    async function resolveHosts(...urls) {
+      for (const u of urls) {
+        const host = new URL(u).hostname;
+        try { await lookup(host); }
+        catch (e) { throw new Error(`DNS ${host}: ${e.code ?? e.message}`); }
+      }
+    }
+
+    const channelHealth = {
+      async email() {
+        await resolveHosts('https://oauth2.googleapis.com', 'https://gmail.googleapis.com');
+        const token = await getGmailToken();
+        const r = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!r.ok) throw new Error(`gmail profile ${r.status}: ${await r.text()}`);
+        return { account: (await r.json()).emailAddress };
+      },
+
+      async linkedin() {
+        if (!DUXSOUP_USER_ID || !DUXSOUP_API_KEY) {
+          throw new Error('DUXSOUP_USER_ID / DUXSOUP_API_KEY not configured');
+        }
+        const url = `${DUXSOUP_BASE_URL}/xapi/remote/control/${DUXSOUP_USER_ID}/queue/size`;
+        await resolveHosts(url);
+        const signature = createHmac('sha1', DUXSOUP_API_KEY).update(url).digest('base64');
+        const r = await fetch(url, {
+          headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': signature },
+        });
+        const text = await r.text();
+        if (!r.ok) throw new Error(`Dux Soup queue/size ${r.status}: ${text}`);
+        return { queue: text };
+      },
+
+      async sms() {
+        if (!QUO_API_KEY || !QUO_FROM_NUMBER) {
+          throw new Error('QUO_API_KEY / QUO_FROM_NUMBER not configured');
+        }
+        const url = 'https://api.quo.com/v1/phone-numbers';
+        await resolveHosts(url);
+        const r = await fetch(url, { headers: { Authorization: QUO_API_KEY } });
+        if (!r.ok) throw new Error(`Quo phone-numbers ${r.status}: ${await r.text()}`);
+        const numbers = ((await r.json()).data ?? []).map(n => n.number);
+        if (!numbers.includes(QUO_FROM_NUMBER)) {
+          throw new Error(`QUO_FROM_NUMBER ${QUO_FROM_NUMBER} not in workspace numbers: ${numbers.join(', ')}`);
+        }
+        return { from_number: QUO_FROM_NUMBER };
+      },
+    };
+
+    async function handleChannelHealth(channel) {
+      const check = channelHealth[channel];
+      if (!check) return Response.json({ ok: false, error: `Unknown channel: ${channel}` }, { status: 404 });
+      try {
+        return Response.json({ ok: true, channel, ...(await check()) });
+      } catch (e) {
+        return Response.json({ ok: false, channel, error: e.message }, { status: 503 });
+      }
+    }
+
+
     async function sendMessage(args) {
       const { verb, channel, to, message, ...rest } = args;
       if (!verb)    throw new Error('verb required (new|reply)');
@@ -509,6 +571,7 @@ data:
       async fetch(req) {
         const { pathname } = new URL(req.url);
         if (pathname === '/healthz') return Response.json({ ok: true });
+        if (pathname.startsWith('/healthz/')) return handleChannelHealth(pathname.slice('/healthz/'.length));
         if (pathname === '/mcp'               && req.method === 'POST') return handleMcp(req);
         if (pathname === '/api/v1/messages'   && req.method === 'POST') return handleMessages(req);
         return new Response('Not Found', { status: 404 });
@@ -539,6 +602,8 @@ spec:
         entity: ssint
         env: main
         capability: msg
+      annotations:
+        simplesalt.company/restart-epoch: "1"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
@@ -680,3 +745,82 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-msg-health
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hermes-msg-health
+  template:
+    metadata:
+      labels:
+        app: hermes-msg-health
+        entity: ssint
+        env: main
+        capability: msg
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: email
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "-", "-T", "20", "http://hermes-msg:8080/healthz/email"]
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 25
+            successThreshold: 1
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+        - name: linkedin
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "-", "-T", "20", "http://hermes-msg:8080/healthz/linkedin"]
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 25
+            successThreshold: 1
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+        - name: sms
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "-", "-T", "20", "http://hermes-msg:8080/healthz/sms"]
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 25
+            successThreshold: 1
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
