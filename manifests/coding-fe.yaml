@@ -144,6 +144,8 @@ spec:
       enabled: true
       create: false
       existingConfigMap: claude-rc-skel-override
+    podAnnotations:
+      simplesalt.company/restart-epoch: "1"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -198,3 +200,5 @@ spec:
       enabled: true
       create: false
       existingConfigMap: claude-rc-skel-override
+    podAnnotations:
+      simplesalt.company/restart-epoch: "1"
