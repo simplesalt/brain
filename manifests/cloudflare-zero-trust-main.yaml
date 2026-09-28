@@ -150,6 +150,9 @@ spec:
       ingress:
         - hostname: info.simplesalt.company
           service: http://big-agi.ssint-main-ai.svc.k.famevans.win:3000
+        - hostname: hooks.simplesalt.company
+          path: ^/duxsoup/events$
+          service: http://duxsoup-ingest.ssint-main-msg.svc.k.famevans.win:8080
         - service: http_status:404
   providerConfigRef:
     name: ssint-main
