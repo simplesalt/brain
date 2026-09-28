@@ -23,6 +23,11 @@ const EXA_CONTENTS = {
         },
         skills: { type: "string", description: "Special skills or expertise the employer wants." },
         success: { type: "string", description: "What success looks like for this role." },
+        employer_sector: {
+          type: "string",
+          enum: ["security", "technology", "other", "unknown"],
+          description: "security if the employer is a cybersecurity company, technology if it is a software, internet or IT company, other for any other industry (banks, retailers, manufacturers, healthcare, government), unknown if you cannot tell.",
+        },
         remote_eligibility: {
           type: "string",
           enum: ["remote", "hybrid", "onsite", "unknown"],
@@ -37,7 +42,7 @@ const EXA_CONTENTS = {
           description: "Date the job was posted, as YYYY-MM-DD, resolving relative dates like '3 weeks ago' against today. Empty if not stated.",
         },
       },
-      required: ["employer", "skills", "success", "remote_eligibility", "applicants", "posted_date"],
+      required: ["employer", "employer_sector", "skills", "success", "remote_eligibility", "applicants", "posted_date"],
     },
   },
 };
@@ -163,7 +168,23 @@ const CONSULTING_FIRMS = [
   { name: "Avanade", domains: ["avanade.com"], patterns: [String.raw`\mavanade\M`] },
 ];
 
-const TITLE_VERSION = 1;
+// Employers Dylan ruled out (security and tech companies, plus named firms). Seeded once, editable in the table.
+const USER_EXCLUDED = [
+  { name: "beBee", domains: ["bebee.com"], patterns: [String.raw`\mbebee\M`], category: "job board" },
+  { name: "RunReveal", domains: ["runreveal.com"], patterns: [String.raw`\mrunreveal\M`], category: "tech/security" },
+  { name: "GitHub", domains: ["github.com", "github.careers"], patterns: [String.raw`^github(,? inc\.?)?$`, String.raw`github\.careers`], category: "tech/security" },
+  { name: "GitLab", domains: ["gitlab.com"], patterns: [String.raw`\mgitlab\M`], category: "tech/security" },
+  { name: "Wiz", domains: ["wiz.io"], patterns: [String.raw`^wiz(,? inc\.?)?$`, String.raw`[./]wiz\.io`], category: "tech/security" },
+  { name: "Checkmarx", domains: ["checkmarx.com"], patterns: [String.raw`\mcheckmarx\M`], category: "tech/security" },
+  { name: "Standard Chartered", domains: ["sc.com"], patterns: [String.raw`standard\s*chartered`], category: "user excluded" },
+  { name: "Vouched", domains: ["vouched.id"], patterns: [String.raw`^vouched`], category: "tech/security" },
+  { name: "Trail of Bits", domains: ["trailofbits.com"], patterns: [String.raw`trail\s*of\s*bits`], category: "tech/security" },
+  { name: "ServiceNow", domains: ["servicenow.com"], patterns: [String.raw`\mservicenow\M`], category: "tech/security" },
+  { name: "Meta", domains: ["meta.com", "metacareers.com"], patterns: [String.raw`^meta( platforms)?(,? inc\.?)?$`, String.raw`metacareers\.com`], category: "tech/security" },
+  { name: "Nike India", domains: [], patterns: [String.raw`nike\s*india`], category: "user excluded" },
+];
+
+const TITLE_VERSION = 2;
 
 const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS searches (
@@ -229,13 +250,17 @@ const DDL_STATEMENTS = [
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS found_via bigint REFERENCES candidates (id)`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS applicants int`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS posted_at timestamptz`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS employer_sector text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS is_job_posting boolean`,
   `CREATE TABLE IF NOT EXISTS excluded_employers (
     name text PRIMARY KEY,
     domains text[] NOT NULL DEFAULT '{}'::text[],
     patterns text[] NOT NULL DEFAULT '{}'::text[],
     note text,
+    category text,
     created_at timestamptz NOT NULL DEFAULT now()
   )`,
+  `ALTER TABLE excluded_employers ADD COLUMN IF NOT EXISTS category text`,
   `CREATE TABLE IF NOT EXISTS sightings (
     id bigserial PRIMARY KEY,
     candidate_id bigint NOT NULL REFERENCES candidates (id),
@@ -312,12 +337,16 @@ const DDL_STATEMENTS = [
              AND coalesce((SELECT max(o.applicants) FROM candidates o WHERE o.role_id = c.role_id), 0) <= 30
              AND (SELECT coalesce(min(o.posted_at), min(o.published_at), min(o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id)
                  >= now() - interval '1 month'
-           ) AS considered
+             AND coalesce(c.is_job_posting, true)
+             AND NOT EXISTS (SELECT 1 FROM candidates o WHERE o.role_id = c.role_id AND o.employer_sector IN ('security', 'technology'))
+           ) AS considered,
+           (SELECT max(o.employer_sector) FILTER (WHERE o.employer_sector IS NOT NULL) FROM candidates o WHERE o.role_id = c.role_id) AS employer_sector,
+           coalesce(c.is_job_posting, true) AS is_job_posting
     FROM candidates c
     WHERE c.is_role_primary`,
   `COMMENT ON COLUMN candidates.applicants IS 'Number of applicants the page reports (e.g. LinkedIn "Over 100 applicants"), when shown.'`,
   `COMMENT ON COLUMN candidates.posted_at IS 'Date the job was posted, as stated on the page.'`,
-  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, has 30 or fewer applicants (when stated), was posted within the last month, and is not at an excluded employer.'`,
+  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, has 30 or fewer applicants (when stated), was posted within the last month, is a real job posting, is not at a security or technology company, and is not at an excluded employer.'`,
   `COMMENT ON COLUMN candidates.enriched_at IS 'When the enrichment stage last fetched this page directly to fill in employer and details and look for the primary source.'`,
   `COMMENT ON COLUMN candidates.primary_source_url IS 'Link from this page to the employer''s own or ATS posting, when one was found.'`,
   `COMMENT ON COLUMN candidates.found_via IS 'For postings discovered by following a link, the candidate whose page linked to it.'`,
@@ -332,18 +361,24 @@ async function migrate() {
 }
 
 async function seed() {
-  for (const f of CONSULTING_FIRMS) {
+  const firms = [
+    ...CONSULTING_FIRMS.map((f) => ({ ...f, category: "consulting" })),
+    ...USER_EXCLUDED,
+  ];
+  for (const f of firms) {
     await sql`
-      INSERT INTO excluded_employers (name, domains, patterns, note)
+      INSERT INTO excluded_employers (name, domains, patterns, note, category)
       VALUES (
         ${f.name},
         ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(f.domains)}::text::jsonb)),
         ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(f.patterns)}::text::jsonb)),
-        'consulting firm (seed)'
+        'seed',
+        ${f.category}
       )
       ON CONFLICT (name) DO NOTHING
     `;
   }
+  await sql`UPDATE excluded_employers SET category = 'consulting' WHERE category IS NULL`;
   for (const s of SEEDS) {
     await sql`
       INSERT INTO searches (
@@ -380,7 +415,9 @@ const ROLE_WORDS =
 function normalizeTitle(raw) {
   if (!raw) return null;
   let t = String(raw).replace(/\s+/g, " ").trim();
-  t = t.replace(/^(job application for|apply(?: now)? (?:for|to)|careers?\s*[-:|]|jobs?\s*[-:|]|now hiring:?|hiring:?|we'?re hiring:?|opening:?)\s*/i, "");
+  t = t.replace(/^(job application for|applying to|apply(?: now)? (?:for|to)|careers?\s*[-:|]|jobs?\s*[-:|]|now hiring:?|hiring:?|we'?re hiring:?|opening:?)\s*/i, "");
+  t = t.replace(/\s+job details\b/i, "");
+  t = t.replace(/,?\s*[$£€]\s?\d[\d,.]*k?(\s*[-–]\s*[$£€]?\s?\d[\d,.]*k?)?(\s*(per|\/)\s*(year|yr|hour|hr))?/gi, "");
   t = t.replace(/\s*[([][^)\]]*(remote|hybrid|on-?site|united states|usa)[^)\]]*[)\]]/gi, "");
   const parts = t.split(/\s+[|–—·•]\s+|\s+-\s+|\s*::\s*/).map((x) => x.trim()).filter(Boolean);
   let pick = parts.find((x) => ROLE_WORDS.test(x)) ?? parts[0] ?? t;
@@ -392,6 +429,7 @@ function normalizeTitle(raw) {
     );
   }
   pick = pick.replace(/[,\s]+(remote|hybrid|on-?site)\b.*$/i, "");
+  pick = pick.replace(/\s+in\s+(the\s+)?([Uu]nited [Ss]tates|USA|US|UK|Canada|India|[A-Z][a-z]+(,\s*[A-Z]{2})?)$/, "");
   pick = pick.replace(/\s*(#|req(?:uisition)?\s*(?:id)?\s*[:#]?|jr|r)\s*-?\d{3,}\s*$/i, "");
   pick = pick.replace(/\s*[-–,:|]+\s*$/, "").trim();
   return pick || String(raw).trim();
@@ -411,7 +449,8 @@ async function applyTitlesAndExclusions() {
   `;
   for (const row of rows) {
     await sql`
-      UPDATE candidates SET job_title = ${normalizeTitle(row.title)}, job_title_version = ${TITLE_VERSION}
+      UPDATE candidates SET job_title = ${normalizeTitle(row.title)}, job_title_version = ${TITLE_VERSION},
+        is_job_posting = ${ROLE_WORDS.test(normalizeTitle(row.title) ?? "")}
       WHERE id = ${row.id}
     `;
   }
@@ -513,6 +552,8 @@ async function clusterRoles() {
     const emp = normEmployer(r.employer);
     if (emp && r.jt) link(`e:${emp}|${r.jt}`, r.id);
     for (const jid of jobIds(r.canonical_url)) link(`j:${jid}`, r.id);
+    // Shorter requisition IDs are only unique within one employer.
+    if (emp) for (const jid of String(r.canonical_url).match(/(?<![\d])\d{4,6}(?![\d])/g) ?? []) link(`jr:${emp}|${jid}`, r.id);
     const slug = urlSlug(r.canonical_url);
     // Generic title slugs recur across employers, so a slug only links postings with the same (or no) employer.
     if (slug.length >= 25) link(`s:${emp || "?"}|${slug}`, r.id);
@@ -616,6 +657,7 @@ async function enrichCandidates() {
       AND (
         (enrich_attempts < 2 AND (employer IS NULL OR skills IS NULL OR success IS NULL
                                   OR coalesce(remote_eligibility, 'unknown') = 'unknown'))
+        OR (enrich_attempts < 3 AND employer_sector IS NULL)
         OR (enrich_attempts < 1 AND is_role_primary AND primary_source_url IS NULL)
       )
     ORDER BY is_role_primary DESC NULLS LAST, id
@@ -779,6 +821,7 @@ function contentsFrom(o) {
   const summary = parseSummary(o.summary);
   return {
     employer: cleanEmployer(summary.employer),
+    employerSector: ["security", "technology", "other"].includes(String(summary.employer_sector)) ? String(summary.employer_sector) : null,
     skills: summary.skills || null,
     success: summary.success || null,
     remoteEligibility: normalizeRemote(summary.remote_eligibility),
@@ -810,6 +853,7 @@ async function saveContents(candidateId, c) {
   await sql`
     UPDATE candidates SET
       employer = COALESCE(${c.employer}, employer),
+      employer_sector = COALESCE(${c.employerSector ?? null}, employer_sector),
       skills = COALESCE(${c.skills}, skills),
       success = COALESCE(${c.success}, success),
       remote_eligibility = CASE WHEN ${c.remoteEligibility} = 'unknown' AND remote_eligibility IS NOT NULL
