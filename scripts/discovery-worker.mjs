@@ -907,8 +907,26 @@ function relativeAge(v) {
   return new Date(Date.now() - days * 86400000);
 }
 
+// SerpApi puts Google's chips ("9 days ago", "Work from home", "Full-time") in extensions[];
+// detected_extensions is only sometimes present.
+function googleExtensions(job) {
+  return [...(job.extensions ?? []), job.detected_extensions?.posted_at].filter((x) => typeof x === "string");
+}
+
+function googleWorkFromHome(job) {
+  return Boolean(job.detected_extensions?.work_from_home) || googleExtensions(job).some((x) => /work from home|remote/i.test(x));
+}
+
+function googlePostedAt(job) {
+  for (const x of googleExtensions(job)) {
+    const d = relativeAge(x);
+    if (d && /ago|today|just/i.test(x)) return d;
+  }
+  return null;
+}
+
 function remoteFromGoogle(job) {
-  if (job.detected_extensions?.work_from_home) return "remote";
+  if (googleWorkFromHome(job)) return "remote";
   const text = `${job.location ?? ""} ${job.description ?? ""}`;
   if (/\bhybrid\b/i.test(text)) return "hybrid";
   if (/\b(fully remote|100% remote|remote[- ]first|work from home|remote,? (us|usa|united states))\b/i.test(text)) return "remote";
@@ -959,7 +977,7 @@ async function googleJobsSearch(q, key) {
         highlights: null,
         pageText: typeof description === "string" ? description.slice(0, PAGE_TEXT_MAX_CHARS) : null,
         applicants: null,
-        postedAt: relativeAge(job.detected_extensions?.posted_at),
+        postedAt: googlePostedAt(job),
       },
     };
   });
@@ -1242,11 +1260,31 @@ async function logDuplicateReport() {
   }
 }
 
+// Re-derive Google Jobs remote flag and posting age from stored raw results (fixes earlier rows).
+async function backfillGoogleJobsFields() {
+  const rows = await sql`
+    SELECT DISTINCT ON (candidate_id) candidate_id, raw FROM sightings
+    WHERE source = 'google_jobs' ORDER BY candidate_id, seen_at DESC
+  `;
+  for (const r of rows) {
+    const job = typeof r.raw === "string" ? JSON.parse(r.raw) : r.raw;
+    const posted = googlePostedAt(job);
+    await sql`
+      UPDATE candidates SET
+        remote_eligibility = CASE WHEN ${googleWorkFromHome(job)} THEN 'remote' ELSE remote_eligibility END,
+        posted_at = COALESCE(${posted}, posted_at)
+      WHERE id = ${Number(r.candidate_id)}
+    `;
+  }
+  return rows.length;
+}
+
 async function main() {
   await migrate();
   await seed();
   console.log(JSON.stringify({ at: new Date().toISOString(), event: "startup", seed_version: SEED_VERSION }));
   await applyTitlesAndExclusions();
+  console.log(JSON.stringify({ at: new Date().toISOString(), event: "google_jobs_fields_backfilled", candidates: await backfillGoogleJobsFields() }));
   await logDuplicateReport();
   while (!shuttingDown) {
     await tick();
