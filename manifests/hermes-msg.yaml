@@ -119,6 +119,7 @@ data:
     const DUXSOUP_USER_ID = process.env.DUXSOUP_USER_ID ?? '';
     const DUXSOUP_API_KEY = process.env.DUXSOUP_API_KEY ?? '';
     const DUXSOUP_BASE_URL = process.env.DUXSOUP_BASE_URL ?? 'https://app.dux-soup.com';
+    const DUXSOUP_INGEST_URL = process.env.DUXSOUP_INGEST_URL ?? 'http://duxsoup-ingest.ssint-main-msg:8080';
 
     const QUO_API_KEY = process.env.QUO_API_KEY ?? '';
     const QUO_FROM_NUMBER = process.env.QUO_FROM_NUMBER ?? '';
@@ -328,6 +329,162 @@ data:
     };
 
 
+    function duxSign(payload) {
+      return createHmac('sha1', DUXSOUP_API_KEY).update(payload).digest('base64');
+    }
+
+    function requireDuxCreds() {
+      if (!DUXSOUP_USER_ID || !DUXSOUP_API_KEY) {
+        throw new Error('DUXSOUP_USER_ID / DUXSOUP_API_KEY not configured');
+      }
+    }
+
+    // POST to the Dux Soup remote-control API. Signs the JSON body (HMAC-SHA1, base64).
+    // https://support.dux-soup.com/article/115-remote-control-by-example
+    async function duxPost(pathSuffix, extra) {
+      requireDuxCreds();
+      const targeturl = `${DUXSOUP_BASE_URL}/xapi/remote/control/${DUXSOUP_USER_ID}${pathSuffix}`;
+      const body = JSON.stringify({
+        targeturl,
+        timestamp: Date.now(),
+        userid: DUXSOUP_USER_ID,
+        ...extra,
+      });
+      const signature = duxSign(body);
+      const r = await fetch(targeturl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': signature },
+        body,
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`Dux Soup ${pathSuffix} ${r.status}: ${text}`);
+      try { return JSON.parse(text); } catch { return {}; }
+    }
+
+    // GET from the Dux Soup remote-control API. Signs the full request URL (HMAC-SHA1, base64).
+    // https://support.dux-soup.com/article/230-queue-management-api
+    async function duxGet(pathSuffix, query = {}) {
+      requireDuxCreds();
+      const url = new URL(`${DUXSOUP_BASE_URL}/xapi/remote/control/${DUXSOUP_USER_ID}${pathSuffix}`);
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+      }
+      const fullUrl = url.toString();
+      const signature = duxSign(fullUrl);
+      const r = await fetch(fullUrl, {
+        headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': signature },
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`Dux Soup ${pathSuffix} ${r.status}: ${text}`);
+      try { return JSON.parse(text); } catch { return text; }
+    }
+
+
+    // Per-command required/optional params, from
+    // https://support.dux-soup.com/article/115-remote-control-by-example
+    // Deliberately excludes disconnect, endorse, savetopdf.
+    const LINKEDIN_ACTION_COMMANDS = {
+      visit:      { required: [],                                optional: ['campaignid', 'force', 'runafter'] },
+      connect:    { required: [],                                optional: ['campaignid', 'messagetext', 'force', 'runafter'] },
+      message:    { required: ['messagetext'],                   optional: ['campaignid', 'force', 'runafter'] },
+      inmail:     { required: ['messagesubject', 'messagetext'], optional: ['campaignid', 'force', 'runafter'] },
+      tag:        { required: ['tags'],                          optional: ['campaignid', 'force', 'runafter'] },
+      untag:      { required: ['tags'],                          optional: ['campaignid', 'force', 'runafter'] },
+      follow:     { required: [],                                optional: ['campaignid', 'force', 'runafter'] },
+      likepost:   { required: [],                                optional: ['campaignid', 'force', 'runafter'] },
+      saveaslead: { required: [],                                optional: ['campaignid', 'force', 'runafter'] },
+      enroll:     { required: ['campaignid'],                    optional: ['force', 'runafter'] },
+    };
+
+    async function linkedinAction(args) {
+      const { command, profile, ...rest } = args ?? {};
+      if (!command) throw new Error('command required');
+      const spec = LINKEDIN_ACTION_COMMANDS[command];
+      if (!spec) throw new Error(`Unsupported linkedin_action command: ${command}`);
+      if (!profile) throw new Error('profile (LinkedIn profile URL) required');
+      for (const key of spec.required) {
+        const v = rest[key];
+        const missing = key === 'tags' ? (!Array.isArray(v) || !v.length) : (v === undefined || v === null || v === '');
+        if (missing) throw new Error(`${key} required for command=${command}`);
+      }
+      const params = { profile };
+      for (const key of [...spec.required, ...spec.optional]) {
+        if (rest[key] !== undefined) params[key] = rest[key];
+      }
+      const data = await duxPost('/queue', { command, params });
+      return { message_id: data.id ?? data.messageid ?? 'queued', command, status: 'queued' };
+    }
+
+
+    let _lookupCampaignId = null;
+
+    // The Campaign API documents no visit-only action object, so the Visit campaign
+    // is created by hand in Dux Soup and found here by id or name.
+    async function ensureLookupCampaign() {
+      if (_lookupCampaignId) return _lookupCampaignId;
+      const data = await duxGet('/campaigns');
+      const campaigns = Array.isArray(data) ? data : (data.data ?? data.campaigns ?? []);
+      const found = campaigns
+        .map(c => c.campaign ?? c)
+        .find(c => c.id === 'gbrain-lookup' || /^gbrain lookup/i.test(c.name ?? ''));
+      if (!found) {
+        throw new Error("Lookup campaign not found: create a Visit campaign named 'gbrain lookup' in Dux Soup");
+      }
+      _lookupCampaignId = found.id;
+      return _lookupCampaignId;
+    }
+
+    async function linkedinSearch({ name, company, keywords, max_results = 5 }) {
+      if (!name) throw new Error('name required');
+      const max = Math.min(Math.max(Number(max_results) || 5, 1), 25);
+      const q = [name, company, keywords].filter(Boolean).join(' ');
+      const search_url = `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(q)}`;
+      const campaign_id = await ensureLookupCampaign();
+      const requested_at = new Date().toISOString();
+      // batchEnroll signal: https://support.dux-soup.com/article/229-extension-control-api
+      await duxPost('/signal', {
+        signal: 'batchEnroll',
+        params: { searchurl: search_url, campaignid: campaign_id, maxenrolls: max, target: 'cloud' },
+      });
+      return {
+        search_url,
+        requested_at,
+        campaign_id,
+        note: 'profiles arrive as Dux Soup visits them within its active hours; call linkedin_search_results with since=requested_at',
+      };
+    }
+
+    async function linkedinSearchResults({ since, q }) {
+      if (!since) throw new Error('since (ISO timestamp) required');
+      const url = new URL('/profiles/recent', DUXSOUP_INGEST_URL);
+      url.searchParams.set('since', since);
+      if (q) url.searchParams.set('q', q);
+      url.searchParams.set('limit', '50');
+      const r = await fetch(url.toString());
+      const text = await r.text();
+      if (!r.ok) throw new Error(`duxsoup-ingest ${r.status}: ${text}`);
+      try { return JSON.parse(text); } catch { return { profiles: [] }; }
+    }
+
+    // Queue Management API: https://support.dux-soup.com/article/230-queue-management-api
+    async function linkedinQueue({ campaignid, profileid, command } = {}) {
+      const query = { campaignid, profileid, command };
+      const [size, items] = await Promise.all([
+        duxGet('/queue/size', query),
+        duxGet('/queue/items', query).catch(e => ({ error: e.message })),
+      ]);
+      return { size, items };
+    }
+
+    // Prospect API: https://support.dux-soup.com/article/241-prospect-api
+    async function linkedinProspect({ profile_id, what }) {
+      if (!profile_id) throw new Error('profile_id required');
+      if (what === 'conversation') return duxGet(`/conversations/${encodeURIComponent(profile_id)}`);
+      if (what === 'tags')         return duxGet(`/prospects/${encodeURIComponent(profile_id)}/tags`);
+      throw new Error(`what must be 'conversation' or 'tags', got: ${what}`);
+    }
+
+
     const smsAdapter = {
       async send(_verb, { to, message, media_url }) {
         if (!QUO_API_KEY || !QUO_FROM_NUMBER) {
@@ -506,6 +663,76 @@ data:
           },
         },
       },
+      {
+        name: 'linkedin_action',
+        description: 'Queue a Dux Soup LinkedIn automation command (visit, connect, message, inmail, tag, untag, follow, likepost, saveaslead, or enroll into a campaign). Commands are queued and picked up by the Dux Soup browser extension. https://support.dux-soup.com/article/115-remote-control-by-example',
+        inputSchema: {
+          type: 'object',
+          required: ['command', 'profile'],
+          properties: {
+            command: { type: 'string',
+                       enum: ['visit', 'connect', 'message', 'inmail', 'tag', 'untag', 'follow', 'likepost', 'saveaslead', 'enroll'],
+                       description: 'Dux Soup remote-control command to queue' },
+            profile:        { type: 'string', description: 'LinkedIn profile URL to act on' },
+            messagetext:    { type: 'string', description: 'Message body (required for message and inmail; optional connection note for connect)' },
+            messagesubject: { type: 'string', description: 'InMail subject line (required for inmail)' },
+            tags:           { type: 'array', items: { type: 'string' }, description: 'Tag names (required for tag/untag)' },
+            campaignid:     { type: 'string', description: 'Campaign to attribute the action to (required for enroll)' },
+            force:          { type: 'boolean', description: 'Bypass Dux Soup throttling/dedupe safeguards' },
+            runafter:       { type: 'string', description: 'ISO8601 timestamp; do not execute before this time' },
+          },
+        },
+      },
+      {
+        name: 'linkedin_search',
+        description: 'Kick off a LinkedIn people search for Dux Soup to visit via its batchEnroll signal. Returns immediately with a request marker; matching profiles arrive asynchronously as Dux Soup visits them (see linkedin_search_results). https://support.dux-soup.com/article/229-extension-control-api',
+        inputSchema: {
+          type: 'object',
+          required: ['name'],
+          properties: {
+            name:        { type: 'string', description: 'Person name to search for' },
+            company:     { type: 'string', description: 'Company name to narrow the search' },
+            keywords:    { type: 'string', description: 'Additional search keywords' },
+            max_results: { type: 'integer', default: 5, minimum: 1, maximum: 25, description: 'Max profiles for Dux Soup to enroll from the search (default 5, max 25)' },
+          },
+        },
+      },
+      {
+        name: 'linkedin_search_results',
+        description: 'Fetch profiles Dux Soup has visited from a prior linkedin_search, recorded by the duxsoup-ingest service.',
+        inputSchema: {
+          type: 'object',
+          required: ['since'],
+          properties: {
+            since: { type: 'string', description: 'ISO8601 timestamp; only profiles visited at/after this time (use requested_at from linkedin_search)' },
+            q:     { type: 'string', description: 'Optional free-text filter' },
+          },
+        },
+      },
+      {
+        name: 'linkedin_queue',
+        description: 'Get the current Dux Soup remote-control queue size and (if available) queued items. https://support.dux-soup.com/article/230-queue-management-api',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            campaignid: { type: 'string', description: 'Filter by campaign ID' },
+            profileid:  { type: 'string', description: 'Filter by profile ID' },
+            command:    { type: 'string', description: 'Filter by command type' },
+          },
+        },
+      },
+      {
+        name: 'linkedin_prospect',
+        description: "Look up a Dux Soup prospect's recorded conversation history or applied tags. https://support.dux-soup.com/article/241-prospect-api",
+        inputSchema: {
+          type: 'object',
+          required: ['profile_id', 'what'],
+          properties: {
+            profile_id: { type: 'string', description: 'Dux Soup prospect profile ID' },
+            what:       { type: 'string', enum: ['conversation', 'tags'], description: 'conversation = full event history; tags = applied tags' },
+          },
+        },
+      },
     ];
 
 
@@ -536,8 +763,13 @@ data:
         if (method === 'tools/call') {
           const { name, arguments: args = {} } = params ?? {};
           let result;
-          if      (name === 'send_message') result = await sendMessage(args);
-          else if (name === 'get_thread')   result = await getThread(args);
+          if      (name === 'send_message')           result = await sendMessage(args);
+          else if (name === 'get_thread')              result = await getThread(args);
+          else if (name === 'linkedin_action')         result = await linkedinAction(args);
+          else if (name === 'linkedin_search')         result = await linkedinSearch(args);
+          else if (name === 'linkedin_search_results') result = await linkedinSearchResults(args);
+          else if (name === 'linkedin_queue')          result = await linkedinQueue(args);
+          else if (name === 'linkedin_prospect')       result = await linkedinProspect(args);
           else return mcpErr(id, -32601, `Unknown tool: ${name}`);
           return Response.json({
             jsonrpc: '2.0', id,
@@ -603,7 +835,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "2"
+        simplesalt.company/restart-epoch: "3"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
@@ -662,6 +894,8 @@ spec:
                   optional: true
             - name: DUXSOUP_BASE_URL
               value: https://app.dux-soup.com
+            - name: DUXSOUP_INGEST_URL
+              value: http://duxsoup-ingest.ssint-main-msg:8080
             - name: DUXSOUP_USER_ID
               valueFrom:
                 secretKeyRef:
