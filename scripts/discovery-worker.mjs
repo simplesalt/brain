@@ -14,7 +14,7 @@ if (!EXA_API_KEY) throw new Error("EXA_API_KEY is required");
 const sql = new SQL(DATABASE_URL);
 
 // Bump this to re-request every seed search on the next restart, even if it already ran.
-const SEED_VERSION = 1;
+const SEED_VERSION = 2;
 
 const SEEDS = [
   {
