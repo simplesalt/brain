@@ -28,3 +28,20 @@ persistence, and storage.
 
 Neither is a system of record. Anything that must survive and be trusted —
 decisions, conventions, project status — belongs in git or a GitHub issue.
+
+# LinkedIn
+
+- Actions go through hermes-msg MCP: `send_message` (channel linkedin),
+  `linkedin_action` (visit, connect, message, inmail, tag, untag, follow,
+  likepost, saveaslead, enroll), `linkedin_search`, `linkedin_search_results`,
+  `linkedin_queue`, `linkedin_prospect`. None need approval.
+- Reach a named person: check gbrain's person page (`linkedin:` field) first;
+  missing — `linkedin_search` by name (+ company), then poll
+  `linkedin_search_results` with `since` = its `requested_at`. Dux Soup only
+  runs in the user's daylight schedule — results may lag a window; report
+  pending, don't wait silently. Judge the best match yourself.
+- Degree decides the action: 1st-degree — direct message; otherwise —
+  `linkedin_action` connect with the message as the note (LinkedIn caps notes
+  at 300 characters). InMail only if asked.
+- Dux Soup ingests all captures (profiles, actions, messages) into gbrain
+  automatically — check person pages/timelines for LinkedIn history.
