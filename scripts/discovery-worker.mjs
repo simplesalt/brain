@@ -531,10 +531,35 @@ async function tick() {
   }
 }
 
+// Diagnostic: titles that appear on more than one canonical URL, to see why dedupe misses.
+async function logDuplicateReport() {
+  try {
+    const [totals] = await sql`
+      SELECT count(*)::int AS candidates,
+             count(DISTINCT lower(title))::int AS distinct_titles,
+             count(DISTINCT canonical_url)::int AS distinct_urls
+      FROM candidates
+    `;
+    const groups = await sql`
+      SELECT lower(title) AS title, count(*)::int AS n,
+             array_agg(canonical_url ORDER BY canonical_url) AS urls
+      FROM candidates
+      GROUP BY lower(title)
+      HAVING count(*) > 1
+      ORDER BY count(*) DESC
+      LIMIT 15
+    `;
+    console.log(JSON.stringify({ at: new Date().toISOString(), event: "duplicate_report", ...totals, groups }));
+  } catch (err) {
+    console.error(JSON.stringify({ at: new Date().toISOString(), event: "duplicate_report_error", error: err.message }));
+  }
+}
+
 async function main() {
   await migrate();
   await seed();
   console.log(JSON.stringify({ at: new Date().toISOString(), event: "startup", seed_version: SEED_VERSION }));
+  await logDuplicateReport();
   while (!shuttingDown) {
     await tick();
     if (shuttingDown) break;
