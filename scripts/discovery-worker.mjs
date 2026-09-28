@@ -17,7 +17,10 @@ const EXA_CONTENTS = {
       title: "RoleSummary",
       type: "object",
       properties: {
-        employer: { type: "string", description: "Name of the company that is hiring (not the job board). Empty if unknown." },
+        employer: {
+          type: "string",
+          description: "Name of the company that will employ the hire, as named in the job description. Never the job board, aggregator or recruiting site hosting the listing (for example not Jobgether, Jobsy, Jobtrail, Hiring Camp, Built In, The Muse, Dice or Simplify). Empty if the page does not name the employer.",
+        },
         skills: { type: "string", description: "Special skills or expertise the employer wants." },
         success: { type: "string", description: "What success looks like for this role." },
         remote_eligibility: {
@@ -301,13 +304,13 @@ const DDL_STATEMENTS = [
              WHERE o.role_id = c.role_id) AS profiles,
            (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) AS excluded_employer,
            (SELECT max(o.applicants) FROM candidates o WHERE o.role_id = c.role_id) AS applicants,
-           (SELECT min(coalesce(o.posted_at, o.published_at, o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id) AS posted_at,
+           (SELECT coalesce(min(o.posted_at), min(o.published_at), min(o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id) AS posted_at,
            (
              (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) IS NULL
              AND coalesce((SELECT o.remote_eligibility FROM candidates o WHERE o.role_id = c.role_id AND o.remote_eligibility <> 'unknown'
                            ORDER BY o.is_role_primary DESC LIMIT 1), 'unknown') = 'remote'
              AND coalesce((SELECT max(o.applicants) FROM candidates o WHERE o.role_id = c.role_id), 0) <= 30
-             AND (SELECT min(coalesce(o.posted_at, o.published_at, o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id)
+             AND (SELECT coalesce(min(o.posted_at), min(o.published_at), min(o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id)
                  >= now() - interval '1 month'
            ) AS considered
     FROM candidates c
@@ -395,6 +398,12 @@ function normalizeTitle(raw) {
 }
 
 async function applyTitlesAndExclusions() {
+  const named = await sql`SELECT id, employer FROM candidates WHERE employer IS NOT NULL`;
+  for (const r of named) {
+    if (cleanEmployer(r.employer) === null) {
+      await sql`UPDATE candidates SET employer = NULL, enrich_attempts = LEAST(enrich_attempts, 1) WHERE id = ${r.id}`;
+    }
+  }
   const rows = await sql`
     SELECT id, title FROM candidates
     WHERE job_title_version IS DISTINCT FROM ${TITLE_VERSION}
@@ -489,7 +498,11 @@ async function clusterRoles() {
   };
 
   // A page reached by following a link was already checked to be the same job as its source.
-  for (const r of rows) if (r.found_via != null && parent.has(r.found_via)) union(r.id, r.found_via);
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  for (const r of rows) {
+    const src = r.found_via != null ? byId.get(r.found_via) : null;
+    if (src && r.jt && r.jt === src.jt) union(r.id, src.id);
+  }
 
   const byKey = new Map();
   const link = (key, id) => {
@@ -501,7 +514,8 @@ async function clusterRoles() {
     if (emp && r.jt) link(`e:${emp}|${r.jt}`, r.id);
     for (const jid of jobIds(r.canonical_url)) link(`j:${jid}`, r.id);
     const slug = urlSlug(r.canonical_url);
-    if (slug.length >= 25) link(`s:${slug}`, r.id);
+    // Generic title slugs recur across employers, so a slug only links postings with the same (or no) employer.
+    if (slug.length >= 25) link(`s:${emp || "?"}|${slug}`, r.id);
   }
 
   const byTitle = new Map();
@@ -628,11 +642,11 @@ async function enrichCandidates() {
       if (existing) continue;
       const [target] = await exaContents([canonical], false);
       if (!target) continue;
-      // Only keep the linked page if it is plausibly the same job: same title or same employer.
+      // Only keep the linked page if it carries the same job title; an employer match alone let
+      // careers index pages and unrelated jobs through.
       const targetContents = contentsFrom(target);
       const sameTitle = normalizeTitle(target.title)?.toLowerCase() === String(row.job_title ?? "").toLowerCase();
-      const empA = normEmployer(targetContents.employer), empB = normEmployer(c.employer ?? row.employer);
-      if (!sameTitle && !(empA && empA === empB)) continue;
+      if (!sameTitle) continue;
       const [inserted] = await sql`
         INSERT INTO candidates (canonical_url, url, domain, title, sources, found_via)
         VALUES (${canonical}, ${link}, ${new URL(canonical).hostname}, ${target.title ?? null},
@@ -753,10 +767,18 @@ async function exaSearch(q) {
   });
 }
 
+// Job boards and scraper sites Exa sometimes names as the employer.
+const AGGREGATOR_NAMES = /^(jobgether|jobsy|jobtrail|taskium|hiring ?camp|asian ?careers|jobs ?radar|jobera|notify ?careers|built ?in.*|the ?muse|dice|simplify( jobs)?|swooped|haystack|ihire.*|jobscroller|worksynergy|workvista|remoteforge|skillcore|jobgrow|linkedin|indeed|glassdoor|ziprecruiter|ms)$/i;
+
+function cleanEmployer(e) {
+  const v = typeof e === "string" ? e.trim() : "";
+  return v && !AGGREGATOR_NAMES.test(normEmployer(v)) ? v : null;
+}
+
 function contentsFrom(o) {
   const summary = parseSummary(o.summary);
   return {
-    employer: typeof summary.employer === "string" && summary.employer.trim() ? summary.employer.trim() : null,
+    employer: cleanEmployer(summary.employer),
     skills: summary.skills || null,
     success: summary.success || null,
     remoteEligibility: normalizeRemote(summary.remote_eligibility),
