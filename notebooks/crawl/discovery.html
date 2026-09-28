@@ -1,0 +1,122 @@
+<!doctype html>
+<notebook theme="light-dark(air, midnight)">
+  <title>Job discovery</title>
+  <script type="text/markdown">
+    # Job discovery
+
+    This notebook queries the crawl pipeline's Postgres database directly (read-only). It shows job-posting candidates discovered by each search profile, which domains they came from, how each profile is performing, and recent search-run history.
+  </script>
+  <script type="text/markdown">
+    ## Candidates
+  </script>
+  <script type="application/sql" pinned database="crawl" output="candidates_by_profile">
+    SELECT
+      string_agg(DISTINCT s.name, ', ' ORDER BY s.name) AS found_by,
+      c.title,
+      c.domain,
+      c.canonical_url,
+      c.published_at,
+      c.sources,
+      c.times_seen,
+      c.last_seen_at
+    FROM candidates c
+    JOIN sightings si ON si.candidate_id = c.id
+    JOIN searches s ON s.id = si.search_id
+    GROUP BY c.id, c.title, c.domain, c.canonical_url, c.published_at, c.sources, c.times_seen, c.last_seen_at
+    ORDER BY c.published_at DESC NULLS LAST
+  </script>
+  <script type="module" pinned>
+    const candidatesFiltered = view(Inputs.search(candidates_by_profile, {placeholder: "Search title, domain, profile…"}));
+  </script>
+  <script type="module" pinned>
+    Inputs.table(candidatesFiltered)
+  </script>
+  <script type="text/markdown">
+    ## Candidates by domain
+
+    Top 25 domains by candidate count. The point is to see how much of what's found is real job boards (Greenhouse, Lever, Workday/myworkdayjobs, Ashby) versus other sites; the "is ATS" flag and colour mark that split.
+  </script>
+  <script type="application/sql" pinned database="crawl" output="by_domain">
+    SELECT
+      domain,
+      COUNT(*) AS candidate_count,
+      (domain ~* '(greenhouse\.io|lever\.co|myworkdayjobs\.com|workday\.com|ashbyhq\.com)') AS is_ats
+    FROM candidates
+    GROUP BY domain
+    ORDER BY candidate_count DESC
+    LIMIT 25
+  </script>
+  <script type="module" pinned>
+    Plot.plot({
+      marginLeft: 170,
+      height: Math.max(200, by_domain.length * 22 + 40),
+      x: {label: "Candidates", grid: true},
+      y: {label: null},
+      color: {
+        domain: [true, false],
+        range: ["#2a78d6", "#c3c2b7"],
+        legend: true,
+        label: "ATS domain"
+      },
+      marks: [
+        Plot.ruleX([0]),
+        Plot.barX(by_domain, {
+          x: "candidate_count",
+          y: "domain",
+          fill: "is_ats",
+          sort: {y: "-x"},
+          tip: true
+        }),
+        Plot.text(by_domain, {
+          x: "candidate_count",
+          y: "domain",
+          text: "candidate_count",
+          dx: 4,
+          textAnchor: "start",
+          sort: {y: "-x"}
+        })
+      ]
+    })
+  </script>
+  <script type="text/markdown">
+    ## Candidates by profile
+
+    Per search profile: how many candidates it has found in total, how many of those sit on an ATS domain, and when it last ran.
+  </script>
+  <script type="application/sql" pinned database="crawl" output="by_profile">
+    SELECT
+      s.name,
+      COUNT(DISTINCT c.id) AS candidate_count,
+      COUNT(DISTINCT c.id) FILTER (
+        WHERE c.domain ~* '(greenhouse\.io|lever\.co|myworkdayjobs\.com|workday\.com|ashbyhq\.com)'
+      ) AS ats_candidate_count,
+      s.last_run_finished_at,
+      s.last_run_status
+    FROM searches s
+    LEFT JOIN sightings si ON si.search_id = s.id
+    LEFT JOIN candidates c ON c.id = si.candidate_id
+    GROUP BY s.id, s.name, s.last_run_finished_at, s.last_run_status
+    ORDER BY candidate_count DESC
+  </script>
+  <script type="text/markdown">
+    ## Recent search runs
+
+    The last 50 search runs, newest first.
+  </script>
+  <script type="application/sql" pinned database="crawl" output="runs">
+    SELECT
+      s.name AS search_name,
+      r.started_at,
+      r.finished_at,
+      r.status,
+      r.serper_results,
+      r.exa_results,
+      r.candidates_inserted,
+      r.candidates_updated,
+      r.error
+    FROM search_runs r
+    JOIN searches s ON s.id = r.search_id
+    ORDER BY r.started_at DESC
+    LIMIT 50
+  </script>
+</notebook>

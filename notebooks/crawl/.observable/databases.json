@@ -1,0 +1,11 @@
+{
+  "crawl": {
+    "type": "postgres",
+    "host": "127.0.0.1",
+    "port": 15432,
+    "username": "crawl_read",
+    "password": "dummy",
+    "database": "crawl",
+    "ssl": "prefer"
+  }
+}

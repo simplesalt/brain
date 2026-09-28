@@ -1,0 +1,13 @@
+{
+  "name": "crawl-notebooks",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "preview": "notebooks preview --root .",
+    "build": "notebooks build --root . -- *.html"
+  },
+  "devDependencies": {
+    "@observablehq/notebook-kit": "^2.6.5",
+    "postgres": "^3.4.9"
+  }
+}
