@@ -216,6 +216,10 @@ const DDL_STATEMENTS = [
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS role_id bigint`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS is_role_primary boolean`,
   `CREATE INDEX IF NOT EXISTS candidates_role_id_idx ON candidates (role_id)`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS enrich_attempts int NOT NULL DEFAULT 0`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS enriched_at timestamptz`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS primary_source_url text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS found_via bigint REFERENCES candidates (id)`,
   `CREATE TABLE IF NOT EXISTS excluded_employers (
     name text PRIMARY KEY,
     domains text[] NOT NULL DEFAULT '{}'::text[],
@@ -293,6 +297,9 @@ const DDL_STATEMENTS = [
     FROM candidates c
     WHERE c.is_role_primary`,
   `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies.'`,
+  `COMMENT ON COLUMN candidates.enriched_at IS 'When the enrichment stage last fetched this page directly to fill in employer and details and look for the primary source.'`,
+  `COMMENT ON COLUMN candidates.primary_source_url IS 'Link from this page to the employer''s own or ATS posting, when one was found.'`,
+  `COMMENT ON COLUMN candidates.found_via IS 'For postings discovered by following a link, the candidate whose page linked to it.'`,
   `COMMENT ON TABLE excluded_employers IS 'Employers whose roles are excluded from discovery results, such as consulting firms. Edit freely; the worker re-applies it every cycle.'`,
   `COMMENT ON COLUMN excluded_employers.domains IS 'The employer''s own web domains; Exa searches skip these and postings on them are flagged.'`,
   `COMMENT ON COLUMN excluded_employers.patterns IS 'Case-insensitive Postgres regular expressions matched against a posting''s URL and title.'`,
@@ -512,6 +519,99 @@ async function clusterRoles() {
   return { candidates: rows.length, roles: members.size, changed };
 }
 
+const ENRICH_BATCH = Number(process.env.ENRICH_BATCH ?? 5);
+const SKIP_LINK_HOSTS = /(^|\.)(linkedin\.com|facebook\.com|twitter\.com|x\.com|instagram\.com|youtube\.com|google\.com|apple\.com|t\.co|bit\.ly)$/;
+
+async function exaContents(urls, withLinks) {
+  const r = await fetch("https://api.exa.ai/contents", {
+    method: "POST",
+    headers: { "x-api-key": EXA_API_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ urls, ...EXA_CONTENTS, ...(withLinks ? { extras: { links: 50 } } : {}) }),
+  });
+  if (!r.ok) throw new Error(`exa contents ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  const body = await r.json();
+  return body.results ?? [];
+}
+
+// Picks the link most likely to be the employer's own or ATS posting of this job.
+function pickPrimaryLink(links, fromDomain, employer) {
+  const emp = normEmployer(employer).replace(/[^a-z0-9]/g, "");
+  let best = null;
+  let bestScore = 0;
+  for (const link of links ?? []) {
+    const canonical = canonicalizeUrl(link);
+    if (!canonical) continue;
+    const host = new URL(canonical).hostname;
+    if (host === fromDomain || SKIP_LINK_HOSTS.test(host)) continue;
+    let score = 0;
+    if (ATS_DOMAIN.test(host)) score += 3;
+    if (emp.length >= 4 && host.replace(/[^a-z0-9]/g, "").includes(emp)) score += 2;
+    if (/job|career|position|opening|apply/i.test(canonical)) score += 1;
+    if (/\d{5,}/.test(canonical)) score += 1;
+    if (score >= 3 && score > bestScore) {
+      best = link;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+// Follow-up stage: fetch pages that lack employer or details, fill them in, and follow links
+// from generic boards to the primary source, which role clustering then prefers.
+async function enrichCandidates() {
+  const rows = await sql`
+    SELECT id, canonical_url, domain, employer, job_title
+    FROM candidates
+    WHERE excluded_employer IS NULL
+      AND enrich_attempts < 1
+      AND (employer IS NULL OR skills IS NULL OR success IS NULL OR highlights IS NULL
+           OR (is_role_primary AND primary_source_url IS NULL))
+    ORDER BY is_role_primary DESC NULLS LAST, id
+    LIMIT ${ENRICH_BATCH}
+  `;
+  let filled = 0, followed = 0, added = 0;
+  const errors = [];
+  for (const row of rows) {
+    await sql`UPDATE candidates SET enrich_attempts = enrich_attempts + 1, enriched_at = now() WHERE id = ${row.id}`;
+    try {
+      const [page] = await exaContents([row.canonical_url], true);
+      if (!page) continue;
+      const c = contentsFrom(page);
+      await saveContents(row.id, c);
+      filled++;
+      if (ATS_DOMAIN.test(row.domain)) continue;
+      const link = pickPrimaryLink(page.extras?.links, row.domain, c.employer ?? row.employer);
+      if (!link) continue;
+      const canonical = canonicalizeUrl(link);
+      await sql`UPDATE candidates SET primary_source_url = ${canonical} WHERE id = ${row.id}`;
+      followed++;
+      const [existing] = await sql`SELECT id FROM candidates WHERE canonical_url = ${canonical}`;
+      if (existing) continue;
+      const [target] = await exaContents([canonical], false);
+      if (!target) continue;
+      // Only keep the linked page if it is plausibly the same job: same title or same employer.
+      const targetContents = contentsFrom(target);
+      const sameTitle = normalizeTitle(target.title)?.toLowerCase() === String(row.job_title ?? "").toLowerCase();
+      const empA = normEmployer(targetContents.employer), empB = normEmployer(c.employer ?? row.employer);
+      if (!sameTitle && !(empA && empA === empB)) continue;
+      const [inserted] = await sql`
+        INSERT INTO candidates (canonical_url, url, domain, title, sources, found_via)
+        VALUES (${canonical}, ${link}, ${new URL(canonical).hostname}, ${target.title ?? null},
+                ARRAY['link']::text[], ${row.id})
+        ON CONFLICT (canonical_url) DO NOTHING
+        RETURNING id
+      `;
+      if (inserted) await saveContents(inserted.id, targetContents);
+      if (inserted) added++;
+    } catch (err) {
+      errors.push(`${row.canonical_url}: ${err.message}`.slice(0, 300));
+    }
+  }
+  if (rows.length) {
+    console.log(JSON.stringify({ at: new Date().toISOString(), event: "enriched", checked: rows.length, filled, followed, added, errors }));
+  }
+}
+
 async function excludedDomains() {
   const rows = await sql`SELECT DISTINCT unnest(domains) AS d FROM excluded_employers`;
   return rows.map((r) => r.d);
@@ -601,7 +701,6 @@ async function exaSearch(q) {
   const body = await r.json();
   const results = body.results ?? [];
   return results.map((o, i) => {
-    const summary = parseSummary(o.summary);
     const { text, ...rawWithoutText } = o;
     return {
       url: o.url,
@@ -610,16 +709,36 @@ async function exaSearch(q) {
       publishedAt: parseDate(o.publishedDate),
       rank: i + 1,
       raw: rawWithoutText,
-      contents: {
-        employer: typeof summary.employer === "string" && summary.employer.trim() ? summary.employer.trim() : null,
-        skills: summary.skills ?? null,
-        success: summary.success ?? null,
-        remoteEligibility: normalizeRemote(summary.remote_eligibility),
-        highlights: Array.isArray(o.highlights) && o.highlights.length ? o.highlights.join(" … ") : null,
-        pageText: typeof text === "string" ? text.slice(0, PAGE_TEXT_MAX_CHARS) : null,
-      },
+      contents: contentsFrom(o),
     };
   });
+}
+
+function contentsFrom(o) {
+  const summary = parseSummary(o.summary);
+  return {
+    employer: typeof summary.employer === "string" && summary.employer.trim() ? summary.employer.trim() : null,
+    skills: summary.skills || null,
+    success: summary.success || null,
+    remoteEligibility: normalizeRemote(summary.remote_eligibility),
+    highlights: Array.isArray(o.highlights) && o.highlights.length ? o.highlights.join(" … ") : null,
+    pageText: typeof o.text === "string" ? o.text.slice(0, PAGE_TEXT_MAX_CHARS) : null,
+  };
+}
+
+async function saveContents(candidateId, c) {
+  await sql`
+    UPDATE candidates SET
+      employer = COALESCE(${c.employer}, employer),
+      skills = COALESCE(${c.skills}, skills),
+      success = COALESCE(${c.success}, success),
+      remote_eligibility = CASE WHEN ${c.remoteEligibility} = 'unknown' AND remote_eligibility IS NOT NULL
+                                THEN remote_eligibility ELSE ${c.remoteEligibility} END,
+      highlights = COALESCE(${c.highlights}, highlights),
+      page_text = COALESCE(${c.pageText}, page_text),
+      contents_fetched_at = now()
+    WHERE id = ${candidateId}
+  `;
 }
 
 async function storeResults({ search, run, source, query, results }) {
@@ -648,21 +767,7 @@ async function storeResults({ search, run, source, query, results }) {
     if (candidate.inserted) inserted++;
     else updated++;
 
-    if (r.contents) {
-      const c = r.contents;
-      await sql`
-        UPDATE candidates SET
-          employer = COALESCE(${c.employer}, employer),
-          skills = COALESCE(${c.skills}, skills),
-          success = COALESCE(${c.success}, success),
-          remote_eligibility = CASE WHEN ${c.remoteEligibility} = 'unknown' AND remote_eligibility IS NOT NULL
-                                    THEN remote_eligibility ELSE ${c.remoteEligibility} END,
-          highlights = COALESCE(${c.highlights}, highlights),
-          page_text = COALESCE(${c.pageText}, page_text),
-          contents_fetched_at = now()
-        WHERE id = ${candidate.id}
-      `;
-    }
+    if (r.contents) await saveContents(candidate.id, r.contents);
 
     await sql`
       INSERT INTO sightings (candidate_id, search_id, run_id, source, query, rank, raw)
@@ -798,7 +903,14 @@ async function tick() {
     console.error(JSON.stringify({ at: new Date().toISOString(), event: "claim_error", error: err.message }));
     return;
   }
-  if (!claimed) return;
+  if (!claimed) {
+    try {
+      await enrichCandidates();
+    } catch (err) {
+      console.error(JSON.stringify({ at: new Date().toISOString(), event: "enrich_error", error: err.message }));
+    }
+    return;
+  }
   try {
     await runSearch(claimed.search, claimed.run);
   } catch (err) {
@@ -831,7 +943,17 @@ async function logDuplicateReport() {
       ORDER BY count(*) DESC
       LIMIT 15
     `;
-    console.log(JSON.stringify({ at: new Date().toISOString(), event: "duplicate_report", ...totals, groups }));
+    const [blanks] = await sql`
+      SELECT count(*)::int AS roles,
+             count(*) FILTER (WHERE coalesce(domain, '') = '')::int AS blank_domain,
+             count(*) FILTER (WHERE coalesce(url, '') = '')::int AS blank_url,
+             count(*) FILTER (WHERE coalesce(employer, '') = '')::int AS blank_employer,
+             count(*) FILTER (WHERE coalesce(skills, '') = '')::int AS blank_skills,
+             count(*) FILTER (WHERE coalesce(highlights, '') = '')::int AS blank_highlights,
+             (array_agg(url) FILTER (WHERE coalesce(domain, '') = ''))[1:5] AS blank_domain_samples
+      FROM roles
+    `;
+    console.log(JSON.stringify({ at: new Date().toISOString(), event: "duplicate_report", ...totals, blanks, groups: groups.slice(0, 5) }));
   } catch (err) {
     console.error(JSON.stringify({ at: new Date().toISOString(), event: "duplicate_report_error", error: err.message }));
   }
