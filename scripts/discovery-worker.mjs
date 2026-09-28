@@ -31,9 +31,10 @@ const PAGE_TEXT_MAX_CHARS = 8000;
 
 const EXA_CONTENTS = {
   text: { maxCharacters: PAGE_TEXT_MAX_CHARS },
-  summary: {
-    query: "What special skills or expertise is desired? What does success look like for this role? Can the role be done remotely?",
-    schema: {
+};
+
+// Fields our own model extracts from page text (Exa is only used for search and page text).
+const ROLE_SCHEMA = {
       $schema: "http://json-schema.org/draft-07/schema#",
       title: "RoleSummary",
       type: "object",
@@ -64,9 +65,7 @@ const EXA_CONTENTS = {
         },
       },
       required: ["employer", "employer_sector", "skills", "success", "remote_eligibility", "applicants", "posted_date"],
-    },
-  },
-};
+    };
 
 if (!DATABASE_URL) throw new Error("DATABASE_URL is required");
 if (!SERPER_API_KEY) throw new Error("SERPER_API_KEY is required");
@@ -279,6 +278,9 @@ const DDL_STATEMENTS = [
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS live_status text`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS live_checked_at timestamptz`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS live_detail text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS extract_version int`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS extract_model text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS extracted_at timestamptz`,
   `CREATE TABLE IF NOT EXISTS excluded_employers (
     name text PRIMARY KEY,
     domains text[] NOT NULL DEFAULT '{}'::text[],
@@ -694,9 +696,7 @@ async function enrichCandidates() {
                OR r.posted_at < now() - interval '1 month')
       )
       AND (
-        (enrich_attempts < 2 AND (employer IS NULL OR skills IS NULL OR success IS NULL
-                                  OR coalesce(remote_eligibility, 'unknown') = 'unknown'))
-        OR (enrich_attempts < 3 AND employer_sector IS NULL)
+        (enrich_attempts < 2 AND page_text IS NULL)
         OR (enrich_attempts < 1 AND is_role_primary AND primary_source_url IS NULL)
       )
     ORDER BY is_role_primary DESC NULLS LAST, id
@@ -744,6 +744,133 @@ async function enrichCandidates() {
   if (rows.length) {
     console.log(JSON.stringify({ at: new Date().toISOString(), event: "enriched", checked: rows.length, filled, followed, added, errors }));
   }
+}
+
+const LLM_BATCH = Number(process.env.LLM_BATCH ?? 8);
+const LLM_MODELS = (process.env.LLM_MODELS ?? "minimax/minimax-m2.7,openai/gpt-oss-120b").split(",");
+const OPENROUTER_KEY_FILE = process.env.OPENROUTER_KEY_FILE ?? "/secrets/openrouter/api_key";
+const EXTRACT_VERSION = 1;
+
+async function openrouterKey() {
+  try {
+    const v = (await Bun.file(OPENROUTER_KEY_FILE).text()).trim();
+    return v || null;
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonLoose(text) {
+  const t = String(text ?? "").replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+  try {
+    return JSON.parse(t);
+  } catch {
+    const m = t.match(/\{[\s\S]*\}/);
+    return m ? JSON.parse(m[0]) : null;
+  }
+}
+
+async function llmExtract(key, { title, url, text }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const prompt = [
+    `Today is ${today}. Extract facts about this job posting. Answer with one JSON object only, matching this JSON schema:`,
+    JSON.stringify(ROLE_SCHEMA),
+    `Also include "is_job_posting": true if the page is a single job posting, false if it is a list of jobs, a careers or benefits page, or anything else.`,
+    `Use empty strings where the page does not say. For skills and success, write one or two plain sentences.`,
+    `Title: ${title ?? ""}`,
+    `URL: ${url}`,
+    `Page text:`,
+    String(text).slice(0, 12000),
+  ].join("\n\n");
+  let lastErr;
+  for (const model of LLM_MODELS) {
+    try {
+      const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: prompt }],
+          response_format: { type: "json_object" },
+          temperature: 0,
+        }),
+        signal: AbortSignal.timeout(90000),
+      });
+      if (!r.ok) throw new Error(`openrouter ${model} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      const body = await r.json();
+      const out = parseJsonLoose(body.choices?.[0]?.message?.content);
+      if (!out) throw new Error(`openrouter ${model}: unparseable reply`);
+      return { model, out };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+// Our model extracts details from page text for postings still in play. Values that came from
+// Google Jobs' structured data are kept; the model fills whatever is still blank or unknown.
+async function extractWithLlm() {
+  const key = await openrouterKey();
+  if (!key) return 0;
+  const rows = await sql`
+    SELECT c.id, c.title, c.canonical_url, c.page_text,
+           ('google_jobs' = ANY(c.sources)) AS from_google
+    FROM candidates c
+    WHERE c.page_text IS NOT NULL AND length(c.page_text) > 200
+      AND c.excluded_employer IS NULL
+      AND c.extract_version IS DISTINCT FROM ${EXTRACT_VERSION}
+      AND NOT EXISTS (
+        SELECT 1 FROM roles r
+        WHERE r.role_id = c.role_id
+          AND (r.excluded_employer IS NOT NULL OR r.remote_eligibility IN ('hybrid', 'onsite')
+               OR r.applicants > 30 OR r.posted_at < now() - interval '1 month'
+               OR r.live_status = 'closed')
+      )
+    ORDER BY c.is_role_primary DESC NULLS LAST, c.id
+    LIMIT ${LLM_BATCH}
+  `;
+  let done = 0;
+  const errors = [];
+  for (const row of rows) {
+    try {
+      const { model, out } = await llmExtract(key, { title: row.title, url: row.canonical_url, text: row.page_text });
+      const c = {
+        employer: cleanEmployer(out.employer),
+        employerSector: ["security", "technology", "other"].includes(String(out.employer_sector)) ? String(out.employer_sector) : null,
+        skills: String(out.skills ?? "").trim() || null,
+        success: String(out.success ?? "").trim() || null,
+        remote: ["remote", "hybrid", "onsite"].includes(String(out.remote_eligibility)) ? String(out.remote_eligibility) : null,
+        applicants: parseApplicants(out.applicants, null),
+        postedAt: parsePostedDate(out.posted_date),
+        isJob: typeof out.is_job_posting === "boolean" ? out.is_job_posting : null,
+      };
+      const g = Boolean(row.from_google);
+      await sql`
+        UPDATE candidates SET
+          employer = CASE WHEN ${g} THEN coalesce(employer, ${c.employer}) ELSE coalesce(${c.employer}, employer) END,
+          employer_sector = coalesce(${c.employerSector}, employer_sector),
+          skills = CASE WHEN ${g} THEN coalesce(skills, ${c.skills}) ELSE coalesce(${c.skills}, skills) END,
+          success = CASE WHEN ${g} THEN coalesce(success, ${c.success}) ELSE coalesce(${c.success}, success) END,
+          remote_eligibility = CASE
+            WHEN ${g} AND coalesce(remote_eligibility, 'unknown') <> 'unknown' THEN remote_eligibility
+            ELSE coalesce(${c.remote}, remote_eligibility) END,
+          applicants = coalesce(${c.applicants}, applicants),
+          posted_at = CASE WHEN ${g} THEN coalesce(posted_at, ${c.postedAt}) ELSE coalesce(${c.postedAt}, posted_at) END,
+          is_job_posting = CASE WHEN ${c.isJob} IS NULL THEN is_job_posting ELSE (${c.isJob} AND coalesce(is_job_posting, true)) END,
+          extract_version = ${EXTRACT_VERSION},
+          extract_model = ${model},
+          extracted_at = now()
+        WHERE id = ${row.id}
+      `;
+      done++;
+    } catch (err) {
+      errors.push(`${row.canonical_url}: ${err.message}`.slice(0, 300));
+      await sql`UPDATE candidates SET extract_version = ${EXTRACT_VERSION}, extracted_at = now() WHERE id = ${row.id}`;
+    }
+  }
+  if (rows.length) console.log(JSON.stringify({ at: new Date().toISOString(), event: "llm_extracted", checked: rows.length, done, errors }));
+  return rows.length;
 }
 
 const LIVE_BATCH = Number(process.env.LIVE_BATCH ?? 10);
@@ -1257,6 +1384,11 @@ async function tick() {
       await checkLiveness();
     } catch (err) {
       console.error(JSON.stringify({ at: new Date().toISOString(), event: "liveness_error", error: err.message }));
+    }
+    try {
+      await extractWithLlm();
+    } catch (err) {
+      console.error(JSON.stringify({ at: new Date().toISOString(), event: "llm_error", error: err.message }));
     }
     try {
       await enrichCandidates();

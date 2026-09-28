@@ -46,6 +46,19 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openrouter-api-key
+  namespace: ssint-main-crawl
+  labels:
+    entity: ssint
+    env: main
+    capability: crawl
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -206,6 +219,9 @@ spec:
             - name: serpapi-api-key
               mountPath: /secrets/serpapi
               readOnly: true
+            - name: openrouter-api-key
+              mountPath: /secrets/openrouter
+              readOnly: true
       volumes:
         - name: discovery-worker-script
           configMap:
@@ -213,4 +229,8 @@ spec:
         - name: serpapi-api-key
           secret:
             secretName: serpapi-api-key
+            optional: true
+        - name: openrouter-api-key
+          secret:
+            secretName: openrouter-api-key
             optional: true
