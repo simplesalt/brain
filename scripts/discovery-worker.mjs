@@ -21,6 +21,7 @@ const EXA_CONTENTS = {
       title: "RoleSummary",
       type: "object",
       properties: {
+        employer: { type: "string", description: "Name of the company that is hiring (not the job board). Empty if unknown." },
         skills: { type: "string", description: "Special skills or expertise the employer wants." },
         success: { type: "string", description: "What success looks like for this role." },
         remote_eligibility: {
@@ -29,7 +30,7 @@ const EXA_CONTENTS = {
           description: "remote if the role can be done fully remotely, hybrid if partly, onsite if not, unknown if the page does not say.",
         },
       },
-      required: ["skills", "success", "remote_eligibility"],
+      required: ["employer", "skills", "success", "remote_eligibility"],
     },
   },
 };
@@ -41,7 +42,7 @@ if (!EXA_API_KEY) throw new Error("EXA_API_KEY is required");
 const sql = new SQL(DATABASE_URL);
 
 // Bump this to re-request every seed search on the next restart, even if it already ran.
-const SEED_VERSION = 4;
+const SEED_VERSION = 5;
 
 const SEEDS = [
   {
@@ -211,6 +212,10 @@ const DDL_STATEMENTS = [
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS job_title text`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS job_title_version int`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS excluded_employer text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS employer text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS role_id bigint`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS is_role_primary boolean`,
+  `CREATE INDEX IF NOT EXISTS candidates_role_id_idx ON candidates (role_id)`,
   `CREATE TABLE IF NOT EXISTS excluded_employers (
     name text PRIMARY KEY,
     domains text[] NOT NULL DEFAULT '{}'::text[],
@@ -264,6 +269,30 @@ const DDL_STATEMENTS = [
   `COMMENT ON COLUMN candidates.page_text IS 'Page text as fetched by Exa, capped in length.'`,
   `COMMENT ON COLUMN candidates.job_title IS 'The job title alone, cleaned from the page title (company, site, location, remote markers and requisition IDs removed).'`,
   `COMMENT ON COLUMN candidates.excluded_employer IS 'Name of the excluded employer (see excluded_employers) this posting matches; null if not excluded.'`,
+  `COMMENT ON COLUMN candidates.employer IS 'Hiring company as named by Exa from the page (not the job board); used to match reposts of the same role.'`,
+  `COMMENT ON COLUMN candidates.role_id IS 'Identifies the real role: every repost of the same job on different sites shares one role_id.'`,
+  `COMMENT ON COLUMN candidates.is_role_primary IS 'True for the one posting chosen to represent its role, preferring the employer''s own or ATS page.'`,
+  `CREATE OR REPLACE VIEW roles AS
+    SELECT c.role_id,
+           c.job_title,
+           coalesce(c.employer, (SELECT max(o.employer) FROM candidates o WHERE o.role_id = c.role_id)) AS employer,
+           (SELECT o.remote_eligibility FROM candidates o WHERE o.role_id = c.role_id AND o.remote_eligibility <> 'unknown'
+             ORDER BY o.is_role_primary DESC LIMIT 1) AS remote_eligibility,
+           c.canonical_url AS url,
+           c.domain,
+           coalesce(c.skills, (SELECT o.skills FROM candidates o WHERE o.role_id = c.role_id AND o.skills IS NOT NULL LIMIT 1)) AS skills,
+           coalesce(c.success, (SELECT o.success FROM candidates o WHERE o.role_id = c.role_id AND o.success IS NOT NULL LIMIT 1)) AS success,
+           coalesce(c.highlights, (SELECT o.highlights FROM candidates o WHERE o.role_id = c.role_id AND o.highlights IS NOT NULL LIMIT 1)) AS highlights,
+           (SELECT min(o.published_at) FROM candidates o WHERE o.role_id = c.role_id) AS published_at,
+           (SELECT max(o.last_seen_at) FROM candidates o WHERE o.role_id = c.role_id) AS last_seen_at,
+           (SELECT count(*) FROM candidates o WHERE o.role_id = c.role_id)::int AS postings,
+           (SELECT string_agg(DISTINCT s.name, ', ') FROM candidates o
+              JOIN sightings g ON g.candidate_id = o.id JOIN searches s ON s.id = g.search_id
+             WHERE o.role_id = c.role_id) AS profiles,
+           (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) AS excluded_employer
+    FROM candidates c
+    WHERE c.is_role_primary`,
+  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies.'`,
   `COMMENT ON TABLE excluded_employers IS 'Employers whose roles are excluded from discovery results, such as consulting firms. Edit freely; the worker re-applies it every cycle.'`,
   `COMMENT ON COLUMN excluded_employers.domains IS 'The employer''s own web domains; Exa searches skip these and postings on them are flagged.'`,
   `COMMENT ON COLUMN excluded_employers.patterns IS 'Case-insensitive Postgres regular expressions matched against a posting''s URL and title.'`,
@@ -358,13 +387,129 @@ async function applyTitlesAndExclusions() {
       SELECT c2.id, (
         SELECT e.name FROM excluded_employers e
         WHERE EXISTS (SELECT 1 FROM unnest(e.domains) d WHERE c2.domain = d OR c2.domain LIKE '%.' || d)
-           OR EXISTS (SELECT 1 FROM unnest(e.patterns) p WHERE c2.canonical_url ~* p OR coalesce(c2.title, '') ~* p)
+           OR EXISTS (SELECT 1 FROM unnest(e.patterns) p WHERE c2.canonical_url ~* p OR coalesce(c2.title, '') ~* p OR coalesce(c2.employer, '') ~* p)
         ORDER BY e.name LIMIT 1
       ) AS name
       FROM candidates c2
     ) m
     WHERE c.id = m.id AND c.excluded_employer IS DISTINCT FROM m.name
   `;
+}
+
+const ATS_DOMAIN = /(^|\.)(greenhouse\.io|lever\.co|myworkdayjobs\.com|workday\.com|ashbyhq\.com|smartrecruiters\.com|icims\.com|jobvite\.com|bamboohr\.com|workable\.com|recruitee\.com|rippling\.com)$/;
+const MAJOR_BOARD = /(^|\.)(linkedin\.com|indeed\.com|builtin[a-z]*\.com|themuse\.com|dice\.com|simplify\.jobs|glassdoor\.com|wellfound\.com)$/;
+
+function wordSet(text) {
+  return new Set(String(text ?? "").toLowerCase().match(/[a-z][a-z0-9+#.-]{2,}/g) ?? []);
+}
+
+function jaccard(a, b) {
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const w of a) if (b.has(w)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
+function jobIds(url) {
+  return String(url ?? "").match(/\d{7,}/g) ?? [];
+}
+
+// Last descriptive path segment, e.g. "director-of-developer-advocate-application-security".
+function urlSlug(url) {
+  try {
+    const seg = new URL(url).pathname.split("/").filter(Boolean).pop() ?? "";
+    return /^[a-z0-9-]+$/i.test(seg) && /[a-z]/i.test(seg) && seg.includes("-") ? seg.toLowerCase() : "";
+  } catch {
+    return "";
+  }
+}
+
+function normEmployer(e) {
+  return String(e ?? "").toLowerCase().replace(/[,.]|\b(inc|llc|ltd|corp|corporation|co|company|plc|group)\b/g, "").replace(/\s+/g, " ").trim();
+}
+
+function primaryRank(c) {
+  const emp = normEmployer(c.employer).replace(/\s+/g, "");
+  if (ATS_DOMAIN.test(c.domain)) return 0;
+  if (emp && c.domain.replace(/[^a-z0-9]/g, "").includes(emp)) return 0;
+  if (MAJOR_BOARD.test(c.domain)) return 1;
+  return 2;
+}
+
+// Groups reposts of one job into a role: same employer and title, a shared job-board ID in
+// the URL, or the same title with closely matching skills/page text when the employer is unknown.
+async function clusterRoles() {
+  const rows = await sql`
+    SELECT id, canonical_url, domain, lower(coalesce(job_title, title, '')) AS jt, employer,
+           skills, highlights, left(page_text, 3000) AS page_text, first_seen_at, role_id, is_role_primary
+    FROM candidates
+  `;
+  // bigint columns may arrive as strings; key everything by number.
+  for (const r of rows) {
+    r.id = Number(r.id);
+    r.role_id = r.role_id == null ? null : Number(r.role_id);
+  }
+  const parent = new Map(rows.map((r) => [r.id, r.id]));
+  const find = (x) => {
+    while (parent.get(x) !== x) {
+      parent.set(x, parent.get(parent.get(x)));
+      x = parent.get(x);
+    }
+    return x;
+  };
+  const union = (a, b) => {
+    const ra = find(a), rb = find(b);
+    if (ra !== rb) parent.set(Math.max(ra, rb), Math.min(ra, rb));
+  };
+
+  const byKey = new Map();
+  const link = (key, id) => {
+    if (byKey.has(key)) union(byKey.get(key), id);
+    else byKey.set(key, id);
+  };
+  for (const r of rows) {
+    const emp = normEmployer(r.employer);
+    if (emp && r.jt) link(`e:${emp}|${r.jt}`, r.id);
+    for (const jid of jobIds(r.canonical_url)) link(`j:${jid}`, r.id);
+    const slug = urlSlug(r.canonical_url);
+    if (slug.length >= 25) link(`s:${slug}`, r.id);
+  }
+
+  const byTitle = new Map();
+  for (const r of rows) {
+    if (!r.jt) continue;
+    if (!byTitle.has(r.jt)) byTitle.set(r.jt, []);
+    byTitle.get(r.jt).push({ ...r, words: wordSet(`${r.skills ?? ""} ${r.highlights ?? ""} ${r.page_text ?? ""}`) });
+  }
+  for (const group of byTitle.values()) {
+    for (let i = 0; i < group.length; i++) {
+      for (let j = i + 1; j < group.length; j++) {
+        const a = group[i], b = group[j];
+        const ea = normEmployer(a.employer), eb = normEmployer(b.employer);
+        if (ea && eb && ea !== eb) continue;
+        if (jaccard(a.words, b.words) >= 0.3) union(a.id, b.id);
+      }
+    }
+  }
+
+  const members = new Map();
+  for (const r of rows) {
+    const root = find(r.id);
+    if (!members.has(root)) members.set(root, []);
+    members.get(root).push(r);
+  }
+  let changed = 0;
+  for (const [root, group] of members) {
+    group.sort((a, b) => primaryRank(a) - primaryRank(b) || (b.employer ? 1 : 0) - (a.employer ? 1 : 0) || (b.skills ? 1 : 0) - (a.skills ? 1 : 0) || a.first_seen_at - b.first_seen_at || a.id - b.id);
+    const primaryId = group[0].id;
+    for (const r of group) {
+      const isPrimary = r.id === primaryId;
+      if (r.role_id === root && r.is_role_primary === isPrimary) continue;
+      await sql`UPDATE candidates SET role_id = ${root}, is_role_primary = ${isPrimary} WHERE id = ${r.id}`;
+      changed++;
+    }
+  }
+  return { candidates: rows.length, roles: members.size, changed };
 }
 
 async function excludedDomains() {
@@ -466,6 +611,7 @@ async function exaSearch(q) {
       rank: i + 1,
       raw: rawWithoutText,
       contents: {
+        employer: typeof summary.employer === "string" && summary.employer.trim() ? summary.employer.trim() : null,
         skills: summary.skills ?? null,
         success: summary.success ?? null,
         remoteEligibility: normalizeRemote(summary.remote_eligibility),
@@ -506,6 +652,7 @@ async function storeResults({ search, run, source, query, results }) {
       const c = r.contents;
       await sql`
         UPDATE candidates SET
+          employer = COALESCE(${c.employer}, employer),
           skills = COALESCE(${c.skills}, skills),
           success = COALESCE(${c.success}, success),
           remote_eligibility = CASE WHEN ${c.remoteEligibility} = 'unknown' AND remote_eligibility IS NOT NULL
@@ -639,6 +786,8 @@ async function tick() {
   }
   try {
     await applyTitlesAndExclusions();
+    const r = await clusterRoles();
+    if (r.changed) console.log(JSON.stringify({ at: new Date().toISOString(), event: "roles_clustered", ...r }));
   } catch (err) {
     console.error(JSON.stringify({ at: new Date().toISOString(), event: "cleanup_error", error: err.message }));
   }
