@@ -82,6 +82,15 @@ const SEEDS = [
   },
 ];
 
+// Re-applied every tick: CNPG may create the crawl_read role after this worker starts.
+const READ_ROLE_GRANTS = `DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'crawl_read') THEN
+      GRANT USAGE ON SCHEMA public TO crawl_read;
+      GRANT SELECT ON ALL TABLES IN SCHEMA public TO crawl_read;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO crawl_read;
+    END IF;
+  END $$`;
+
 const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS searches (
     id bigserial PRIMARY KEY,
@@ -413,6 +422,11 @@ process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
 async function tick() {
+  try {
+    await sql.unsafe(READ_ROLE_GRANTS);
+  } catch (err) {
+    console.error(JSON.stringify({ at: new Date().toISOString(), event: "grant_error", error: err.message }));
+  }
   let claimed;
   try {
     claimed = await claimSearch();

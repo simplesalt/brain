@@ -48,8 +48,30 @@ spec:
     initdb:
       database: crawl
       owner: crawl
+  managed:
+    roles:
+      - name: crawl_read
+        ensure: present
+        login: true
+        passwordSecret:
+          name: crawl-read-login
   storage:
     size: 5Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: crawl-read-login
+  namespace: ssint-main-crawl
+  labels:
+    entity: ssint
+    env: main
+    capability: crawl
+    cnpg.io/reload: "true"
+type: kubernetes.io/basic-auth
+stringData:
+  username: crawl_read
+  password: dummy
 ---
 apiVersion: apps/v1
 kind: Deployment
