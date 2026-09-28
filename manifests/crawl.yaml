@@ -101,3 +101,62 @@ spec:
               memory: 32Mi
             limits:
               memory: 128Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: discovery-worker
+  namespace: ssint-main-crawl
+  labels:
+    entity: ssint
+    env: main
+    capability: crawl
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: discovery-worker
+  template:
+    metadata:
+      labels:
+        app: discovery-worker
+        entity: ssint
+        env: main
+        capability: crawl
+    spec:
+      containers:
+        - name: discovery-worker
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "/scripts/discovery-worker.mjs"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: crawl-pg-app
+                  key: uri
+            - name: SERPER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: serper-api-key
+                  key: api_key
+            - name: EXA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: exa-api-key
+                  key: api_key
+          resources:
+            requests:
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: discovery-worker-script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: discovery-worker-script
+          configMap:
+            name: discovery-worker-script

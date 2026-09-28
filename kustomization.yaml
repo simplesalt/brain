@@ -31,6 +31,15 @@ configMapGenerator:
     namespace: ssint-main-ai
     files:
       - lease-sweep.mjs=scripts/lease-sweep.mjs
+  - name: discovery-worker-script
+    namespace: ssint-main-crawl
+    options:
+      labels:
+        entity: ssint
+        env: main
+        capability: crawl
+    files:
+      - discovery-worker.mjs=scripts/discovery-worker.mjs
 generatorOptions:
   labels:
     entity: ssint
