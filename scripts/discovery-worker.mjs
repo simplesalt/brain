@@ -485,6 +485,13 @@ function normalizeTitle(raw) {
 }
 
 async function applyTitlesAndExclusions() {
+  await sql`
+    UPDATE candidates SET
+      skills = CASE WHEN skills ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))' THEN NULL ELSE skills END,
+      success = CASE WHEN success ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))' THEN NULL ELSE success END
+    WHERE skills ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))'
+       OR success ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))'
+  `;
   const named = await sql`SELECT id, employer FROM candidates WHERE employer IS NOT NULL`;
   for (const r of named) {
     if (cleanEmployer(r.employer) === null) {
@@ -757,7 +764,7 @@ async function enrichCandidates() {
 const LLM_BATCH = Number(process.env.LLM_BATCH ?? 8);
 const LLM_MODELS = (process.env.LLM_MODELS ?? "minimax/minimax-m2.7,openai/gpt-oss-120b").split(",");
 const OPENROUTER_KEY_FILE = process.env.OPENROUTER_KEY_FILE ?? "/secrets/openrouter/api_key";
-const EXTRACT_VERSION = 2;
+const EXTRACT_VERSION = 3;
 
 async function openrouterKey() {
   try {
@@ -808,6 +815,7 @@ async function llmExtract(key, { title, url, text, stated }) {
     `Today is ${today}. Extract facts about this job posting. Answer with one JSON object only, matching this JSON schema:`,
     JSON.stringify(ROLE_SCHEMA),
     `Also include "is_job_posting": true if the page is a single job posting, false if it is a list of jobs, a careers or benefits page, or anything else.`,
+    `Also include "job_title": the job title alone, with no company, location, site name, salary or words like "job" or "remote".`,
     `Use empty strings or empty lists where the page does not say.`,
     BULLET_GUIDE,
     ...(stated ? [`Stated qualifications and responsibilities from the listing:`, stated] : []),
@@ -881,6 +889,7 @@ async function extractWithLlm() {
         applicants: parseApplicants(out.applicants, null),
         postedAt: parsePostedDate(out.posted_date),
         isJob: typeof out.is_job_posting === "boolean" ? out.is_job_posting : null,
+        jobTitle: meaningful(out.job_title),
       };
       const g = Boolean(row.from_google);
       await sql`
@@ -895,6 +904,8 @@ async function extractWithLlm() {
           applicants = coalesce(${c.applicants}, applicants),
           posted_at = CASE WHEN ${g} THEN coalesce(posted_at, ${c.postedAt}) ELSE coalesce(${c.postedAt}, posted_at) END,
           is_job_posting = CASE WHEN ${c.isJob} IS NULL THEN is_job_posting ELSE (${c.isJob} AND coalesce(is_job_posting, true)) END,
+          job_title = coalesce(${c.jobTitle}::text, job_title),
+          job_title_version = CASE WHEN ${c.jobTitle}::text IS NULL THEN job_title_version ELSE ${TITLE_VERSION}::int END,
           extract_version = ${EXTRACT_VERSION},
           extract_model = ${model},
           extracted_at = now()
