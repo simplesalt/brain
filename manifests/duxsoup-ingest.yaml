@@ -1,0 +1,974 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duxsoup-ingest
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: duxsoup-ingest-heartbeat
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+spec:
+  leaseDurationSeconds: 120
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: duxsoup-ingest-heartbeat
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["duxsoup-ingest-heartbeat"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duxsoup-ingest-heartbeat
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: duxsoup-ingest-heartbeat
+subjects:
+  - kind: ServiceAccount
+    name: duxsoup-ingest
+    namespace: ssint-main-msg
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: duxsoup-ingest-pg
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  imageName: ghcr.io/cloudnative-pg/postgresql:17
+  bootstrap:
+    initdb:
+      database: duxsoup
+      owner: duxsoup
+  storage:
+    size: 1Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duxsoup-ingest-script
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+data:
+  duxsoup-ingest.mjs: |
+    #!/usr/bin/env bun
+
+    import { SQL } from 'bun';
+    import { createHmac, timingSafeEqual } from 'crypto';
+    import { readFileSync } from 'fs';
+    import { join } from 'path';
+
+    const PORT = Number(process.env.PORT ?? 8080);
+    const DATABASE_URL = process.env.DATABASE_URL ?? '';
+
+    const DUXSOUP_API_KEY = process.env.DUXSOUP_API_KEY ?? '';
+
+    const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain.ssint-main-ai:3131/mcp';
+    const GBRAIN_TOKEN = process.env.GBRAIN_REMOTE_TOKEN ?? '';
+
+    const POD_NAME = process.env.POD_NAME ?? 'unknown';
+    const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 120);
+    const PROCESS_INTERVAL_MS = Number(process.env.PROCESS_INTERVAL_MS ?? 10_000);
+    const PROCESS_BATCH = Number(process.env.PROCESS_BATCH ?? 20);
+
+    if (!DATABASE_URL) {
+      console.error('FATAL: DATABASE_URL must be set');
+      process.exit(1);
+    }
+    if (!DUXSOUP_API_KEY) {
+      console.error('WARN: DUXSOUP_API_KEY not set — /duxsoup/events will reject every request with 401');
+    }
+
+    const sql = new SQL(DATABASE_URL);
+
+    // ---------------------------------------------------------------------------
+    // Schema (idempotent; re-run safely on every startup)
+    // ---------------------------------------------------------------------------
+
+    const DDL = [
+      `CREATE TABLE IF NOT EXISTS events (
+        id bigserial PRIMARY KEY,
+        received_at timestamptz NOT NULL DEFAULT now(),
+        type text,
+        event text,
+        payload jsonb NOT NULL,
+        processed_at timestamptz,
+        attempts int NOT NULL DEFAULT 0,
+        last_error text,
+        last_attempt_at timestamptz
+      )`,
+      `CREATE INDEX IF NOT EXISTS events_unprocessed_idx ON events (received_at) WHERE processed_at IS NULL`,
+      `CREATE INDEX IF NOT EXISTS events_type_idx ON events (type)`,
+      `CREATE TABLE IF NOT EXISTS profiles (
+        dux_id text PRIMARY KEY,
+        profile_url text,
+        first_name text,
+        last_name text,
+        title text,
+        company text,
+        degree text,
+        picture text,
+        last_visited_at timestamptz,
+        gbrain_slug text,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      )`,
+      `CREATE INDEX IF NOT EXISTS profiles_profile_url_idx ON profiles (profile_url)`,
+      `CREATE INDEX IF NOT EXISTS profiles_last_visited_idx ON profiles (last_visited_at DESC)`,
+      `COMMENT ON TABLE events IS 'Every Dux Soup webhook event, stored verbatim before processing; the durability boundary for the ingest endpoint.'`,
+      `COMMENT ON COLUMN events.type IS 'Top-level Dux Soup event category: visit, scan, action, message, rccommand or session.'`,
+      `COMMENT ON COLUMN events.event IS 'Top-level Dux Soup event name, as sent.'`,
+      `COMMENT ON COLUMN events.payload IS 'Full raw webhook JSON body, verbatim.'`,
+      `COMMENT ON COLUMN events.processed_at IS 'When this event was successfully applied to gbrain/profiles; NULL while still pending or retrying.'`,
+      `COMMENT ON COLUMN events.attempts IS 'Number of processing attempts so far.'`,
+      `COMMENT ON COLUMN events.last_error IS 'Error message from the most recent failed processing attempt.'`,
+      `COMMENT ON COLUMN events.last_attempt_at IS 'When the most recent processing attempt ran; used to back off retries.'`,
+      `COMMENT ON TABLE profiles IS 'One row per LinkedIn profile Dux Soup has visited, scanned or messaged, and the gbrain person page it is synced to.'`,
+      `COMMENT ON COLUMN profiles.dux_id IS 'Dux Soup profile id (the id/profileid/fromId/toId field across event types); synthesized as url:<hash> when only a URL is known.'`,
+      `COMMENT ON COLUMN profiles.gbrain_slug IS 'Slug of the gbrain person page this profile is synced to.'`,
+    ];
+
+    async function migrate() {
+      for (const stmt of DDL) await sql.unsafe(stmt);
+    }
+
+    async function migrateWithRetry() {
+      const attempts = Number(process.env.MIGRATE_ATTEMPTS ?? 12);
+      for (let i = 1; i <= attempts; i++) {
+        try {
+          await migrate();
+          return;
+        } catch (e) {
+          console.error(`migrate: attempt ${i}/${attempts} failed: ${e.message}`);
+          if (i === attempts) {
+            console.error('FATAL: could not migrate schema; exiting for restart');
+            process.exit(1);
+          }
+          await new Promise((r) => setTimeout(r, 10_000));
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Auth: key = base64url(HMAC-SHA256(DUXSOUP_API_KEY, "duxsoup-webhook"))
+    // ---------------------------------------------------------------------------
+
+    function deriveEventsKey(apiKey) {
+      return createHmac('sha256', apiKey).update('duxsoup-webhook').digest('base64url');
+    }
+
+    const EVENTS_KEY = DUXSOUP_API_KEY ? deriveEventsKey(DUXSOUP_API_KEY) : null;
+
+    function timingSafeEqualStr(a, b) {
+      const ab = Buffer.from(String(a ?? ''), 'utf8');
+      const bb = Buffer.from(String(b ?? ''), 'utf8');
+      if (ab.length !== bb.length) {
+        // Compare against a same-length dummy so a length mismatch doesn't
+        // short-circuit faster than a same-length mismatch would.
+        try { timingSafeEqual(ab, Buffer.alloc(ab.length)); } catch { /* ignore */ }
+        return false;
+      }
+      return timingSafeEqual(ab, bb);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Kubernetes: heartbeat Lease
+    // ---------------------------------------------------------------------------
+
+    const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
+    const K8S_HOST = 'https://kubernetes.default.svc';
+    const NAMESPACE = (() => {
+      try { return readFileSync(join(SA_DIR, 'namespace'), 'utf8').trim(); }
+      catch { return 'ssint-main-msg'; }
+    })();
+    const LEASE_NAME = 'duxsoup-ingest-heartbeat';
+    const LEASE_PATH = `/apis/coordination.k8s.io/v1/namespaces/${NAMESPACE}/leases/${LEASE_NAME}`;
+    const ANN = 'ingestion.simplesalt.company';
+
+    let _k8sToken, _k8sCa;
+    function k8sAuth() {
+      if (!_k8sToken) _k8sToken = readFileSync(join(SA_DIR, 'token'), 'utf8').trim();
+      if (!_k8sCa) _k8sCa = readFileSync(join(SA_DIR, 'ca.crt'), 'utf8');
+      return { token: _k8sToken, ca: _k8sCa };
+    }
+
+    async function k8sPatch(path, body) {
+      const { token, ca } = k8sAuth();
+      const r = await fetch(`${K8S_HOST}${path}`, {
+        method: 'PATCH',
+        tls: { ca },
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/merge-patch+json',
+        },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`k8s PATCH ${path} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      return r.json();
+    }
+
+    function microNow() { return new Date().toISOString().replace('Z', '000Z'); }
+
+    function normalizePayload(p) {
+      if (p == null) return null;
+      return typeof p === 'string' ? JSON.parse(p) : p;
+    }
+
+    async function computeStats() {
+      const [agg] = await sql`
+        SELECT
+          count(*)::int AS received_total,
+          count(*) FILTER (WHERE processed_at IS NOT NULL)::int AS ingested_total,
+          count(*) FILTER (WHERE processed_at IS NULL AND attempts > 0)::int AS failed_total,
+          count(*) FILTER (WHERE processed_at IS NULL)::int AS pending,
+          max(received_at) AS last_event_at
+        FROM events
+      `;
+      const [sessRow] = await sql`SELECT payload FROM events WHERE type = 'session' ORDER BY received_at DESC LIMIT 1`;
+      const sessData = normalizePayload(sessRow?.payload)?.data ?? {};
+      const sessionState = {
+        loggedin: sessData.loggedin ?? sessData.LoggedIn ?? sessData.loggedIn ?? null,
+        paused: sessData.paused ?? sessData.Paused ?? null,
+        cloudsession: sessData.cloudsession ?? sessData.CloudSession ?? sessData.cloudSession ?? null,
+      };
+      const [rcRow] = await sql`SELECT payload FROM events WHERE type = 'rccommand' ORDER BY received_at DESC LIMIT 1`;
+      const rcData = normalizePayload(rcRow?.payload)?.data ?? {};
+      const rcError = rcData.error ?? rcData.Error ?? rcData.errormessage ?? rcData.ErrorMessage ?? null;
+      return { ...agg, sessionState, rcError };
+    }
+
+    async function writeHeartbeat() {
+      let stats = null;
+      try { stats = await computeStats(); }
+      catch (e) { console.error(`heartbeat: stats query failed: ${e.message}`); }
+      const ann = {
+        [`${ANN}/received-total`]: String(stats?.received_total ?? ''),
+        [`${ANN}/ingested-total`]: String(stats?.ingested_total ?? ''),
+        [`${ANN}/failed-total`]: String(stats?.failed_total ?? ''),
+        [`${ANN}/pending`]: String(stats?.pending ?? ''),
+        [`${ANN}/last-event-at`]: stats?.last_event_at ? new Date(stats.last_event_at).toISOString() : '',
+        [`${ANN}/session-state`]: JSON.stringify(stats?.sessionState ?? {}),
+        [`${ANN}/rccommand-last-error`]: String(stats?.rcError ?? '').slice(0, 400),
+      };
+      const body = {
+        spec: { holderIdentity: POD_NAME, leaseDurationSeconds: HEARTBEAT_MAX_AGE_SEC, renewTime: microNow() },
+        metadata: { annotations: ann },
+      };
+      try { await k8sPatch(LEASE_PATH, body); }
+      catch (e) { console.error(`heartbeat: Lease PATCH failed: ${e.message}`); }
+    }
+
+    // ---------------------------------------------------------------------------
+    // gbrain MCP client (JSON-RPC tools/call, SSE or plain-JSON response)
+    // ---------------------------------------------------------------------------
+
+    function parseMcpResponse(text) {
+      let msg = null;
+      for (const block of text.split('\n\n')) {
+        const data = block.split('\n')
+          .filter((l) => l.startsWith('data:'))
+          .map((l) => l.slice(5).trim())
+          .join('\n');
+        if (!data) continue;
+        try { const o = JSON.parse(data); if (o.result || o.error) msg = o; } catch { /* keep scanning */ }
+      }
+      if (msg) return msg;
+      try { return JSON.parse(text); } catch { return null; }
+    }
+
+    // Generic MCP tools/call wrapper. Returns the parsed JSON the tool answered
+    // with (gbrain's ops all return either an object or an array that the MCP
+    // transport JSON.stringifies into content[0].text — see
+    // garrytan/gbrain@492b552 src/mcp/dispatch.ts:598). On a thrown OperationError
+    // the same commit's dispatch.ts:638 wraps `e.toJSON()` (which carries `error`,
+    // the OperationError `code`, e.g. 'page_not_found') as isError content; we
+    // surface that as `err.code` so callers can special-case it.
+    async function gbrainCall(name, args) {
+      const r = await fetch(GBRAIN_MCP_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          Authorization: `Bearer ${GBRAIN_TOKEN}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name, arguments: args },
+        }),
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
+      const msg = parseMcpResponse(text);
+      if (!msg) throw new Error(`unparseable MCP response: ${text.slice(0, 200)}`);
+      if (msg.error) throw new Error(`rpc: ${JSON.stringify(msg.error).slice(0, 300)}`);
+      const out = (msg.result?.content ?? []).map((c) => c.text ?? '').join('\n');
+      let parsed;
+      try { parsed = JSON.parse(out); } catch { parsed = null; }
+      if (msg.result?.isError) {
+        const err = new Error((parsed && parsed.message) || out.slice(0, 300) || `${name}: tool error`);
+        err.code = parsed?.error;
+        throw err;
+      }
+      return parsed !== null ? parsed : out;
+    }
+
+    // get_page params: { slug, fuzzy, include_content, include_deleted, source_id }
+    // (garrytan/gbrain@492b552 src/core/ops/pages.ts:146-155). Returns null on
+    // page_not_found instead of throwing, so callers can treat "no page yet" as
+    // a normal case.
+    async function gbrainGetPage(slug, { includeContent = false } = {}) {
+      try {
+        return await gbrainCall('get_page', { slug, include_content: includeContent });
+      } catch (e) {
+        if (e.code === 'page_not_found') return null;
+        throw e;
+      }
+    }
+
+    // put_page params: { slug, content, allow_empty, source_kind, source_uri,
+    // ingested_via } — content is the FULL markdown (frontmatter + body); it
+    // replaces the page wholesale (pages.ts:359-375).
+    async function gbrainPutPage(slug, content) {
+      return gbrainCall('put_page', { slug, content });
+    }
+
+    // search params: { query, limit, offset, mode, types, snippet_chars,
+    // source_id, salience, recency } (search.ts:135-173). Results carry
+    // { slug, page_id, title, type, ... } (types.ts:744-753).
+    async function gbrainSearch(query, { limit = 5, types } = {}) {
+      return gbrainCall('search', { query, limit, ...(types ? { types } : {}) });
+    }
+
+    // add_timeline_entry params: { slug, date, summary, detail, source }
+    // (timeline.ts: add_timeline_entry). date must be strict YYYY-MM-DD.
+    async function gbrainAddTimelineEntry({ slug, date, summary, detail, source }) {
+      return gbrainCall('add_timeline_entry', { slug, date, summary, detail, source });
+    }
+
+    // put_raw_data params: { slug, source, data } (raw-data.ts: put_raw_data).
+    async function gbrainPutRawData(slug, source, data) {
+      return gbrainCall('put_raw_data', { slug, source, data });
+    }
+
+    // ---------------------------------------------------------------------------
+    // profiles table
+    // ---------------------------------------------------------------------------
+
+    function shortHash(s) {
+      const h = new Bun.CryptoHasher('sha256').update(String(s ?? '')).digest('hex');
+      return h.slice(0, 16);
+    }
+
+    function canonicalizeProfileUrl(u) {
+      try {
+        const url = new URL(u);
+        const host = url.hostname.toLowerCase();
+        const path = url.pathname.replace(/\/+$/, '');
+        return `https://${host}${path}`;
+      } catch {
+        return u ?? null;
+      }
+    }
+
+    async function upsertProfile({ dux_id, profile_url, first_name, last_name, title, company, degree, picture, visited_at }) {
+      if (!dux_id) return null;
+      const rows = await sql`
+        INSERT INTO profiles (dux_id, profile_url, first_name, last_name, title, company, degree, picture, last_visited_at)
+        VALUES (
+          ${dux_id}, ${profile_url ?? null}, ${first_name ?? null}, ${last_name ?? null},
+          ${title ?? null}, ${company ?? null}, ${degree ?? null}, ${picture ?? null},
+          ${visited_at ?? new Date()}
+        )
+        ON CONFLICT (dux_id) DO UPDATE SET
+          profile_url = COALESCE(EXCLUDED.profile_url, profiles.profile_url),
+          first_name = COALESCE(EXCLUDED.first_name, profiles.first_name),
+          last_name = COALESCE(EXCLUDED.last_name, profiles.last_name),
+          title = COALESCE(EXCLUDED.title, profiles.title),
+          company = COALESCE(EXCLUDED.company, profiles.company),
+          degree = COALESCE(EXCLUDED.degree, profiles.degree),
+          picture = COALESCE(EXCLUDED.picture, profiles.picture),
+          last_visited_at = GREATEST(profiles.last_visited_at, EXCLUDED.last_visited_at),
+          updated_at = now()
+        RETURNING *
+      `;
+      return rows[0] ?? null;
+    }
+
+    async function setProfileGbrainSlug(dux_id, slug) {
+      const rows = await sql`
+        UPDATE profiles SET gbrain_slug = ${slug}, updated_at = now() WHERE dux_id = ${dux_id} RETURNING *
+      `;
+      return rows[0] ?? null;
+    }
+
+    async function findProfileByDuxId(id) {
+      if (!id) return null;
+      const rows = await sql`SELECT * FROM profiles WHERE dux_id = ${String(id)}`;
+      return rows[0] ?? null;
+    }
+
+    async function findProfileByUrl(url) {
+      if (!url) return null;
+      const canon = canonicalizeProfileUrl(url);
+      const rows = await sql`SELECT * FROM profiles WHERE profile_url = ${canon} OR profile_url = ${url} LIMIT 1`;
+      return rows[0] ?? null;
+    }
+
+    // Used by action/message handlers, which may reference a profile visit/scan
+    // has never seen yet. Creates a minimal stub row (and, via syncPersonPage,
+    // a minimal gbrain page) so the timeline entry always has somewhere to land.
+    async function resolvePerson({ dux_id, profile_url, first_name, last_name }) {
+      const id = dux_id != null ? String(dux_id) : null;
+      let profile = (id && (await findProfileByDuxId(id))) || (profile_url && (await findProfileByUrl(profile_url)));
+      if (!profile) {
+        profile = await upsertProfile({
+          dux_id: id ?? `url:${shortHash(profile_url ?? crypto.randomUUID())}`,
+          profile_url: profile_url ?? null,
+          first_name: first_name ?? null,
+          last_name: last_name ?? null,
+        });
+      }
+      if (!profile.gbrain_slug) {
+        await syncPersonPage(profile, null);
+        profile = await findProfileByDuxId(profile.dux_id);
+      }
+      return profile;
+    }
+
+    // ---------------------------------------------------------------------------
+    // gbrain person page sync
+    // ---------------------------------------------------------------------------
+
+    function linkedinVanity(url) {
+      try {
+        const path = new URL(url).pathname;
+        const m = path.match(/\/in\/([^/?#]+)/i);
+        return m ? decodeURIComponent(m[1]) : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function sanitizeSlugPart(s) {
+      const out = String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+      return out || 'unknown';
+    }
+
+    function deriveSlug(profileRow) {
+      const vanity = profileRow.profile_url ? linkedinVanity(profileRow.profile_url) : null;
+      if (vanity) return `people/${sanitizeSlugPart(vanity)}`;
+      return `people/li-${sanitizeSlugPart(profileRow.dux_id)}`;
+    }
+
+    function uniqueList(arr) {
+      const seen = new Set();
+      const out = [];
+      for (const v of arr) {
+        if (!v || seen.has(v)) continue;
+        seen.add(v);
+        out.push(v);
+      }
+      return out;
+    }
+
+    function replaceFrontmatterBlock(content, merged) {
+      const block = `---\n${JSON.stringify(merged, null, 2)}\n---\n`;
+      const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n/.exec(content ?? '');
+      if (m) return block + (content ?? '').slice(m[0].length);
+      return block + '\n' + (content ?? '');
+    }
+
+    // Searches gbrain for an existing person page matching this profile's
+    // LinkedIn URL or exact full name, so re-discovering someone Dux Soup has
+    // already crossed paths with (via another source) doesn't fork a duplicate
+    // page. Only adopted on a clear match (URL equality or exact-name equality).
+    async function findMatchingPersonSlug(profileRow, fullName) {
+      const queries = uniqueList([profileRow.profile_url, fullName]);
+      const seen = new Set();
+      for (const q of queries) {
+        let results;
+        try { results = await gbrainSearch(q, { limit: 5, types: ['person'] }); }
+        catch { continue; }
+        for (const r of results ?? []) {
+          if (!r?.slug || seen.has(r.slug)) continue;
+          seen.add(r.slug);
+          const page = await gbrainGetPage(r.slug).catch(() => null);
+          if (!page) continue;
+          const fm = page.frontmatter ?? {};
+          const urlMatch = profileRow.profile_url && fm.linkedin
+            && canonicalizeProfileUrl(String(fm.linkedin)) === canonicalizeProfileUrl(profileRow.profile_url);
+          const nameMatch = fullName && String(page.title ?? '').trim().toLowerCase() === fullName.toLowerCase();
+          if (urlMatch || nameMatch) return r.slug;
+        }
+      }
+      return null;
+    }
+
+    // Creates or updates the gbrain person page for a profiles row: resolves the
+    // slug (existing gbrain_slug, else a matching page found by search, else a
+    // freshly derived one), merges the duxsoup-sourced fields into frontmatter
+    // while preserving the rest of the page, writes it, and (when rawPayload is
+    // given) attaches the raw webhook payload via put_raw_data for provenance.
+    async function syncPersonPage(profileRow, rawPayload) {
+      const fullName = [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim();
+      let slug = profileRow.gbrain_slug || deriveSlug(profileRow);
+      let existing = await gbrainGetPage(slug, { includeContent: true });
+      if (!existing && !profileRow.gbrain_slug) {
+        const found = await findMatchingPersonSlug(profileRow, fullName);
+        if (found) {
+          slug = found;
+          existing = await gbrainGetPage(slug, { includeContent: true });
+        }
+      }
+
+      const updates = {
+        type: 'person',
+        source: 'duxsoup',
+        ...(fullName ? { title: fullName } : {}),
+        ...(profileRow.profile_url ? { linkedin: profileRow.profile_url } : {}),
+        ...(profileRow.company ? { company: profileRow.company } : {}),
+        ...(profileRow.title ? { role: profileRow.title } : {}),
+        ...(profileRow.degree ? { linkedin_degree: profileRow.degree } : {}),
+      };
+      const aliasAdds = uniqueList([profileRow.profile_url, `dux:${profileRow.dux_id}`]);
+
+      let content;
+      if (existing) {
+        const merged = { ...existing.frontmatter, ...updates };
+        merged.aliases = uniqueList([
+          ...(Array.isArray(existing.frontmatter?.aliases) ? existing.frontmatter.aliases : []),
+          ...aliasAdds,
+        ]);
+        content = replaceFrontmatterBlock(existing.content, merged);
+      } else {
+        const fm = { ...updates, title: updates.title || fullName || profileRow.dux_id, aliases: aliasAdds };
+        content = `---\n${JSON.stringify(fm, null, 2)}\n---\n\n# ${fm.title}\n`;
+      }
+
+      await gbrainPutPage(slug, content);
+      if (rawPayload) await gbrainPutRawData(slug, 'duxsoup', rawPayload);
+      await setProfileGbrainSlug(profileRow.dux_id, slug);
+      return slug;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Event processing
+    // ---------------------------------------------------------------------------
+
+    function parseDuxTime(v) {
+      if (v == null) return new Date();
+      if (typeof v === 'number') return new Date(v > 1e12 ? v : v * 1000);
+      const d = new Date(v);
+      return Number.isNaN(d.getTime()) ? new Date() : d;
+    }
+
+    function ymd(d) { return d.toISOString().slice(0, 10); }
+
+    function truthy(v) {
+      if (v === true) return true;
+      if (v === false || v == null) return false;
+      const s = String(v).trim().toLowerCase();
+      return s === 'true' || s === '1' || s === 'yes' || s === 'success';
+    }
+
+    function stringifyDetail(v) {
+      if (v == null) return '';
+      return typeof v === 'string' ? v : JSON.stringify(v);
+    }
+
+    async function processVisit(row) {
+      const d = row.payload?.data ?? {};
+      const profileRow = await upsertProfile({
+        dux_id: d.id != null ? String(d.id) : null,
+        profile_url: d.Profile ?? null,
+        first_name: d['First Name'] ?? null,
+        last_name: d['Last Name'] ?? null,
+        title: d.Title ?? null,
+        company: d.Company ?? null,
+        degree: d.Degree ?? null,
+        picture: d.Picture ?? null,
+        visited_at: parseDuxTime(d.VisitTime ?? row.payload?.time),
+      });
+      if (!profileRow) throw new Error('visit event missing data.id');
+      await syncPersonPage(profileRow, row.payload);
+    }
+
+    async function processScan(row) {
+      const d = row.payload?.data ?? {};
+      const profileRow = await upsertProfile({
+        dux_id: d.id != null ? String(d.id) : null,
+        profile_url: d.Profile ?? null,
+        first_name: d['First Name'] ?? null,
+        last_name: d['Last Name'] ?? null,
+        visited_at: parseDuxTime(d.ScanTime ?? row.payload?.time),
+      });
+      if (!profileRow) throw new Error('scan event missing data.id');
+      await syncPersonPage(profileRow, row.payload);
+    }
+
+    async function processAction(row) {
+      const d = row.payload?.data ?? {};
+      const profileRow = await resolvePerson({
+        dux_id: d.profileid != null ? String(d.profileid) : null,
+        profile_url: d.targeturl ?? null,
+      });
+      const slug = profileRow.gbrain_slug || (await syncPersonPage(profileRow, null));
+      const success = truthy(d.successflag);
+      await gbrainAddTimelineEntry({
+        slug,
+        date: ymd(parseDuxTime(row.payload?.time)),
+        summary: `LinkedIn ${d.name ?? 'action'}: ${success ? 'success' : 'failed'}`,
+        detail: stringifyDetail(d.returnvalue),
+        source: `duxsoup:action:${row.id}`,
+      });
+    }
+
+    async function processMessage(row) {
+      const d = row.payload?.data ?? {};
+      const ev = String(row.event ?? row.payload?.event ?? '').toLowerCase();
+      const isReceived = ev ? ev === 'received' : (d.fromId != null || d.from != null);
+      const profileRow = await resolvePerson({
+        dux_id: isReceived ? (d.fromId != null ? String(d.fromId) : null) : (d.toId != null ? String(d.toId) : null),
+        profile_url: d.url ?? null,
+        first_name: isReceived ? d.fromFirstName : d.toFirstName,
+        last_name: isReceived ? d.fromLastName : d.toLastName,
+      });
+      const slug = profileRow.gbrain_slug || (await syncPersonPage(profileRow, null));
+      await gbrainAddTimelineEntry({
+        slug,
+        date: ymd(parseDuxTime(row.payload?.time)),
+        summary: `LinkedIn message ${isReceived ? 'received' : 'sent'}`,
+        detail: stringifyDetail(d.text ?? ''),
+        source: `duxsoup:message:${row.id}`,
+      });
+    }
+
+    // rccommand and session events are kept in the events table only (no gbrain
+    // write); their latest state is read directly from events by writeHeartbeat.
+    async function processEvent(rawRow) {
+      const row = { ...rawRow, payload: normalizePayload(rawRow.payload) };
+      const type = String(row.type ?? '').toLowerCase();
+      switch (type) {
+        case 'visit': return processVisit(row);
+        case 'scan': return processScan(row);
+        case 'action': return processAction(row);
+        case 'message': return processMessage(row);
+        case 'rccommand': return;
+        case 'session': return;
+        default:
+          console.error(`process: unrecognized event type "${row.type}" (event=${row.event}) id=${row.id}; storing only`);
+          return;
+      }
+    }
+
+    async function claimBatch() {
+      return sql`
+        SELECT * FROM events
+        WHERE processed_at IS NULL
+          AND (
+            attempts = 0
+            OR last_attempt_at IS NULL
+            OR last_attempt_at <= now() - (LEAST(POWER(2, attempts) * 5, 300) || ' seconds')::interval
+          )
+        ORDER BY received_at ASC
+        LIMIT ${PROCESS_BATCH}
+      `;
+    }
+
+    let processing = false;
+    async function processBatch() {
+      if (processing) return 0;
+      processing = true;
+      try {
+        let rows;
+        try { rows = await claimBatch(); }
+        catch (e) { console.error(`processBatch: claim failed: ${e.message}`); return 0; }
+        for (const row of rows) {
+          try {
+            await processEvent(row);
+            await sql`UPDATE events SET processed_at = now(), last_attempt_at = now(), last_error = NULL WHERE id = ${row.id}`;
+          } catch (e) {
+            const msg = String(e?.message ?? e).slice(0, 800);
+            console.error(`processBatch: event ${row.id} (${row.type}) failed (attempt ${row.attempts + 1}): ${msg}`);
+            try {
+              await sql`UPDATE events SET attempts = attempts + 1, last_attempt_at = now(), last_error = ${msg} WHERE id = ${row.id}`;
+            } catch (e2) {
+              console.error(`processBatch: could not record failure for event ${row.id}: ${e2.message}`);
+            }
+          }
+        }
+        return rows.length;
+      } finally {
+        processing = false;
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // HTTP
+    // ---------------------------------------------------------------------------
+
+    async function handleEventsPost(req, url) {
+      const key = url.searchParams.get('key') ?? '';
+      if (!EVENTS_KEY || !timingSafeEqualStr(key, EVENTS_KEY)) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      let body;
+      try { body = await req.json(); }
+      catch { return Response.json({ error: 'invalid JSON body' }, { status: 400 }); }
+
+      const type = typeof body?.type === 'string' ? body.type : null;
+      const event = typeof body?.event === 'string' ? body.event : null;
+
+      let inserted;
+      try {
+        const rows = await sql`
+          INSERT INTO events (type, event, payload)
+          VALUES (${type}, ${event}, ${JSON.stringify(body ?? {})}::jsonb)
+          RETURNING id
+        `;
+        inserted = rows[0];
+      } catch (e) {
+        console.error(`events: insert failed: ${e.message}`);
+        return Response.json({ error: 'storage unavailable' }, { status: 503 });
+      }
+
+      queueMicrotask(() => { processBatch().catch((e) => console.error(`events: immediate process failed: ${e.message}`)); });
+      return Response.json({ ok: true, id: inserted.id }, { status: 200 });
+    }
+
+    async function handleProfilesRecent(url) {
+      const since = url.searchParams.get('since');
+      const sinceDate = since ? new Date(since) : null;
+      if (!since || !sinceDate || Number.isNaN(sinceDate.getTime())) {
+        return Response.json({ error: 'since is required and must be ISO8601' }, { status: 400 });
+      }
+      const q = (url.searchParams.get('q') ?? '').trim();
+      let limit = Number(url.searchParams.get('limit') ?? 20);
+      if (!Number.isFinite(limit) || limit <= 0) limit = 20;
+      limit = Math.min(Math.floor(limit), 100);
+      const tokens = q ? q.toLowerCase().split(/\s+/).filter(Boolean) : [];
+
+      let rows;
+      try {
+        rows = await sql`
+          SELECT dux_id, profile_url, first_name, last_name, title, company, degree, last_visited_at, gbrain_slug
+          FROM profiles
+          WHERE last_visited_at >= ${sinceDate}
+          ORDER BY last_visited_at DESC
+          LIMIT 1000
+        `;
+      } catch (e) {
+        console.error(`profiles/recent: query failed: ${e.message}`);
+        return Response.json({ error: 'storage unavailable' }, { status: 503 });
+      }
+
+      const filtered = tokens.length
+        ? rows.filter((r) => {
+          const hay = `${r.first_name ?? ''} ${r.last_name ?? ''} ${r.title ?? ''} ${r.company ?? ''}`.toLowerCase();
+          return tokens.every((t) => hay.includes(t));
+        })
+        : rows;
+
+      const profiles = filtered.slice(0, limit).map((r) => ({
+        dux_id: r.dux_id,
+        profile_url: r.profile_url,
+        first_name: r.first_name,
+        last_name: r.last_name,
+        title: r.title,
+        company: r.company,
+        degree: r.degree,
+        visited_at: r.last_visited_at,
+        gbrain_slug: r.gbrain_slug,
+      }));
+      return Response.json({ profiles });
+    }
+
+    async function handleReadyz() {
+      let agg;
+      try {
+        const rows = await sql`
+          SELECT count(*)::int AS total,
+                 max(received_at) AS last_event_at,
+                 min(received_at) FILTER (WHERE processed_at IS NULL) AS oldest_unprocessed
+          FROM events
+        `;
+        agg = rows[0];
+      } catch (e) {
+        return Response.json({ ready: false, reason: `database unreachable: ${e.message}` }, { status: 503 });
+      }
+      const now = Date.now();
+      if (agg.total > 0 && agg.last_event_at) {
+        const ageH = (now - new Date(agg.last_event_at).getTime()) / 3_600_000;
+        if (ageH > 48) return Response.json({ ready: false, reason: `no event received in ${ageH.toFixed(1)}h (max 48h)` }, { status: 503 });
+      }
+      if (agg.oldest_unprocessed) {
+        const ageMin = (now - new Date(agg.oldest_unprocessed).getTime()) / 60_000;
+        if (ageMin > 15) return Response.json({ ready: false, reason: `oldest unprocessed event is ${ageMin.toFixed(1)}m old (max 15m)` }, { status: 503 });
+      }
+      return Response.json({ ready: true, total: agg.total });
+    }
+
+    async function main() {
+      await migrateWithRetry();
+
+      const tick = async () => {
+        await processBatch().catch((e) => console.error(`tick: processBatch failed: ${e.message}`));
+        await writeHeartbeat().catch((e) => console.error(`tick: writeHeartbeat failed: ${e.message}`));
+      };
+      tick();
+      setInterval(tick, PROCESS_INTERVAL_MS);
+
+      Bun.serve({
+        port: PORT,
+        async fetch(req) {
+          const url = new URL(req.url);
+          const { pathname } = url;
+          if (pathname === '/healthz') return Response.json({ ok: true });
+          if (pathname === '/readyz') return handleReadyz();
+          if (pathname === '/duxsoup/events' && req.method === 'POST') return handleEventsPost(req, url);
+          if (pathname === '/profiles/recent' && req.method === 'GET') return handleProfilesRecent(url);
+          return new Response('Not Found', { status: 404 });
+        },
+        error(e) { return Response.json({ error: e.message }, { status: 500 }); },
+      });
+
+      console.log(`duxsoup-ingest listening on :${PORT}`);
+    }
+
+    await main();
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duxsoup-ingest
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: duxsoup-ingest
+  template:
+    metadata:
+      labels:
+        app: duxsoup-ingest
+        entity: ssint
+        env: main
+        capability: msg
+      annotations:
+        simplesalt.company/restart-epoch: "1"
+    spec:
+      serviceAccountName: duxsoup-ingest
+      containers:
+        - name: duxsoup-ingest
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "/scripts/duxsoup-ingest.mjs"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-ingest-pg-app
+                  key: uri
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: DUXSOUP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-api-key
+                  key: api_key
+                  optional: true
+            - name: GBRAIN_MCP_URL
+              value: http://gbrain.ssint-main-ai:3131/mcp
+            - name: GBRAIN_REMOTE_TOKEN
+              value: "gbrain-mcp"
+          livenessProbe:
+            # The container blocks on migrateWithRetry() (schema migration, up to
+            # ~120s of retries against a not-yet-ready CNPG cluster) before the
+            # HTTP server starts listening at all, so liveness needs enough grace
+            # to outlast that on a cold start.
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: duxsoup-ingest-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duxsoup-ingest
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  selector:
+    app: duxsoup-ingest
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

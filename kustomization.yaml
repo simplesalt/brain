@@ -12,6 +12,7 @@ resources:
   - manifests/calendar-collector.yaml
   - manifests/lease-sweep.yaml
   - manifests/hermes-msg.yaml
+  - manifests/duxsoup-ingest.yaml
   - manifests/coding.yaml
   - manifests/coding-rc.yaml
   - manifests/coding-fe.yaml
