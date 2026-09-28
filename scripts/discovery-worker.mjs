@@ -448,13 +448,14 @@ function primaryRank(c) {
 async function clusterRoles() {
   const rows = await sql`
     SELECT id, canonical_url, domain, lower(coalesce(job_title, title, '')) AS jt, employer,
-           skills, highlights, left(page_text, 3000) AS page_text, first_seen_at, role_id, is_role_primary
+           skills, highlights, left(page_text, 3000) AS page_text, first_seen_at, role_id, is_role_primary, found_via
     FROM candidates
   `;
   // bigint columns may arrive as strings; key everything by number.
   for (const r of rows) {
     r.id = Number(r.id);
     r.role_id = r.role_id == null ? null : Number(r.role_id);
+    r.found_via = r.found_via == null ? null : Number(r.found_via);
   }
   const parent = new Map(rows.map((r) => [r.id, r.id]));
   const find = (x) => {
@@ -468,6 +469,9 @@ async function clusterRoles() {
     const ra = find(a), rb = find(b);
     if (ra !== rb) parent.set(Math.max(ra, rb), Math.min(ra, rb));
   };
+
+  // A page reached by following a link was already checked to be the same job as its source.
+  for (const r of rows) if (r.found_via != null && parent.has(r.found_via)) union(r.id, r.found_via);
 
   const byKey = new Map();
   const link = (key, id) => {
