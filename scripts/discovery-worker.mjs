@@ -118,6 +118,45 @@ const READ_ROLE_GRANTS = `DO $$ BEGIN
     END IF;
   END $$`;
 
+// Seed list of consulting firms whose roles are excluded. Rows live in
+// excluded_employers so agents can add or remove firms; seeding never overwrites edits.
+const CONSULTING_FIRMS = [
+  { name: "Deloitte", domains: ["deloitte.com"], patterns: [String.raw`\mdeloitte\M`] },
+  { name: "Accenture", domains: ["accenture.com"], patterns: [String.raw`\maccenture\M`] },
+  { name: "PwC", domains: ["pwc.com"], patterns: [String.raw`\mpwc\M`, "pricewaterhouse"] },
+  { name: "EY", domains: ["ey.com"], patterns: [String.raw`ernst\s*(&|and)\s*young`, String.raw`[./]ey\.com`, String.raw`/ey(/|$)`] },
+  { name: "KPMG", domains: ["kpmg.com", "kpmg.us"], patterns: [String.raw`\mkpmg\M`] },
+  { name: "McKinsey", domains: ["mckinsey.com"], patterns: [String.raw`\mmckinsey\M`] },
+  { name: "Boston Consulting Group", domains: ["bcg.com"], patterns: ["boston consulting group", String.raw`\mbcg\M`] },
+  { name: "Bain", domains: ["bain.com"], patterns: [String.raw`\mbain\s*(&|and)\s*company\M`] },
+  { name: "Booz Allen Hamilton", domains: ["boozallen.com"], patterns: [String.raw`booz\s*allen`] },
+  { name: "Capgemini", domains: ["capgemini.com"], patterns: [String.raw`\mcapgemini\M`] },
+  { name: "Cognizant", domains: ["cognizant.com"], patterns: [String.raw`\mcognizant\M`] },
+  { name: "Infosys", domains: ["infosys.com"], patterns: [String.raw`\minfosys\M`] },
+  { name: "Wipro", domains: ["wipro.com"], patterns: [String.raw`\mwipro\M`] },
+  { name: "Tata Consultancy Services", domains: ["tcs.com"], patterns: ["tata consultancy", String.raw`\mtcs\M`] },
+  { name: "HCLTech", domains: ["hcltech.com"], patterns: [String.raw`\mhcl\s*tech`] },
+  { name: "Tech Mahindra", domains: ["techmahindra.com"], patterns: [String.raw`tech\s*mahindra`] },
+  { name: "Genpact", domains: ["genpact.com"], patterns: [String.raw`\mgenpact\M`] },
+  { name: "DXC Technology", domains: ["dxc.com"], patterns: [String.raw`\mdxc\M`] },
+  { name: "NTT DATA", domains: ["nttdata.com"], patterns: [String.raw`ntt\s*data`] },
+  { name: "CGI", domains: ["cgi.com"], patterns: [String.raw`\mcgi\M`] },
+  { name: "Protiviti", domains: ["protiviti.com"], patterns: [String.raw`\mprotiviti\M`] },
+  { name: "Grant Thornton", domains: ["grantthornton.com"], patterns: [String.raw`grant\s*thornton`] },
+  { name: "BDO", domains: ["bdo.com"], patterns: [String.raw`\mbdo\M`] },
+  { name: "RSM", domains: ["rsmus.com"], patterns: [String.raw`\mrsm\s*(us|us llp)?\M`] },
+  { name: "Crowe", domains: ["crowe.com"], patterns: [String.raw`\mcrowe\M`] },
+  { name: "Guidehouse", domains: ["guidehouse.com"], patterns: [String.raw`\mguidehouse\M`] },
+  { name: "Huron", domains: ["huronconsultinggroup.com"], patterns: [String.raw`huron\s*consulting`] },
+  { name: "Kroll", domains: ["kroll.com"], patterns: [String.raw`\mkroll\M`] },
+  { name: "Optiv", domains: ["optiv.com"], patterns: [String.raw`\moptiv\M`] },
+  { name: "Coalfire", domains: ["coalfire.com"], patterns: [String.raw`\mcoalfire\M`] },
+  { name: "Slalom", domains: ["slalom.com"], patterns: [String.raw`\mslalom\M`] },
+  { name: "Avanade", domains: ["avanade.com"], patterns: [String.raw`\mavanade\M`] },
+];
+
+const TITLE_VERSION = 1;
+
 const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS searches (
     id bigserial PRIMARY KEY,
@@ -169,6 +208,16 @@ const DDL_STATEMENTS = [
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS highlights text`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS page_text text`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS contents_fetched_at timestamptz`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS job_title text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS job_title_version int`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS excluded_employer text`,
+  `CREATE TABLE IF NOT EXISTS excluded_employers (
+    name text PRIMARY KEY,
+    domains text[] NOT NULL DEFAULT '{}'::text[],
+    patterns text[] NOT NULL DEFAULT '{}'::text[],
+    note text,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
   `CREATE TABLE IF NOT EXISTS sightings (
     id bigserial PRIMARY KEY,
     candidate_id bigint NOT NULL REFERENCES candidates (id),
@@ -213,6 +262,11 @@ const DDL_STATEMENTS = [
   `COMMENT ON COLUMN candidates.remote_eligibility IS 'Whether the role can be done remotely: remote, hybrid, onsite or unknown, judged by Exa from the page.'`,
   `COMMENT ON COLUMN candidates.highlights IS 'Most relevant sentences from the page about skills, success and remote work, joined with " … ".'`,
   `COMMENT ON COLUMN candidates.page_text IS 'Page text as fetched by Exa, capped in length.'`,
+  `COMMENT ON COLUMN candidates.job_title IS 'The job title alone, cleaned from the page title (company, site, location, remote markers and requisition IDs removed).'`,
+  `COMMENT ON COLUMN candidates.excluded_employer IS 'Name of the excluded employer (see excluded_employers) this posting matches; null if not excluded.'`,
+  `COMMENT ON TABLE excluded_employers IS 'Employers whose roles are excluded from discovery results, such as consulting firms. Edit freely; the worker re-applies it every cycle.'`,
+  `COMMENT ON COLUMN excluded_employers.domains IS 'The employer''s own web domains; Exa searches skip these and postings on them are flagged.'`,
+  `COMMENT ON COLUMN excluded_employers.patterns IS 'Case-insensitive Postgres regular expressions matched against a posting''s URL and title.'`,
   `COMMENT ON COLUMN candidates.contents_fetched_at IS 'When the summary, highlights and page text were last refreshed.'`,
 ];
 
@@ -221,6 +275,18 @@ async function migrate() {
 }
 
 async function seed() {
+  for (const f of CONSULTING_FIRMS) {
+    await sql`
+      INSERT INTO excluded_employers (name, domains, patterns, note)
+      VALUES (
+        ${f.name},
+        ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(f.domains)}::text::jsonb)),
+        ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(f.patterns)}::text::jsonb)),
+        'consulting firm (seed)'
+      )
+      ON CONFLICT (name) DO NOTHING
+    `;
+  }
   for (const s of SEEDS) {
     await sql`
       INSERT INTO searches (
@@ -249,6 +315,62 @@ async function seed() {
 
 // Params dropped regardless of key case: exact matches plus any utm_* prefix.
 const DROP_PARAMS = new Set(["gclid", "fbclid", "gh_src", "source", "ref", "lever-source", "lever-origin"]);
+
+const ROLE_WORDS =
+  /\b(security|officer|architect|architecture|manager|director|engineer|analyst|evangelist|advocate|lead|chief|head|specialist|consultant|principal|staff|biso|ciso|cso|grc|governance|risk|compliance|program|vp|vice president|administrator|auditor|strategist|advisor|of staff)\b/i;
+
+// Deterministic cleanup of a page title down to the job title alone.
+function normalizeTitle(raw) {
+  if (!raw) return null;
+  let t = String(raw).replace(/\s+/g, " ").trim();
+  t = t.replace(/^(job application for|apply(?: now)? (?:for|to)|careers?\s*[-:|]|jobs?\s*[-:|]|now hiring:?|hiring:?|we'?re hiring:?|opening:?)\s*/i, "");
+  t = t.replace(/\s*[([][^)\]]*(remote|hybrid|on-?site|united states|usa)[^)\]]*[)\]]/gi, "");
+  const parts = t.split(/\s+[|–—·•]\s+|\s+-\s+|\s*::\s*/).map((x) => x.trim()).filter(Boolean);
+  let pick = parts.find((x) => ROLE_WORDS.test(x)) ?? parts[0] ?? t;
+  const at = pick.match(/^(.*?\S)\s+(?:at|@)\s+[A-Z0-9].*$/);
+  if (at && ROLE_WORDS.test(at[1])) pick = at[1];
+  for (let i = 0; i < 3; i++) {
+    pick = pick.replace(/\s*[([][^)\]]*[)\]]\s*$/, (m) =>
+      /remote|hybrid|on-?site|\b[A-Z]{2}\b|,|\d|united states|usa/i.test(m) ? "" : m,
+    );
+  }
+  pick = pick.replace(/[,\s]+(remote|hybrid|on-?site)\b.*$/i, "");
+  pick = pick.replace(/\s*(#|req(?:uisition)?\s*(?:id)?\s*[:#]?|jr|r)\s*-?\d{3,}\s*$/i, "");
+  pick = pick.replace(/\s*[-–,:|]+\s*$/, "").trim();
+  return pick || String(raw).trim();
+}
+
+async function applyTitlesAndExclusions() {
+  const rows = await sql`
+    SELECT id, title FROM candidates
+    WHERE job_title_version IS DISTINCT FROM ${TITLE_VERSION}
+    LIMIT 500
+  `;
+  for (const row of rows) {
+    await sql`
+      UPDATE candidates SET job_title = ${normalizeTitle(row.title)}, job_title_version = ${TITLE_VERSION}
+      WHERE id = ${row.id}
+    `;
+  }
+  await sql`
+    UPDATE candidates c SET excluded_employer = m.name
+    FROM (
+      SELECT c2.id, (
+        SELECT e.name FROM excluded_employers e
+        WHERE EXISTS (SELECT 1 FROM unnest(e.domains) d WHERE c2.domain = d OR c2.domain LIKE '%.' || d)
+           OR EXISTS (SELECT 1 FROM unnest(e.patterns) p WHERE c2.canonical_url ~* p OR coalesce(c2.title, '') ~* p)
+        ORDER BY e.name LIMIT 1
+      ) AS name
+      FROM candidates c2
+    ) m
+    WHERE c.id = m.id AND c.excluded_employer IS DISTINCT FROM m.name
+  `;
+}
+
+async function excludedDomains() {
+  const rows = await sql`SELECT DISTINCT unnest(domains) AS d FROM excluded_employers`;
+  return rows.map((r) => r.d);
+}
 
 function canonicalizeUrl(raw) {
   if (!raw) return null;
@@ -322,7 +444,13 @@ async function exaSearch(q) {
   const r = await fetch("https://api.exa.ai/search", {
     method: "POST",
     headers: { "x-api-key": EXA_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ query: q, numResults: RESULTS_PER_QUERY, type: "auto", contents: EXA_CONTENTS }),
+    body: JSON.stringify({
+      query: q,
+      numResults: RESULTS_PER_QUERY,
+      type: "auto",
+      contents: EXA_CONTENTS,
+      excludeDomains: await excludedDomains(),
+    }),
   });
   if (!r.ok) throw new Error(`exa ${r.status}: ${(await r.text()).slice(0, 200)}`);
   const body = await r.json();
@@ -509,6 +637,11 @@ async function tick() {
   } catch (err) {
     console.error(JSON.stringify({ at: new Date().toISOString(), event: "grant_error", error: err.message }));
   }
+  try {
+    await applyTitlesAndExclusions();
+  } catch (err) {
+    console.error(JSON.stringify({ at: new Date().toISOString(), event: "cleanup_error", error: err.message }));
+  }
   let claimed;
   try {
     claimed = await claimSearch();
@@ -541,10 +674,10 @@ async function logDuplicateReport() {
       FROM candidates
     `;
     const groups = await sql`
-      SELECT lower(title) AS title, count(*)::int AS n,
+      SELECT lower(coalesce(job_title, title)) AS title, count(*)::int AS n,
              array_agg(canonical_url ORDER BY canonical_url) AS urls
       FROM candidates
-      GROUP BY lower(title)
+      GROUP BY lower(coalesce(job_title, title))
       HAVING count(*) > 1
       ORDER BY count(*) DESC
       LIMIT 15
@@ -559,6 +692,7 @@ async function main() {
   await migrate();
   await seed();
   console.log(JSON.stringify({ at: new Date().toISOString(), event: "startup", seed_version: SEED_VERSION }));
+  await applyTitlesAndExclusions();
   await logDuplicateReport();
   while (!shuttingDown) {
     await tick();
