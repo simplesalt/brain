@@ -6,6 +6,33 @@ const SERPER_API_KEY = process.env.SERPER_API_KEY;
 const EXA_API_KEY = process.env.EXA_API_KEY;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 30_000);
 const RESULTS_PER_QUERY = 20;
+const PAGE_TEXT_MAX_CHARS = 8000;
+
+const EXA_CONTENTS = {
+  text: { maxCharacters: PAGE_TEXT_MAX_CHARS },
+  highlights: {
+    query: "Required skills and expertise, what success looks like in this role, and whether the role can be done remotely",
+    maxCharacters: 1000,
+  },
+  summary: {
+    query: "What special skills or expertise is desired? What does success look like for this role? Can the role be done remotely?",
+    schema: {
+      $schema: "http://json-schema.org/draft-07/schema#",
+      title: "RoleSummary",
+      type: "object",
+      properties: {
+        skills: { type: "string", description: "Special skills or expertise the employer wants." },
+        success: { type: "string", description: "What success looks like for this role." },
+        remote_eligibility: {
+          type: "string",
+          enum: ["remote", "hybrid", "onsite", "unknown"],
+          description: "remote if the role can be done fully remotely, hybrid if partly, onsite if not, unknown if the page does not say.",
+        },
+      },
+      required: ["skills", "success", "remote_eligibility"],
+    },
+  },
+};
 
 if (!DATABASE_URL) throw new Error("DATABASE_URL is required");
 if (!SERPER_API_KEY) throw new Error("SERPER_API_KEY is required");
@@ -14,7 +41,7 @@ if (!EXA_API_KEY) throw new Error("EXA_API_KEY is required");
 const sql = new SQL(DATABASE_URL);
 
 // Bump this to re-request every seed search on the next restart, even if it already ran.
-const SEED_VERSION = 3;
+const SEED_VERSION = 4;
 
 const SEEDS = [
   {
@@ -136,6 +163,12 @@ const DDL_STATEMENTS = [
     last_seen_at timestamptz NOT NULL DEFAULT now(),
     times_seen int NOT NULL DEFAULT 1
   )`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS skills text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS success text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS remote_eligibility text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS highlights text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS page_text text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS contents_fetched_at timestamptz`,
   `CREATE TABLE IF NOT EXISTS sightings (
     id bigserial PRIMARY KEY,
     candidate_id bigint NOT NULL REFERENCES candidates (id),
@@ -175,6 +208,12 @@ const DDL_STATEMENTS = [
   `COMMENT ON COLUMN candidates.first_seen_at IS 'When this URL was first discovered.'`,
   `COMMENT ON COLUMN candidates.last_seen_at IS 'When this URL was most recently discovered again.'`,
   `COMMENT ON COLUMN candidates.times_seen IS 'How many times this URL has been discovered across all searches and runs.'`,
+  `COMMENT ON COLUMN candidates.skills IS 'Special skills or expertise the posting asks for, summarized by Exa.'`,
+  `COMMENT ON COLUMN candidates.success IS 'What success looks like in the role, summarized by Exa.'`,
+  `COMMENT ON COLUMN candidates.remote_eligibility IS 'Whether the role can be done remotely: remote, hybrid, onsite or unknown, judged by Exa from the page.'`,
+  `COMMENT ON COLUMN candidates.highlights IS 'Most relevant sentences from the page about skills, success and remote work, joined with " … ".'`,
+  `COMMENT ON COLUMN candidates.page_text IS 'Page text as fetched by Exa, capped in length.'`,
+  `COMMENT ON COLUMN candidates.contents_fetched_at IS 'When the summary, highlights and page text were last refreshed.'`,
 ];
 
 async function migrate() {
@@ -243,6 +282,23 @@ function parseDate(v) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+// Exa returns a schema summary as a JSON string; fall back to treating plain text as skills.
+function parseSummary(raw) {
+  if (!raw) return {};
+  if (typeof raw === "object") return raw;
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === "object" ? v : { skills: String(raw) };
+  } catch {
+    return { skills: String(raw) };
+  }
+}
+
+function normalizeRemote(v) {
+  const s = String(v ?? "").toLowerCase();
+  return ["remote", "hybrid", "onsite"].includes(s) ? s : "unknown";
+}
+
 async function serperSearch(q) {
   const r = await fetch("https://google.serper.dev/search", {
     method: "POST",
@@ -266,19 +322,30 @@ async function exaSearch(q) {
   const r = await fetch("https://api.exa.ai/search", {
     method: "POST",
     headers: { "x-api-key": EXA_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ query: q, numResults: RESULTS_PER_QUERY, type: "auto" }),
+    body: JSON.stringify({ query: q, numResults: RESULTS_PER_QUERY, type: "auto", contents: EXA_CONTENTS }),
   });
   if (!r.ok) throw new Error(`exa ${r.status}: ${(await r.text()).slice(0, 200)}`);
   const body = await r.json();
   const results = body.results ?? [];
-  return results.map((o, i) => ({
-    url: o.url,
-    title: o.title ?? null,
-    snippet: null,
-    publishedAt: parseDate(o.publishedDate),
-    rank: i + 1,
-    raw: o,
-  }));
+  return results.map((o, i) => {
+    const summary = parseSummary(o.summary);
+    const { text, ...rawWithoutText } = o;
+    return {
+      url: o.url,
+      title: o.title ?? null,
+      snippet: null,
+      publishedAt: parseDate(o.publishedDate),
+      rank: i + 1,
+      raw: rawWithoutText,
+      contents: {
+        skills: summary.skills ?? null,
+        success: summary.success ?? null,
+        remoteEligibility: normalizeRemote(summary.remote_eligibility),
+        highlights: Array.isArray(o.highlights) && o.highlights.length ? o.highlights.join(" … ") : null,
+        pageText: typeof text === "string" ? text.slice(0, PAGE_TEXT_MAX_CHARS) : null,
+      },
+    };
+  });
 }
 
 async function storeResults({ search, run, source, query, results }) {
@@ -302,10 +369,25 @@ async function storeResults({ search, run, source, query, results }) {
         title = COALESCE(candidates.title, EXCLUDED.title),
         snippet = COALESCE(candidates.snippet, EXCLUDED.snippet),
         published_at = COALESCE(candidates.published_at, EXCLUDED.published_at)
-      RETURNING *, (xmax = 0) AS inserted
+      RETURNING id, (xmax = 0) AS inserted
     `;
     if (candidate.inserted) inserted++;
     else updated++;
+
+    if (r.contents) {
+      const c = r.contents;
+      await sql`
+        UPDATE candidates SET
+          skills = COALESCE(${c.skills}, skills),
+          success = COALESCE(${c.success}, success),
+          remote_eligibility = CASE WHEN ${c.remoteEligibility} = 'unknown' AND remote_eligibility IS NOT NULL
+                                    THEN remote_eligibility ELSE ${c.remoteEligibility} END,
+          highlights = COALESCE(${c.highlights}, highlights),
+          page_text = COALESCE(${c.pageText}, page_text),
+          contents_fetched_at = now()
+        WHERE id = ${candidate.id}
+      `;
+    }
 
     await sql`
       INSERT INTO sightings (candidate_id, search_id, run_id, source, query, rank, raw)
