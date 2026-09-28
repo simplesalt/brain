@@ -276,6 +276,9 @@ const DDL_STATEMENTS = [
   `ALTER TABLE searches ADD COLUMN IF NOT EXISTS google_jobs_queries text[] NOT NULL DEFAULT '{}'::text[]`,
   `ALTER TABLE searches ADD COLUMN IF NOT EXISTS google_jobs_run_at timestamptz`,
   `ALTER TABLE search_runs ADD COLUMN IF NOT EXISTS google_jobs_results int`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS live_status text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS live_checked_at timestamptz`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS live_detail text`,
   `CREATE TABLE IF NOT EXISTS excluded_employers (
     name text PRIMARY KEY,
     domains text[] NOT NULL DEFAULT '{}'::text[],
@@ -362,20 +365,23 @@ const DDL_STATEMENTS = [
              AND (SELECT coalesce(min(o.posted_at), min(o.published_at), min(o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id)
                  >= now() - interval '1 month'
              AND coalesce(c.is_job_posting, true)
+             AND coalesce(c.live_status, 'unknown') <> 'closed'
              AND NOT EXISTS (SELECT 1 FROM candidates o WHERE o.role_id = c.role_id AND o.employer_sector IN ('security', 'technology'))
            ) AS considered,
            (SELECT max(o.employer_sector) FILTER (WHERE o.employer_sector IS NOT NULL) FROM candidates o WHERE o.role_id = c.role_id) AS employer_sector,
-           coalesce(c.is_job_posting, true) AS is_job_posting
+           coalesce(c.is_job_posting, true) AS is_job_posting,
+           c.live_status
     FROM candidates c
     WHERE c.is_role_primary`,
   `COMMENT ON COLUMN candidates.applicants IS 'Number of applicants the page reports (e.g. LinkedIn "Over 100 applicants"), when shown.'`,
   `COMMENT ON COLUMN candidates.posted_at IS 'Date the job was posted, as stated on the page.'`,
-  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, has 30 or fewer applicants (when stated), was posted within the last month, is a real job posting, is not at a security or technology company, and is not at an excluded employer.'`,
+  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, has 30 or fewer applicants (when stated), was posted within the last month, is a real job posting that is still open, is not at a security or technology company, and is not at an excluded employer.'`,
   `COMMENT ON COLUMN candidates.enriched_at IS 'When the enrichment stage last fetched this page directly to fill in employer and details and look for the primary source.'`,
   `COMMENT ON COLUMN candidates.primary_source_url IS 'Link from this page to the employer''s own or ATS posting, when one was found.'`,
   `COMMENT ON COLUMN candidates.found_via IS 'For postings discovered by following a link, the candidate whose page linked to it.'`,
   `COMMENT ON COLUMN searches.google_jobs_queries IS 'Queries run against Google for Jobs (via SerpApi) for this profile; one page of about 10 jobs each.'`,
   `COMMENT ON COLUMN searches.google_jobs_run_at IS 'When this search last ran its Google Jobs queries.'`,
+  `COMMENT ON COLUMN candidates.live_status IS 'live, closed (page gone or says the job is closed/filled) or unknown (site blocked the check); from a plain page fetch, rechecked daily.'`,
   `COMMENT ON TABLE excluded_employers IS 'Employers whose roles are excluded from discovery results, such as consulting firms. Edit freely; the worker re-applies it every cycle.'`,
   `COMMENT ON COLUMN excluded_employers.domains IS 'The employer''s own web domains; Exa searches skip these and postings on them are flagged.'`,
   `COMMENT ON COLUMN excluded_employers.patterns IS 'Case-insensitive Postgres regular expressions matched against a posting''s URL and title.'`,
@@ -738,6 +744,51 @@ async function enrichCandidates() {
   if (rows.length) {
     console.log(JSON.stringify({ at: new Date().toISOString(), event: "enriched", checked: rows.length, filled, followed, added, errors }));
   }
+}
+
+const LIVE_BATCH = Number(process.env.LIVE_BATCH ?? 10);
+const CLOSED_TEXT =
+  /no longer (accepting applications|available|open|active)|position (has been|is) (filled|closed)|job (has|is) (expired|closed|no longer)|this job (posting )?(has been|is) (removed|closed|filled)|posting (has )?(expired|closed)|job not found|requisition (is )?closed|applications? (are |is )?closed/i;
+
+async function checkLive(url) {
+  try {
+    const r = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(15000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; simplesalt-crawl/1.0)", Accept: "text/html,*/*" },
+    });
+    if (r.status === 404 || r.status === 410) return { status: "closed", detail: `HTTP ${r.status}` };
+    if (!r.ok) return { status: "unknown", detail: `HTTP ${r.status}` };
+    const text = (await r.text()).slice(0, 400000).replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ");
+    const m = text.match(CLOSED_TEXT);
+    if (m) return { status: "closed", detail: m[0] };
+    return { status: "live", detail: `HTTP ${r.status}` };
+  } catch (err) {
+    return { status: "unknown", detail: String(err.message).slice(0, 120) };
+  }
+}
+
+// Checks the primary posting of every role still in consideration, oldest check first, daily.
+async function checkLiveness() {
+  const rows = await sql`
+    SELECT c.id, c.canonical_url FROM candidates c
+    JOIN roles r ON r.role_id = c.role_id
+    WHERE c.is_role_primary AND r.considered
+      AND (c.live_checked_at IS NULL OR c.live_checked_at < now() - interval '1 day')
+    ORDER BY c.live_checked_at NULLS FIRST, c.id
+    LIMIT ${LIVE_BATCH}
+  `;
+  const tally = { live: 0, closed: 0, unknown: 0 };
+  for (const row of rows) {
+    const res = await checkLive(row.canonical_url);
+    tally[res.status]++;
+    await sql`
+      UPDATE candidates SET live_status = ${res.status}, live_detail = ${res.detail}, live_checked_at = now()
+      WHERE id = ${row.id}
+    `;
+  }
+  if (rows.length) console.log(JSON.stringify({ at: new Date().toISOString(), event: "liveness_checked", ...tally }));
+  return rows.length;
 }
 
 async function excludedDomains() {
@@ -1201,6 +1252,11 @@ async function tick() {
       if (await googleJobsBackfill()) return;
     } catch (err) {
       console.error(JSON.stringify({ at: new Date().toISOString(), event: "google_jobs_error", error: err.message }));
+    }
+    try {
+      await checkLiveness();
+    } catch (err) {
+      console.error(JSON.stringify({ at: new Date().toISOString(), event: "liveness_error", error: err.message }));
     }
     try {
       await enrichCandidates();
