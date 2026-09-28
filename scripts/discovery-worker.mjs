@@ -196,8 +196,8 @@ async function seed() {
       )
       VALUES (
         ${s.name}, ${s.role}, ${s.company_type}, ${s.responsibilities}, ${s.flavor},
-        ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(s.serper_queries)}::jsonb)),
-        ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(s.exa_queries)}::jsonb)), ${SEED_VERSION}, now()
+        ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(s.serper_queries)}::text::jsonb)),
+        ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(s.exa_queries)}::text::jsonb)), ${SEED_VERSION}, now()
       )
       ON CONFLICT (name) DO UPDATE SET
         role = EXCLUDED.role,
@@ -297,13 +297,13 @@ async function storeResults({ search, run, source, query, results }) {
 
     const [candidate] = await sql`
       INSERT INTO candidates (canonical_url, url, domain, title, snippet, published_at, sources)
-      VALUES (${canonical}, ${r.url}, ${domain}, ${r.title}, ${r.snippet}, ${r.publishedAt}, ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify([source])}::jsonb)))
+      VALUES (${canonical}, ${r.url}, ${domain}, ${r.title}, ${r.snippet}, ${r.publishedAt}, ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify([source])}::text::jsonb)))
       ON CONFLICT (canonical_url) DO UPDATE SET
         last_seen_at = now(),
         times_seen = candidates.times_seen + 1,
         sources = (
           SELECT array_agg(DISTINCT s ORDER BY s)
-          FROM unnest(candidates.sources || ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify([source])}::jsonb))) AS s
+          FROM unnest(candidates.sources || ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify([source])}::text::jsonb))) AS s
         ),
         title = COALESCE(candidates.title, EXCLUDED.title),
         snippet = COALESCE(candidates.snippet, EXCLUDED.snippet),
@@ -315,7 +315,7 @@ async function storeResults({ search, run, source, query, results }) {
 
     await sql`
       INSERT INTO sightings (candidate_id, search_id, run_id, source, query, rank, raw)
-      VALUES (${candidate.id}, ${search.id}, ${run.id}, ${source}, ${query}, ${r.rank}, ${JSON.stringify(r.raw)}::jsonb)
+      VALUES (${candidate.id}, ${search.id}, ${run.id}, ${source}, ${query}, ${r.rank}, ${JSON.stringify(r.raw)}::text::jsonb)
     `;
   }
   return { inserted, updated };
