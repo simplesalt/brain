@@ -43,8 +43,16 @@ const ROLE_SCHEMA = {
           type: "string",
           description: "Name of the company that will employ the hire, as named in the job description. Never the job board, aggregator or recruiting site hosting the listing (for example not Jobgether, Jobsy, Jobtrail, Hiring Camp, Built In, The Muse, Dice or Simplify). Empty if the page does not name the employer.",
         },
-        skills: { type: "string", description: "Special skills or expertise the employer wants." },
-        success: { type: "string", description: "What success looks like for this role." },
+        skills: {
+          type: "array",
+          items: { type: "string" },
+          description: "Special skills or expertise wanted, as short keyword phrases.",
+        },
+        success: {
+          type: "array",
+          items: { type: "string" },
+          description: "What success looks like in the role, as short keyword phrases.",
+        },
         employer_sector: {
           type: "string",
           enum: ["security", "technology", "other", "unknown"],
@@ -749,7 +757,7 @@ async function enrichCandidates() {
 const LLM_BATCH = Number(process.env.LLM_BATCH ?? 8);
 const LLM_MODELS = (process.env.LLM_MODELS ?? "minimax/minimax-m2.7,openai/gpt-oss-120b").split(",");
 const OPENROUTER_KEY_FILE = process.env.OPENROUTER_KEY_FILE ?? "/secrets/openrouter/api_key";
-const EXTRACT_VERSION = 1;
+const EXTRACT_VERSION = 2;
 
 async function openrouterKey() {
   try {
@@ -776,13 +784,33 @@ function parseJsonLoose(text) {
   }
 }
 
-async function llmExtract(key, { title, url, text }) {
+const BULLET_GUIDE = `For skills and success, give 3 to 8 terse keyword phrases each (2 to 5 words), not sentences.
+Keep named frameworks, standards, tools, domains and concrete duties; abbreviate standards (ISO 27001 -> ISO 27k).
+Drop years of experience, soft skills, and filler such as strong, deep, proven, experience in, understanding of, ability to, the role involves, success will be measured by.
+
+Example success. Text: "Success will be measured by the ability to define and govern security architecture that aligns with business strategy and reduces cyber risk. The role involves leading cross-functional teams to implement security patterns across cloud, data, AI, and identity platforms."
+Answer: ["define and govern security architecture", "lead teams", "cloud, data, AI, identity"]
+
+Example skills. Text: "10+ years of experience in cybersecurity, security architecture, or information security with focus on enterprise architecture and solution design; deep expertise in security architecture frameworks, secure design principles, and enterprise technology environments; strong understanding of cybersecurity frameworks (NIST CSF, ISO 27001) and regulatory requirements; experience leading architecture reviews, defining standards, and guiding secure solution development."
+Answer: ["security architecture frameworks", "secure design principles", "NIST CSF", "ISO 27k", "architecture reviews", "defining standards", "solution development"]`;
+
+// Turns a model's list (or a stray string) into one bullet per line for Excel.
+function bullets(v) {
+  const items = (Array.isArray(v) ? v : String(v ?? "").split(/\n|;\s*/))
+    .map((x) => String(x).replace(/^[\s•*-]+/, "").trim())
+    .filter((x) => meaningful(x));
+  return items.length ? items.map((x) => `• ${x}`).join("\n") : null;
+}
+
+async function llmExtract(key, { title, url, text, stated }) {
   const today = new Date().toISOString().slice(0, 10);
   const prompt = [
     `Today is ${today}. Extract facts about this job posting. Answer with one JSON object only, matching this JSON schema:`,
     JSON.stringify(ROLE_SCHEMA),
     `Also include "is_job_posting": true if the page is a single job posting, false if it is a list of jobs, a careers or benefits page, or anything else.`,
-    `Use empty strings where the page does not say. For skills and success, write one or two plain sentences.`,
+    `Use empty strings or empty lists where the page does not say.`,
+    BULLET_GUIDE,
+    ...(stated ? [`Stated qualifications and responsibilities from the listing:`, stated] : []),
     `Title: ${title ?? ""}`,
     `URL: ${url}`,
     `Page text:`,
@@ -820,7 +848,7 @@ async function extractWithLlm() {
   const key = await openrouterKey();
   if (!key) return 0;
   const rows = await sql`
-    SELECT c.id, c.title, c.canonical_url, c.page_text,
+    SELECT c.id, c.title, c.canonical_url, c.page_text, c.skills AS stated_skills, c.success AS stated_success,
            ('google_jobs' = ANY(c.sources)) AS from_google
     FROM candidates c
     WHERE c.page_text IS NOT NULL AND length(c.page_text) > 200
@@ -840,12 +868,15 @@ async function extractWithLlm() {
   const errors = [];
   for (const row of rows) {
     try {
-      const { model, out } = await llmExtract(key, { title: row.title, url: row.canonical_url, text: row.page_text });
+      const stated = [row.stated_skills && `Qualifications: ${row.stated_skills}`, row.stated_success && `Responsibilities: ${row.stated_success}`]
+        .filter(Boolean)
+        .join("\n");
+      const { model, out } = await llmExtract(key, { title: row.title, url: row.canonical_url, text: row.page_text, stated });
       const c = {
         employer: cleanEmployer(out.employer),
         employerSector: ["security", "technology", "other"].includes(String(out.employer_sector)) ? String(out.employer_sector) : null,
-        skills: meaningful(out.skills),
-        success: meaningful(out.success),
+        skills: bullets(out.skills),
+        success: bullets(out.success),
         remote: ["remote", "hybrid", "onsite"].includes(String(out.remote_eligibility)) ? String(out.remote_eligibility) : null,
         applicants: parseApplicants(out.applicants, null),
         postedAt: parsePostedDate(out.posted_date),
@@ -856,8 +887,8 @@ async function extractWithLlm() {
         UPDATE candidates SET
           employer = CASE WHEN ${g} THEN coalesce(employer, ${c.employer}) ELSE coalesce(${c.employer}, employer) END,
           employer_sector = coalesce(${c.employerSector}, employer_sector),
-          skills = CASE WHEN ${g} THEN coalesce(skills, ${c.skills}) ELSE coalesce(${c.skills}, skills) END,
-          success = CASE WHEN ${g} THEN coalesce(success, ${c.success}) ELSE coalesce(${c.success}, success) END,
+          skills = coalesce(${c.skills}, skills),
+          success = coalesce(${c.success}, success),
           remote_eligibility = CASE
             WHEN ${g} AND coalesce(remote_eligibility, 'unknown') <> 'unknown' THEN remote_eligibility
             ELSE coalesce(${c.remote}, remote_eligibility) END,
