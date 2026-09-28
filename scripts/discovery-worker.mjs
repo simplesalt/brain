@@ -4,8 +4,29 @@ import { SQL } from "bun";
 const DATABASE_URL = process.env.DATABASE_URL;
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 const EXA_API_KEY = process.env.EXA_API_KEY;
+const SERPAPI_KEY_FILE = process.env.SERPAPI_KEY_FILE ?? "/secrets/serpapi/api_key";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 30_000);
 const RESULTS_PER_QUERY = 20;
+
+// Read on every call: the Secret is mounted as a file, so a kubectl patch takes effect without a restart.
+async function serpapiKey() {
+  try {
+    const v = (await Bun.file(SERPAPI_KEY_FILE).text()).trim();
+    return v || null;
+  } catch {
+    return null;
+  }
+}
+
+// Google Jobs queries per seed profile, run through SerpApi. Only filled in where a search has none,
+// so agent edits are kept.
+const GOOGLE_JOBS_SEEDS = {
+  karen: ["security chief of staff remote", "chief of staff information security remote"],
+  terry: ["enterprise security architect remote", "principal security architect remote"],
+  dwayne: ["business information security officer remote", "BISO remote"],
+  chad: ["GRC manager remote", "governance risk and compliance manager remote"],
+  mario: ["security developer advocate remote", "security evangelist remote"],
+};
 const PAGE_TEXT_MAX_CHARS = 8000;
 
 const EXA_CONTENTS = {
@@ -252,6 +273,9 @@ const DDL_STATEMENTS = [
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS posted_at timestamptz`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS employer_sector text`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS is_job_posting boolean`,
+  `ALTER TABLE searches ADD COLUMN IF NOT EXISTS google_jobs_queries text[] NOT NULL DEFAULT '{}'::text[]`,
+  `ALTER TABLE searches ADD COLUMN IF NOT EXISTS google_jobs_run_at timestamptz`,
+  `ALTER TABLE search_runs ADD COLUMN IF NOT EXISTS google_jobs_results int`,
   `CREATE TABLE IF NOT EXISTS excluded_employers (
     name text PRIMARY KEY,
     domains text[] NOT NULL DEFAULT '{}'::text[],
@@ -350,6 +374,8 @@ const DDL_STATEMENTS = [
   `COMMENT ON COLUMN candidates.enriched_at IS 'When the enrichment stage last fetched this page directly to fill in employer and details and look for the primary source.'`,
   `COMMENT ON COLUMN candidates.primary_source_url IS 'Link from this page to the employer''s own or ATS posting, when one was found.'`,
   `COMMENT ON COLUMN candidates.found_via IS 'For postings discovered by following a link, the candidate whose page linked to it.'`,
+  `COMMENT ON COLUMN searches.google_jobs_queries IS 'Queries run against Google for Jobs (via SerpApi) for this profile; one page of about 10 jobs each.'`,
+  `COMMENT ON COLUMN searches.google_jobs_run_at IS 'When this search last ran its Google Jobs queries.'`,
   `COMMENT ON TABLE excluded_employers IS 'Employers whose roles are excluded from discovery results, such as consulting firms. Edit freely; the worker re-applies it every cycle.'`,
   `COMMENT ON COLUMN excluded_employers.domains IS 'The employer''s own web domains; Exa searches skip these and postings on them are flagged.'`,
   `COMMENT ON COLUMN excluded_employers.patterns IS 'Case-insensitive Postgres regular expressions matched against a posting''s URL and title.'`,
@@ -379,6 +405,13 @@ async function seed() {
     `;
   }
   await sql`UPDATE excluded_employers SET category = 'consulting' WHERE category IS NULL`;
+  for (const [name, queries] of Object.entries(GOOGLE_JOBS_SEEDS)) {
+    await sql`
+      UPDATE searches
+      SET google_jobs_queries = ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(queries)}::text::jsonb))
+      WHERE name = ${name} AND google_jobs_queries = '{}'::text[]
+    `;
+  }
   for (const s of SEEDS) {
     await sql`
       INSERT INTO searches (
@@ -867,6 +900,116 @@ async function saveContents(candidateId, c) {
   `;
 }
 
+function relativeAge(v) {
+  const m = String(v ?? "").match(/(\d+)\+?\s*(hour|day|week|month|year)s?\s+ago/i);
+  if (!m) return /just|today|hour/i.test(String(v ?? "")) ? new Date() : null;
+  const days = { hour: 1 / 24, day: 1, week: 7, month: 30, year: 365 }[m[2].toLowerCase()] * Number(m[1]);
+  return new Date(Date.now() - days * 86400000);
+}
+
+function remoteFromGoogle(job) {
+  if (job.detected_extensions?.work_from_home) return "remote";
+  const text = `${job.location ?? ""} ${job.description ?? ""}`;
+  if (/\bhybrid\b/i.test(text)) return "hybrid";
+  if (/\b(fully remote|100% remote|remote[- ]first|work from home|remote,? (us|usa|united states))\b/i.test(text)) return "remote";
+  if (/\b(on-?site|in[- ]office)\b/i.test(text)) return "onsite";
+  return "unknown";
+}
+
+function highlightItems(job, title) {
+  const h = (job.job_highlights ?? []).find((x) => new RegExp(title, "i").test(x.title ?? ""));
+  return h?.items?.length ? h.items.join("; ") : null;
+}
+
+// Best apply link: ATS or employer page first, then major boards, then anything else.
+function bestApplyLink(job) {
+  const links = (job.apply_options ?? []).map((o) => o.link).filter(Boolean);
+  const ranked = links
+    .map((link) => {
+      const c = canonicalizeUrl(link);
+      if (!c) return null;
+      return { link, rank: primaryRank({ domain: new URL(c).hostname, employer: job.company_name }) };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.rank - b.rank);
+  return ranked[0]?.link ?? job.share_link ?? null;
+}
+
+async function googleJobsSearch(q, key) {
+  const params = new URLSearchParams({ engine: "google_jobs", q, gl: "us", hl: "en", api_key: key });
+  const r = await fetch(`https://serpapi.com/search.json?${params}`);
+  if (!r.ok) throw new Error(`serpapi ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  const body = await r.json();
+  if (body.error && !/hasn't returned any results/i.test(body.error)) throw new Error(`serpapi: ${body.error}`);
+  return (body.jobs_results ?? []).map((job, i) => {
+    const { description, ...rawWithoutDescription } = job;
+    return {
+      url: bestApplyLink(job),
+      title: job.title ?? null,
+      snippet: null,
+      publishedAt: null,
+      rank: i + 1,
+      raw: rawWithoutDescription,
+      contents: {
+        employer: cleanEmployer(job.company_name),
+        employerSector: null,
+        skills: highlightItems(job, "qualif"),
+        success: highlightItems(job, "responsib"),
+        remoteEligibility: remoteFromGoogle(job),
+        highlights: null,
+        pageText: typeof description === "string" ? description.slice(0, PAGE_TEXT_MAX_CHARS) : null,
+        applicants: null,
+        postedAt: relativeAge(job.detected_extensions?.posted_at),
+      },
+    };
+  });
+}
+
+async function runGoogleJobs(search, run, key, counts, errors) {
+  for (const q of search.google_jobs_queries ?? []) {
+    try {
+      const results = (await googleJobsSearch(q, key)).filter((r) => r.url);
+      counts.google_jobs += results.length;
+      const r = await storeResults({ search, run, source: "google_jobs", query: q, results });
+      counts.inserted += r.inserted;
+      counts.updated += r.updated;
+    } catch (err) {
+      errors.push(`google_jobs[${q}]: ${err.message}`);
+    }
+  }
+  await sql`UPDATE searches SET google_jobs_run_at = now() WHERE id = ${search.id}`;
+}
+
+// Runs Google Jobs once for searches that have never run it, as soon as a SerpApi key is present,
+// without re-running their Exa queries.
+async function googleJobsBackfill() {
+  const key = await serpapiKey();
+  if (!key) return false;
+  const [search] = await sql`
+    SELECT id, name, to_jsonb(google_jobs_queries) AS google_jobs_queries
+    FROM searches
+    WHERE google_jobs_run_at IS NULL AND cardinality(google_jobs_queries) > 0
+    ORDER BY id
+    LIMIT 1
+  `;
+  if (!search) return false;
+  const [run] = await sql`
+    INSERT INTO search_runs (search_id, started_at, status) VALUES (${search.id}, now(), 'running') RETURNING *
+  `;
+  const counts = { google_jobs: 0, inserted: 0, updated: 0 };
+  const errors = [];
+  await runGoogleJobs(search, run, key, counts, errors);
+  const status = errors.length ? "error" : "ok";
+  await sql`
+    UPDATE search_runs SET finished_at = now(), status = ${status}, google_jobs_results = ${counts.google_jobs},
+      candidates_inserted = ${counts.inserted}, candidates_updated = ${counts.updated},
+      error = ${errors.length ? errors.join(" | ") : null}
+    WHERE id = ${run.id}
+  `;
+  console.log(JSON.stringify({ at: new Date().toISOString(), event: "google_jobs_backfill", search: search.name, ...counts, errors }));
+  return true;
+}
+
 async function storeResults({ search, run, source, query, results }) {
   let inserted = 0;
   let updated = 0;
@@ -908,7 +1051,8 @@ async function claimSearch() {
     const [search] = await tx`
       SELECT id, name,
         to_jsonb(serper_queries) AS serper_queries,
-        to_jsonb(exa_queries) AS exa_queries
+        to_jsonb(exa_queries) AS exa_queries,
+        to_jsonb(google_jobs_queries) AS google_jobs_queries
       FROM searches
       WHERE run_requested_at IS NOT NULL
         AND (last_run_started_at IS NULL OR run_requested_at > last_run_started_at)
@@ -928,7 +1072,7 @@ async function claimSearch() {
 }
 
 async function runSearch(search, run) {
-  const counts = { serper: 0, exa: 0, inserted: 0, updated: 0 };
+  const counts = { serper: 0, exa: 0, google_jobs: 0, inserted: 0, updated: 0 };
   const errors = [];
 
   for (const q of search.serper_queries ?? []) {
@@ -955,12 +1099,16 @@ async function runSearch(search, run) {
     }
   }
 
+  const googleKey = await serpapiKey();
+  if (googleKey && (search.google_jobs_queries ?? []).length) await runGoogleJobs(search, run, googleKey, counts, errors);
+
   const status = errors.length ? "error" : "ok";
   const errorText = errors.length ? errors.join(" | ") : null;
 
   await sql`
     UPDATE search_runs SET
       finished_at = now(),
+      google_jobs_results = ${counts.google_jobs},
       status = ${status},
       serper_results = ${counts.serper},
       exa_results = ${counts.exa},
@@ -983,6 +1131,7 @@ async function runSearch(search, run) {
       search: search.name,
       serper_results: counts.serper,
       exa_results: counts.exa,
+      google_jobs_results: counts.google_jobs,
       inserted: counts.inserted,
       updated: counts.updated,
       errors: errors.length,
@@ -1030,6 +1179,11 @@ async function tick() {
     return;
   }
   if (!claimed) {
+    try {
+      if (await googleJobsBackfill()) return;
+    } catch (err) {
+      console.error(JSON.stringify({ at: new Date().toISOString(), event: "google_jobs_error", error: err.message }));
+    }
     try {
       await enrichCandidates();
     } catch (err) {

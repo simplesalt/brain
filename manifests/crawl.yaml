@@ -33,6 +33,19 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: serpapi-api-key
+  namespace: ssint-main-crawl
+  labels:
+    entity: ssint
+    env: main
+    capability: crawl
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -190,7 +203,14 @@ spec:
             - name: discovery-worker-script
               mountPath: /scripts
               readOnly: true
+            - name: serpapi-api-key
+              mountPath: /secrets/serpapi
+              readOnly: true
       volumes:
         - name: discovery-worker-script
           configMap:
             name: discovery-worker-script
+        - name: serpapi-api-key
+          secret:
+            secretName: serpapi-api-key
+            optional: true
