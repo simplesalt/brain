@@ -404,6 +404,7 @@ async function runSearch(search, run) {
       inserted: counts.inserted,
       updated: counts.updated,
       errors: errors.length,
+      error_detail: errors.length ? errors.map((e) => e.slice(0, 300)) : undefined,
     }),
   );
 }
