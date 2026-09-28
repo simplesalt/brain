@@ -135,6 +135,8 @@ spec:
 apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
 kind: TrustTunnelCloudflaredConfig
 metadata:
+  annotations:
+    crossplane.io/external-name: "83c27a64-4074-474c-9a8f-19448d1c2081"
   name: ssint-main-tunnel-config
   labels:
     entity: ssint
@@ -162,6 +164,7 @@ metadata:
     env: main
     capability: access
 spec:
+  deletionPolicy: Orphan
   forProvider:
     zoneId: 260b251cdb53f8376875a8eb8d03ca0b
     name: info
