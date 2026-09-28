@@ -10,10 +10,6 @@ const PAGE_TEXT_MAX_CHARS = 8000;
 
 const EXA_CONTENTS = {
   text: { maxCharacters: PAGE_TEXT_MAX_CHARS },
-  highlights: {
-    query: "Required skills and expertise, what success looks like in this role, and whether the role can be done remotely",
-    maxCharacters: 1000,
-  },
   summary: {
     query: "What special skills or expertise is desired? What does success look like for this role? Can the role be done remotely?",
     schema: {
@@ -29,8 +25,16 @@ const EXA_CONTENTS = {
           enum: ["remote", "hybrid", "onsite", "unknown"],
           description: "remote if the role can be done fully remotely, hybrid if partly, onsite if not, unknown if the page does not say.",
         },
+        applicants: {
+          type: "string",
+          description: "Number of applicants the page states, digits only (use 100 for 'over 100 applicants', 25 for 'be among the first 25 applicants'). Empty if not stated.",
+        },
+        posted_date: {
+          type: "string",
+          description: "Date the job was posted, as YYYY-MM-DD, resolving relative dates like '3 weeks ago' against today. Empty if not stated.",
+        },
       },
-      required: ["employer", "skills", "success", "remote_eligibility"],
+      required: ["employer", "skills", "success", "remote_eligibility", "applicants", "posted_date"],
     },
   },
 };
@@ -220,6 +224,8 @@ const DDL_STATEMENTS = [
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS enriched_at timestamptz`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS primary_source_url text`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS found_via bigint REFERENCES candidates (id)`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS applicants int`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS posted_at timestamptz`,
   `CREATE TABLE IF NOT EXISTS excluded_employers (
     name text PRIMARY KEY,
     domains text[] NOT NULL DEFAULT '{}'::text[],
@@ -293,10 +299,22 @@ const DDL_STATEMENTS = [
            (SELECT string_agg(DISTINCT s.name, ', ') FROM candidates o
               JOIN sightings g ON g.candidate_id = o.id JOIN searches s ON s.id = g.search_id
              WHERE o.role_id = c.role_id) AS profiles,
-           (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) AS excluded_employer
+           (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) AS excluded_employer,
+           (SELECT max(o.applicants) FROM candidates o WHERE o.role_id = c.role_id) AS applicants,
+           (SELECT min(coalesce(o.posted_at, o.published_at, o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id) AS posted_at,
+           (
+             (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) IS NULL
+             AND coalesce((SELECT o.remote_eligibility FROM candidates o WHERE o.role_id = c.role_id AND o.remote_eligibility <> 'unknown'
+                           ORDER BY o.is_role_primary DESC LIMIT 1), 'unknown') = 'remote'
+             AND coalesce((SELECT max(o.applicants) FROM candidates o WHERE o.role_id = c.role_id), 0) <= 30
+             AND (SELECT min(coalesce(o.posted_at, o.published_at, o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id)
+                 >= now() - interval '1 month'
+           ) AS considered
     FROM candidates c
     WHERE c.is_role_primary`,
-  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies.'`,
+  `COMMENT ON COLUMN candidates.applicants IS 'Number of applicants the page reports (e.g. LinkedIn "Over 100 applicants"), when shown.'`,
+  `COMMENT ON COLUMN candidates.posted_at IS 'Date the job was posted, as stated on the page.'`,
+  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, has 30 or fewer applicants (when stated), was posted within the last month, and is not at an excluded employer.'`,
   `COMMENT ON COLUMN candidates.enriched_at IS 'When the enrichment stage last fetched this page directly to fill in employer and details and look for the primary source.'`,
   `COMMENT ON COLUMN candidates.primary_source_url IS 'Link from this page to the employer''s own or ATS posting, when one was found.'`,
   `COMMENT ON COLUMN candidates.found_via IS 'For postings discovered by following a link, the candidate whose page linked to it.'`,
@@ -526,11 +544,16 @@ async function clusterRoles() {
 const ENRICH_BATCH = Number(process.env.ENRICH_BATCH ?? 5);
 const SKIP_LINK_HOSTS = /(^|\.)(linkedin\.com|facebook\.com|twitter\.com|x\.com|instagram\.com|youtube\.com|google\.com|apple\.com|t\.co|bit\.ly)$/;
 
-async function exaContents(urls, withLinks) {
+async function exaContents(urls, withLinks, fresh = false) {
   const r = await fetch("https://api.exa.ai/contents", {
     method: "POST",
     headers: { "x-api-key": EXA_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ urls, ...EXA_CONTENTS, ...(withLinks ? { extras: { links: 50 } } : {}) }),
+    body: JSON.stringify({
+      urls,
+      ...EXA_CONTENTS,
+      ...(withLinks ? { extras: { links: 50 } } : {}),
+      ...(fresh ? { maxAgeHours: 0 } : {}),
+    }),
   });
   if (!r.ok) throw new Error(`exa contents ${r.status}: ${(await r.text()).slice(0, 200)}`);
   const body = await r.json();
@@ -564,12 +587,14 @@ function pickPrimaryLink(links, fromDomain, employer) {
 // from generic boards to the primary source, which role clustering then prefers.
 async function enrichCandidates() {
   const rows = await sql`
-    SELECT id, canonical_url, domain, employer, job_title
+    SELECT id, canonical_url, domain, employer, job_title, enrich_attempts
     FROM candidates
     WHERE excluded_employer IS NULL
-      AND enrich_attempts < 1
-      AND (employer IS NULL OR skills IS NULL OR success IS NULL OR highlights IS NULL
-           OR (is_role_primary AND primary_source_url IS NULL))
+      AND (
+        (enrich_attempts < 2 AND (employer IS NULL OR skills IS NULL OR success IS NULL
+                                  OR coalesce(remote_eligibility, 'unknown') = 'unknown'))
+        OR (enrich_attempts < 1 AND is_role_primary AND primary_source_url IS NULL)
+      )
     ORDER BY is_role_primary DESC NULLS LAST, id
     LIMIT ${ENRICH_BATCH}
   `;
@@ -578,7 +603,8 @@ async function enrichCandidates() {
   for (const row of rows) {
     await sql`UPDATE candidates SET enrich_attempts = enrich_attempts + 1, enriched_at = now() WHERE id = ${row.id}`;
     try {
-      const [page] = await exaContents([row.canonical_url], true);
+      // A retry asks Exa for a fresh crawl, since its cached copy already came back incomplete.
+      const [page] = await exaContents([row.canonical_url], true, row.enrich_attempts >= 1);
       if (!page) continue;
       const c = contentsFrom(page);
       await saveContents(row.id, c);
@@ -727,7 +753,26 @@ function contentsFrom(o) {
     remoteEligibility: normalizeRemote(summary.remote_eligibility),
     highlights: Array.isArray(o.highlights) && o.highlights.length ? o.highlights.join(" … ") : null,
     pageText: typeof o.text === "string" ? o.text.slice(0, PAGE_TEXT_MAX_CHARS) : null,
+    applicants: parseApplicants(summary.applicants, o.text),
+    postedAt: parsePostedDate(summary.posted_date),
   };
+}
+
+// Applicant count from the summary, falling back to phrases like "Over 100 applicants" in the page text.
+function parseApplicants(fromSummary, text) {
+  const n = Number(String(fromSummary ?? "").replace(/[^0-9]/g, ""));
+  if (String(fromSummary ?? "").trim() && Number.isFinite(n) && n > 0) return n;
+  const m = String(text ?? "").match(/(?:over|more than)?\s*(\d[\d,]*)\+?\s+applicants|first\s+(\d+)\s+applicants/i);
+  if (!m) return null;
+  const v = Number((m[1] ?? m[2]).replace(/,/g, ""));
+  return Number.isFinite(v) ? v : null;
+}
+
+function parsePostedDate(v) {
+  const m = String(v ?? "").match(/^\d{4}-\d{2}-\d{2}$/);
+  if (!m) return null;
+  const d = new Date(`${m[0]}T00:00:00Z`);
+  return Number.isNaN(d.getTime()) || d > new Date() ? null : d;
 }
 
 async function saveContents(candidateId, c) {
@@ -740,6 +785,8 @@ async function saveContents(candidateId, c) {
                                 THEN remote_eligibility ELSE ${c.remoteEligibility} END,
       highlights = COALESCE(${c.highlights}, highlights),
       page_text = COALESCE(${c.pageText}, page_text),
+      applicants = COALESCE(${c.applicants ?? null}, applicants),
+      posted_at = COALESCE(${c.postedAt ?? null}, posted_at),
       contents_fetched_at = now()
     WHERE id = ${candidateId}
   `;
@@ -953,7 +1000,10 @@ async function logDuplicateReport() {
              count(*) FILTER (WHERE coalesce(url, '') = '')::int AS blank_url,
              count(*) FILTER (WHERE coalesce(employer, '') = '')::int AS blank_employer,
              count(*) FILTER (WHERE coalesce(skills, '') = '')::int AS blank_skills,
-             count(*) FILTER (WHERE coalesce(highlights, '') = '')::int AS blank_highlights,
+             count(*) FILTER (WHERE coalesce(success, '') = '')::int AS blank_success,
+             count(*) FILTER (WHERE coalesce(remote_eligibility, 'unknown') = 'unknown')::int AS unknown_remote,
+             count(*) FILTER (WHERE applicants IS NOT NULL)::int AS with_applicants,
+             count(*) FILTER (WHERE considered)::int AS considered,
              (array_agg(url) FILTER (WHERE coalesce(domain, '') = ''))[1:5] AS blank_domain_samples
       FROM roles
     `;
