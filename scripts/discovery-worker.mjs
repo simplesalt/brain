@@ -14,7 +14,7 @@ if (!EXA_API_KEY) throw new Error("EXA_API_KEY is required");
 const sql = new SQL(DATABASE_URL);
 
 // Bump this to re-request every seed search on the next restart, even if it already ran.
-const SEED_VERSION = 2;
+const SEED_VERSION = 3;
 
 const SEEDS = [
   {
@@ -25,10 +25,7 @@ const SEEDS = [
       "Project manager and fixer for security efforts; drives cross-functional execution for the CISO organization.",
     flavor:
       "Look for program-management language (roadmaps, OKRs, cross-team coordination) paired with security scope; filter out pure EA/admin roles with no security remit.",
-    serper_queries: [
-      '"Security Chief of Staff" OR "Chief of Staff, Security" (site:boards.greenhouse.io OR site:jobs.lever.co OR site:myworkdayjobs.com OR site:jobs.ashbyhq.com)',
-      '"Chief of Staff" "CISO" (site:boards.greenhouse.io OR site:jobs.lever.co OR site:myworkdayjobs.com OR site:jobs.ashbyhq.com)',
-    ],
+    serper_queries: [],
     exa_queries: [
       "Job posting for a Security Chief of Staff who acts as a program manager and fixer for a large enterprise security organization",
     ],
@@ -41,10 +38,7 @@ const SEEDS = [
       "Pushes architecture standards out to business divisions; some internal evangelism to drive adoption.",
     flavor:
       "Favor postings that mention setting or governing standards across multiple divisions/BUs, not just building one system; evangelism/advocacy language is a good signal.",
-    serper_queries: [
-      '"Security Architect" "enterprise architecture" (site:boards.greenhouse.io OR site:jobs.lever.co OR site:myworkdayjobs.com OR site:jobs.ashbyhq.com)',
-      '"Principal Security Architect" OR "Enterprise Security Architect" (site:boards.greenhouse.io OR site:jobs.lever.co OR site:myworkdayjobs.com OR site:jobs.ashbyhq.com)',
-    ],
+    serper_queries: [],
     exa_queries: [
       "Job posting for a Security Architect at a Fortune 500 company who defines security architecture standards and drives adoption across business divisions",
     ],
@@ -57,10 +51,7 @@ const SEEDS = [
       "Embedded in one division; improves security metrics and posture for that division specifically.",
     flavor:
       "Prefer postings tied to a single business unit/division rather than an enterprise-wide CISO role; metrics/posture-improvement language is a good signal.",
-    serper_queries: [
-      '"Business Information Security Officer" OR "BISO" (site:boards.greenhouse.io OR site:jobs.lever.co OR site:myworkdayjobs.com OR site:jobs.ashbyhq.com)',
-      '"BISO" division security metrics (site:boards.greenhouse.io OR site:jobs.lever.co OR site:myworkdayjobs.com OR site:jobs.ashbyhq.com)',
-    ],
+    serper_queries: [],
     exa_queries: [
       "Job posting for a Business Information Security Officer (BISO) embedded in a division of a large enterprise, responsible for security risk metrics and posture",
     ],
@@ -72,10 +63,7 @@ const SEEDS = [
     responsibilities: "Drives governance, risk, and compliance program delivery.",
     flavor:
       "Delivery/execution language (managing audits, controls, frameworks like SOX/ISO/NIST) is a stronger signal than pure policy-writing roles.",
-    serper_queries: [
-      '"GRC Manager" OR "Governance Risk and Compliance Manager" (site:boards.greenhouse.io OR site:jobs.lever.co OR site:myworkdayjobs.com OR site:jobs.ashbyhq.com)',
-      '"Manager, GRC" OR "GRC Program Manager" security (site:boards.greenhouse.io OR site:jobs.lever.co OR site:myworkdayjobs.com OR site:jobs.ashbyhq.com)',
-    ],
+    serper_queries: [],
     exa_queries: [
       "Job posting for a Governance, Risk, and Compliance (GRC) Manager at a large enterprise, driving delivery of GRC programs and compliance initiatives",
     ],
@@ -87,10 +75,7 @@ const SEEDS = [
     responsibilities: "Evangelizes security practices to developers; represents security externally.",
     flavor:
       "Best fit is a hybrid dev-facing + security role (advocacy, conference talks, content); plain product-marketing or pure AppSec-engineer roles are weaker matches.",
-    serper_queries: [
-      '"Security Developer Advocate" OR "Developer Evangelist" security (site:boards.greenhouse.io OR site:jobs.lever.co OR site:jobs.ashbyhq.com)',
-      '"Security Evangelist" software (site:boards.greenhouse.io OR site:jobs.lever.co OR site:jobs.ashbyhq.com)',
-    ],
+    serper_queries: [],
     exa_queries: [
       "Job posting for a security developer evangelist or developer advocate role at a software company, engaging developers on security best practices",
     ],
