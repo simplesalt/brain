@@ -204,7 +204,7 @@ const USER_EXCLUDED = [
   { name: "Nike India", domains: [], patterns: [String.raw`nike\s*india`], category: "user excluded" },
 ];
 
-const TITLE_VERSION = 2;
+const TITLE_VERSION = 3;
 
 const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS searches (
@@ -457,7 +457,7 @@ function normalizeTitle(raw) {
   if (!raw) return null;
   let t = String(raw).replace(/\s+/g, " ").trim();
   t = t.replace(/^(job application for|applying to|apply(?: now)? (?:for|to)|careers?\s*[-:|]|jobs?\s*[-:|]|now hiring:?|hiring:?|we'?re hiring:?|opening:?)\s*/i, "");
-  t = t.replace(/\s+job details\b/i, "");
+  t = t.replace(/\s+job details\b/i, "").replace(/\s+job$/i, "");
   t = t.replace(/,?\s*[$£€]\s?\d[\d,.]*k?(\s*[-–]\s*[$£€]?\s?\d[\d,.]*k?)?(\s*(per|\/)\s*(year|yr|hour|hr))?/gi, "");
   t = t.replace(/\s*[([][^)\]]*(remote|hybrid|on-?site|united states|usa)[^)\]]*[)\]]/gi, "");
   const parts = t.split(/\s+[|–—·•]\s+|\s+-\s+|\s*::\s*/).map((x) => x.trim()).filter(Boolean);
@@ -760,6 +760,12 @@ async function openrouterKey() {
   }
 }
 
+// Models sometimes answer "Not specified" instead of leaving a field empty.
+function meaningful(v) {
+  const t = String(v ?? "").trim();
+  return !t || /^(n\/?a|none|unknown|not (specified|stated|mentioned|provided)\b.*)$/i.test(t) ? null : t;
+}
+
 function parseJsonLoose(text) {
   const t = String(text ?? "").replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
   try {
@@ -838,8 +844,8 @@ async function extractWithLlm() {
       const c = {
         employer: cleanEmployer(out.employer),
         employerSector: ["security", "technology", "other"].includes(String(out.employer_sector)) ? String(out.employer_sector) : null,
-        skills: String(out.skills ?? "").trim() || null,
-        success: String(out.success ?? "").trim() || null,
+        skills: meaningful(out.skills),
+        success: meaningful(out.success),
         remote: ["remote", "hybrid", "onsite"].includes(String(out.remote_eligibility)) ? String(out.remote_eligibility) : null,
         applicants: parseApplicants(out.applicants, null),
         postedAt: parsePostedDate(out.posted_date),
