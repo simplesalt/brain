@@ -590,6 +590,15 @@ async function enrichCandidates() {
     SELECT id, canonical_url, domain, employer, job_title, enrich_attempts
     FROM candidates
     WHERE excluded_employer IS NULL
+      -- No follow-up spend on roles already ruled out for a known reason.
+      AND NOT EXISTS (
+        SELECT 1 FROM roles r
+        WHERE r.role_id = candidates.role_id
+          AND (r.excluded_employer IS NOT NULL
+               OR r.remote_eligibility IN ('hybrid', 'onsite')
+               OR r.applicants > 30
+               OR r.posted_at < now() - interval '1 month')
+      )
       AND (
         (enrich_attempts < 2 AND (employer IS NULL OR skills IS NULL OR success IS NULL
                                   OR coalesce(remote_eligibility, 'unknown') = 'unknown'))
