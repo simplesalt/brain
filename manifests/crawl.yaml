@@ -49,6 +49,18 @@ spec:
       database: crawl
       owner: crawl
   managed:
+    services:
+      additional:
+        - selectorType: rw
+          serviceTemplate:
+            metadata:
+              name: crawl-pg-lan
+              labels:
+                entity: ssint
+                env: main
+                capability: crawl
+            spec:
+              type: LoadBalancer
     roles:
       - name: crawl_read
         ensure: present
