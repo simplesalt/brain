@@ -10,7 +10,20 @@ metadata:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: crawl-api-keys
+  name: serper-api-key
+  namespace: ssint-main-crawl
+  labels:
+    entity: ssint
+    env: main
+    capability: crawl
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: exa-api-key
   namespace: ssint-main-crawl
   labels:
     entity: ssint
