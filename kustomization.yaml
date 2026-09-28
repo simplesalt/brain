@@ -17,7 +17,6 @@ resources:
   - manifests/coding-fe.yaml
   - manifests/cloudflare-zero-trust-main.yaml
   - manifests/gcp-sso.yaml
-  - manifests/simplesalt-certs.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
