@@ -367,25 +367,42 @@ const DDL_STATEMENTS = [
            (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) AS excluded_employer,
            (SELECT max(o.applicants) FROM candidates o WHERE o.role_id = c.role_id) AS applicants,
            (SELECT coalesce(min(o.posted_at), min(o.published_at), min(o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id) AS posted_at,
-           (
-             (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) IS NULL
-             AND coalesce((SELECT o.remote_eligibility FROM candidates o WHERE o.role_id = c.role_id AND o.remote_eligibility <> 'unknown'
-                           ORDER BY o.is_role_primary DESC LIMIT 1), 'unknown') = 'remote'
-             AND coalesce((SELECT max(o.applicants) FROM candidates o WHERE o.role_id = c.role_id), 0) <= 30
-             AND (SELECT coalesce(min(o.posted_at), min(o.published_at), min(o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id)
-                 >= now() - interval '1 month'
-             AND coalesce(c.is_job_posting, true)
-             AND coalesce(c.live_status, 'unknown') <> 'closed'
-             AND NOT EXISTS (SELECT 1 FROM candidates o WHERE o.role_id = c.role_id AND o.employer_sector IN ('security', 'technology'))
-           ) AS considered,
+           (a.excluded IS NULL AND a.remote = 'remote' AND a.applicants <= 30 AND a.posted >= now() - interval '1 month'
+            AND a.is_job AND a.live <> 'closed' AND NOT a.tech AND NOT a.extract_failed AND a.has_detail) AS considered,
            (SELECT max(o.employer_sector) FILTER (WHERE o.employer_sector IS NOT NULL) FROM candidates o WHERE o.role_id = c.role_id) AS employer_sector,
            coalesce(c.is_job_posting, true) AS is_job_posting,
-           c.live_status
+           c.live_status,
+           CASE
+             WHEN a.excluded IS NOT NULL THEN 'excluded employer: ' || a.excluded
+             WHEN a.tech THEN 'security or tech company'
+             WHEN NOT a.is_job THEN 'not a job posting'
+             WHEN a.live = 'closed' THEN 'posting closed'
+             WHEN a.remote <> 'remote' THEN 'not remote (' || a.remote || ')'
+             WHEN a.posted < now() - interval '1 month' THEN 'posted over a month ago'
+             WHEN a.applicants > 30 THEN 'over 30 applicants'
+             WHEN a.extract_failed THEN 'details could not be extracted'
+             WHEN NOT a.has_detail THEN 'no skills or success found'
+           END AS not_considered_reason
     FROM candidates c
+    CROSS JOIN LATERAL (
+      SELECT
+        (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) AS excluded,
+        coalesce((SELECT o.remote_eligibility FROM candidates o WHERE o.role_id = c.role_id AND o.remote_eligibility <> 'unknown'
+                  ORDER BY o.is_role_primary DESC LIMIT 1), 'unknown') AS remote,
+        coalesce((SELECT max(o.applicants) FROM candidates o WHERE o.role_id = c.role_id), 0) AS applicants,
+        (SELECT coalesce(min(o.posted_at), min(o.published_at), min(o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id) AS posted,
+        coalesce(c.is_job_posting, true) AS is_job,
+        coalesce(c.live_status, 'unknown') AS live,
+        EXISTS (SELECT 1 FROM candidates o WHERE o.role_id = c.role_id AND o.employer_sector IN ('security', 'technology')) AS tech,
+        (c.extract_version IS NOT NULL AND c.extract_model IS NULL) AS extract_failed,
+        (c.extract_version IS NULL
+         OR EXISTS (SELECT 1 FROM candidates o WHERE o.role_id = c.role_id
+                    AND (coalesce(o.skills, '') <> '' OR coalesce(o.success, '') <> ''))) AS has_detail
+    ) a
     WHERE c.is_role_primary`,
   `COMMENT ON COLUMN candidates.applicants IS 'Number of applicants the page reports (e.g. LinkedIn "Over 100 applicants"), when shown.'`,
   `COMMENT ON COLUMN candidates.posted_at IS 'Date the job was posted, as stated on the page.'`,
-  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, has 30 or fewer applicants (when stated), was posted within the last month, is a real job posting that is still open, is not at a security or technology company, and is not at an excluded employer.'`,
+  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, has 30 or fewer applicants (when stated), was posted within the last month, is a real job posting that is still open, is not at a security or technology company, is not at an excluded employer, and had its details extracted. not_considered_reason gives the first rule a role failed.'`,
   `COMMENT ON COLUMN candidates.enriched_at IS 'When the enrichment stage last fetched this page directly to fill in employer and details and look for the primary source.'`,
   `COMMENT ON COLUMN candidates.primary_source_url IS 'Link from this page to the employer''s own or ATS posting, when one was found.'`,
   `COMMENT ON COLUMN candidates.found_via IS 'For postings discovered by following a link, the candidate whose page linked to it.'`,
