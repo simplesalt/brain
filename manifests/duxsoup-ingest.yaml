@@ -95,6 +95,9 @@ data:
     const DATABASE_URL = process.env.DATABASE_URL ?? '';
 
     const DUXSOUP_API_KEY = process.env.DUXSOUP_API_KEY ?? '';
+    const DUXSOUP_USER_ID = process.env.DUXSOUP_USER_ID ?? '';
+    const DUXSOUP_BASE_URL = process.env.DUXSOUP_BASE_URL ?? 'https://app.dux-soup.com';
+    const SETTINGS_POLL_INTERVAL_MS = Number(process.env.SETTINGS_POLL_INTERVAL_MS ?? 6 * 60 * 60 * 1000);
 
     const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain.ssint-main-ai:3131/mcp';
     const GBRAIN_TOKEN = process.env.GBRAIN_REMOTE_TOKEN ?? '';
@@ -110,6 +113,9 @@ data:
     }
     if (!DUXSOUP_API_KEY) {
       console.error('WARN: DUXSOUP_API_KEY not set — /duxsoup/events will reject every request with 401');
+    }
+    if (!DUXSOUP_USER_ID || !DUXSOUP_API_KEY) {
+      console.error('WARN: DUXSOUP_USER_ID / DUXSOUP_API_KEY not fully set — duxsoup-settings poll will be skipped');
     }
 
     const sql = new SQL(DATABASE_URL);
@@ -202,6 +208,148 @@ data:
         return false;
       }
       return timingSafeEqual(ab, bb);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Dux Soup settings/queue poll (read-only; startup + every
+    // SETTINGS_POLL_INTERVAL_MS, default 6h). Signs GET requests exactly as
+    // hermes-msg's duxGet() does (HMAC-SHA1 over the full URL, base64).
+    // Never POSTs and never writes any Dux Soup setting, schedule, webhook or
+    // queue.
+    // https://support.dux-soup.com/article/228-the-user-settings-api
+    // https://support.dux-soup.com/article/230-queue-management-api
+    // ---------------------------------------------------------------------------
+
+    const SENSITIVE_KEY_RE = /token|secret|key|password|auth|signature|credential/i;
+
+    function duxSign(payload) {
+      return createHmac('sha1', DUXSOUP_API_KEY).update(payload).digest('base64');
+    }
+
+    // GET-only; pathSuffix is always a fixed literal ('/settings' or
+    // '/queue/size'), never interpolated from external input.
+    async function duxGet(pathSuffix) {
+      const fullUrl = `${DUXSOUP_BASE_URL}/xapi/remote/control/${DUXSOUP_USER_ID}${pathSuffix}`;
+      const signature = duxSign(fullUrl);
+      const r = await fetch(fullUrl, {
+        headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': signature },
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`${r.status}: ${text.slice(0, 200)}`);
+      try { return JSON.parse(text); } catch { return text; }
+    }
+
+    // Removes the configured userid/API key (and, defensively, any
+    // /xapi/remote/control/<id> segment) from a string before it is logged,
+    // in case a thrown error ever echoes the request URL.
+    function stripSecrets(s) {
+      let out = String(s ?? '');
+      if (DUXSOUP_USER_ID) out = out.split(DUXSOUP_USER_ID).join('<redacted>');
+      if (DUXSOUP_API_KEY) out = out.split(DUXSOUP_API_KEY).join('<redacted>');
+      out = out.replace(/\/xapi\/remote\/control\/[^/\s]+/gi, '/xapi/remote/control/<redacted>');
+      return out;
+    }
+
+    function isShortEnumString(v) {
+      return typeof v === 'string' && v.length > 0 && v.length <= 24 && !/^https?:\/\//i.test(v);
+    }
+
+    // Reduces a webhook URL to its host and a path where every segment
+    // except the last is replaced by "<masked>"; the query string (and any
+    // token it carries) is dropped entirely, never inspected.
+    function maskWebhookUrl(u) {
+      try {
+        const url = new URL(String(u));
+        const segments = url.pathname.split('/').filter(Boolean);
+        let path;
+        if (segments.length === 0) path = '/';
+        else if (segments.length === 1) path = `/${segments[0]}`;
+        else path = `/${segments.slice(0, -1).map(() => '<masked>').join('/')}/${segments[segments.length - 1]}`;
+        return { host: url.hostname, path };
+      } catch {
+        return { host: null, path: null };
+      }
+    }
+
+    // Dux Soup does not document the webhook entry shape, so the URL-bearing
+    // field is found by value (first http(s) string) rather than assumed by
+    // key name. Any field named like a secret is always dropped; every
+    // remaining field is kept verbatim only when it is a boolean, number, or
+    // short enum-like string — anything else (a long or opaque value) is
+    // dropped rather than guessed at.
+    function redactWebhookEntry(entry) {
+      if (typeof entry === 'string') return maskWebhookUrl(entry);
+      if (!entry || typeof entry !== 'object') return { host: null, path: null };
+      let urlKey = null;
+      for (const [k, v] of Object.entries(entry)) {
+        if (typeof v === 'string' && /^https?:\/\//i.test(v)) { urlKey = k; break; }
+      }
+      const urlPart = urlKey ? maskWebhookUrl(entry[urlKey]) : { host: null, path: null };
+      const safe = {};
+      for (const [k, v] of Object.entries(entry)) {
+        if (k === urlKey || SENSITIVE_KEY_RE.test(k)) continue;
+        if (typeof v === 'boolean' || typeof v === 'number' || isShortEnumString(v)) safe[k] = v;
+      }
+      return { ...urlPart, ...safe };
+    }
+
+    function redactSettings(settings) {
+      const s = settings && typeof settings === 'object' ? settings : {};
+      const raw = s.webhooks;
+      const webhooks = Array.isArray(raw) ? raw : (raw != null ? [raw] : []);
+      return {
+        webhookprofileflag: s.webhookprofileflag ?? null,
+        webhooks_count: webhooks.length,
+        webhooks: webhooks.map(redactWebhookEntry),
+        setting_keys: Object.keys(s),
+      };
+    }
+
+    function extractQueueSize(resp) {
+      if (typeof resp === 'number') return resp;
+      if (typeof resp === 'string') {
+        const trimmed = resp.trim();
+        const n = Number(trimmed);
+        return trimmed !== '' && Number.isFinite(n) ? n : trimmed.slice(0, 100);
+      }
+      if (resp && typeof resp === 'object') {
+        for (const k of ['size', 'count', 'total', 'queuesize', 'queueSize']) {
+          if (typeof resp[k] === 'number') return resp[k];
+        }
+      }
+      return null;
+    }
+
+    // Reads settings and queue size read-only and logs one redacted JSON
+    // line. A failed read logs one warning line and leaves the other value
+    // as null; it never throws, so it can never crash the process or affect
+    // readiness, the heartbeat, or event processing (it runs on its own
+    // timer, independent of tick()).
+    async function pollDuxSoupSettings() {
+      if (!DUXSOUP_USER_ID || !DUXSOUP_API_KEY) {
+        console.error('duxsoup-settings-poll: DUXSOUP_USER_ID / DUXSOUP_API_KEY not configured; skipping');
+        return;
+      }
+      let settingsRedacted = null;
+      let queueSize = null;
+      try {
+        settingsRedacted = redactSettings(await duxGet('/settings'));
+      } catch (e) {
+        console.error(`duxsoup-settings-poll: settings read failed: ${stripSecrets(e?.message ?? e).slice(0, 300)}`);
+      }
+      try {
+        queueSize = extractQueueSize(await duxGet('/queue/size'));
+      } catch (e) {
+        console.error(`duxsoup-settings-poll: queue size read failed: ${stripSecrets(e?.message ?? e).slice(0, 300)}`);
+      }
+      if (!settingsRedacted && queueSize == null) return;
+      console.log(`duxsoup-settings: ${JSON.stringify({
+        webhookprofileflag: settingsRedacted?.webhookprofileflag ?? null,
+        webhooks_count: settingsRedacted?.webhooks_count ?? null,
+        webhooks: settingsRedacted?.webhooks ?? null,
+        setting_keys: settingsRedacted?.setting_keys ?? null,
+        queue_size: queueSize,
+      })}`);
     }
 
     // ---------------------------------------------------------------------------
@@ -851,6 +999,11 @@ data:
       tick();
       setInterval(tick, PROCESS_INTERVAL_MS);
 
+      const settingsPoll = () => pollDuxSoupSettings()
+        .catch((e) => console.error(`duxsoup-settings-poll: unexpected failure: ${stripSecrets(e?.message ?? e).slice(0, 300)}`));
+      settingsPoll();
+      setInterval(settingsPoll, SETTINGS_POLL_INTERVAL_MS);
+
       Bun.serve({
         port: PORT,
         async fetch(req) {
@@ -918,6 +1071,12 @@ spec:
                 secretKeyRef:
                   name: duxsoup-api-key
                   key: api_key
+                  optional: true
+            - name: DUXSOUP_USER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-user-id
+                  key: user_id
                   optional: true
             - name: GBRAIN_MCP_URL
               value: http://gbrain.ssint-main-ai:3131/mcp
