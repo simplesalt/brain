@@ -34,7 +34,7 @@ services:
     before_first_stop:
       - "Pin the hermes-agent skills sync to the gbrain server SHA (see pinned_in) so it moves with each stop."
       - "Give the gbrain Deployment a Recreate strategy (or scale to 0 per hop) so no older gbrain process overlaps a newer schema."
-      - "Pin the oven/bun image to a version >= 1.3.11 (today floating oven/bun:1-alpine); Bun >= 1.3.11 is enforced at startup from v0.50.5.0."
+      - "Pin oven/bun to 1.4.2-alpine (sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f) in every container and initContainer of the gbrain Deployment and Job: Bun >= 1.3.11 is enforced from v0.50.5.0, and 1.4.2 is in upstream's musl native-lock CI matrix while the floating oven/bun:1-alpine currently resolves to 1.4.0, which is not."
       - "Add a startupProbe to the gbrain container: liveness gives ~160s and /health waits for migrations."
       - "gbrain-pg has no backup automation: tracked in simplesalt/projects#549; until it lands take a manual pg_dump where a stop asks for one."
       - "DONE: Job gbrain-migrate-embedding-dims-2 carries kustomize.toolkit.fluxcd.io/force: enabled, so a SHA bump recreates it instead of failing the brain Kustomization on its immutable pod template (Flux re-creates it after its 3600s TTL, so it usually exists)."
@@ -89,6 +89,8 @@ services:
         before:
           - "put_page callers (calendar-collector, duxsoup-ingest, email-collector) already send expected_revision (from get_page.revision) or force: true (simplesalt/projects#658); the current pin ignores unknown params, so callers can change first."
           - "Take a fresh pg_dump of gbrain-pg; rehearse this hop on a restored copy first."
+          - "gbrain sources list --json shows local_path null on every non-archived source and gbrain config get sync.repo_path is unset; if either is set, stop: on Postgres a source root without a claimed writer refuses writes with owner_unavailable."
+          - "Do not run apply-migrations, sources writer claim or sources writer activate: init applies the schema, and the brain stays unmanaged with database-only writes (activation needs persistent canonical checkout and lock dirs we do not have, and refuses cycle.conversation_facts_backfill)."
           - "Save a timeline row-count baseline to compare after the hop."
           - "Bump both install-gbrain SHAs and the skills-sync pin to this SHA in one commit; Recreate or scale to 0."
         validate:
@@ -101,6 +103,9 @@ services:
           - "Timeline row counts match the saved baseline."
           - "put_page on an existing slug without revision returns isError revision_conflict; with expected_revision or force it succeeds."
           - "gbrain doctor/repair preview is clean."
+          - "gbrain sources writer status --probe --json: native_lock.target linux-x64-musl with acquired true, enabled false, no worktrees or bindings, every onboarding source database_only (none claim_required), publication_concurrency >= 1."
+          - "gbrain container startup log contains 'Resolve IPC:' (its absence means the native lock addon failed to load)."
+          - "Smoke put_page and add_timeline_entry receipts show persistence.mode database, never owner_unavailable or write_pending; afterwards writer status blockers are empty and no '[persistence] phase=' lines appear in either container log."
           - "One email-collector and one calendar-collector CronJob run completes."
           - "Autopilot cycle completes and embed --stale succeeds."
           - "Job gbrain-migrate-embedding-dims-2 logs 'already vector(1536)'."
@@ -121,6 +126,8 @@ services:
           - "Startup log shows 'hermes-mcp bearer asserted'."
           - "GET /health returns 200 with the version."
           - "Bearer MCP smoke: search, get_page, put_page (with expected_revision or force), add_timeline_entry, put_raw_data."
+          - "Re-run the v0.60.5.0 writer checks (writer status probe, 'Resolve IPC:' log line, database-mode receipts, empty blockers); writer status shows a single writer version 0.60.11.0."
+          - "gbrain doctor shows unbound_source ok; leave persistence.unbound_write unset (it only covers put_page, not add_timeline_entry)."
           - "Timeline row counts still match the baseline; gbrain stats before and after shows facts dropped only by the one-time fact-expiry migration (174)."
           - "Autopilot cycle completes and embed --stale succeeds."
           - "Job gbrain-migrate-embedding-dims-2 logs 'already vector(1536)'."
