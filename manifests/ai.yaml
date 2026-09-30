@@ -308,6 +308,7 @@ metadata:
     capability: ai
   annotations:
     kustomize.toolkit.fluxcd.io/ssa: merge
+    kustomize.toolkit.fluxcd.io/force: enabled
 spec:
   activeDeadlineSeconds: 14400
   ttlSecondsAfterFinished: 3600
