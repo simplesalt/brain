@@ -141,7 +141,7 @@ services:
     target: {version: v2026.9.24, pin: sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7, date: 2026-09-24}
     notes:
       - "Pins are multi-arch index digests of the dated tag. Never the floating :latest (sha256:d4da4a40... differs from the v2026.9.24 tag and was re-pushed ~10h later)."
-      - "Curated release notes exist only for v2026.7.1, v2026.7.20, v2026.8.3 and v2026.8.31; v2026.9.7 through v2026.9.24 all defer to v0.22.0 notes, which had not shipped as of 2026-09-30 (v2026.9.24 = v0.21.5). Hold full prod trust in the uncurated stops until they ship."
+      - "Curated release notes exist only for v2026.7.1, v2026.7.20, v2026.8.3 and v2026.8.31; v2026.9.11 has its own state.db patch-release write-up; v2026.9.7, v2026.9.14, v2026.9.21 and v2026.9.24 defer to v0.22.0 notes, which had not shipped as of 2026-09-30 (v2026.9.24 = v0.21.5). Hold full prod trust in the uncurated stops until they ship."
       - "Probes are TCP 9119 only: API (8642), webhook (8644) and gateway health are unprobed, so every stop relies on the explicit validate checks."
       - "/opt/data is a 5Gi emptyDir: all state and any lazy installs rebuild on every pod recreation."
       - "Existing bug, not caused by the version gap: hermes writes ~/.hindsight/claude-code.json in a nested snake_case shape that does not match upstream's flat camelCase schema (bankId/recallBudget/recallMaxTokens/recallTypes); reconcile the writer separately."
@@ -241,7 +241,7 @@ services:
         pin: sha256:ffa391a77284e49f6b55e32c86f33529ac4257831407b14038a72b6a0a232039
         date: 2026-07-29
         alembic: {revisions: 13, long_running: ["3 CONCURRENTLY index builds"], lossy: ["2 cold-archive column drops"]}
-        why: "Prove the hop mechanics on cheap additive migrations before the larger hops."
+        why: "Smallest hop: prove the mechanics (in-process migrations inside the startupProbe window, non-superuser role, CONCURRENTLY builds, config-apply hook) before the larger, destructive 0.9.x hop."
         before:
           - "Take a DB dump of hindsight-pg (2 lossy cold-archive column drops cannot be undone without it)."
           - "Change only values.image.digest."
