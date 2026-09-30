@@ -33,6 +33,22 @@ spec:
   install:
     createNamespace: false
     timeout: 10m
+  upgrade:
+    timeout: 20m
   values:
     image:
       digest: "sha256:7c069db2d7aeeae82d3d3917292b87b14d6547f979c8b1335a42c94d09d57213"
+  postRenderers:
+    - kustomize:
+        patches:
+          - target:
+              kind: Deployment
+              name: hindsight
+            patch: |
+              - op: add
+                path: /spec/template/spec/containers/0/startupProbe
+                value:
+                  tcpSocket:
+                    port: 8888
+                  periodSeconds: 10
+                  failureThreshold: 90
