@@ -69,7 +69,7 @@ metadata:
     env: main
     capability: crawl
 spec:
-  imageName: ghcr.io/cloudnative-pg/postgresql:17
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
   bootstrap:
     initdb:
       database: crawl
@@ -135,7 +135,7 @@ spec:
     spec:
       containers:
         - name: dbcheck
-          image: ghcr.io/cloudnative-pg/postgresql:17
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
