@@ -5,8 +5,34 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 const EXA_API_KEY = process.env.EXA_API_KEY;
 const SERPAPI_KEY_FILE = process.env.SERPAPI_KEY_FILE ?? "/secrets/serpapi/api_key";
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 30_000);
+// Guard on every drain-until-empty loop in a cycle; hitting it is logged as loop_cap_hit.
+const MAX_LOOP_ITERATIONS = 200;
 const RESULTS_PER_QUERY = 20;
+
+// A detail that could not be found holds one of these in the field itself: NOT_MENTIONED when the
+// page does not state it, or `${CANT_FIND}: <reason>` when fetching or extraction failed (with
+// "; max retries hit" appended once a temporary failure used up its tries). Every reader treats
+// both exactly like a blank (see found() here and found_detail() in SQL).
+const NOT_MENTIONED = "not mentioned";
+const CANT_FIND = "can't find";
+const MAX_RETRIES_NOTE = "max retries hit";
+
+// A posting's details are tried this many times when the failure is temporary: the first try, one
+// retry RETRY_DELAY_MS later in the same cycle, and one more try in the next cycle.
+const MAX_DETAIL_TRIES = 3;
+const RETRY_DELAY_MS = (() => {
+  const n = Number(process.env.RETRY_DELAY_MS ?? 15 * 60 * 1000);
+  return Number.isFinite(n) && n >= 0 ? n : 15 * 60 * 1000;
+})();
+
+// The detail's trimmed value, or null when it is missing: null, blank, 'unknown' or a marker.
+// Mirrors the found_detail() SQL function.
+function found(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v);
+  if (!s.trim() || s === "unknown" || s === NOT_MENTIONED || s.startsWith(CANT_FIND)) return null;
+  return s.trim();
+}
 
 // Read on every call: the Secret is mounted as a file, so a kubectl patch takes effect without a restart.
 async function serpapiKey() {
@@ -63,16 +89,12 @@ const ROLE_SCHEMA = {
           enum: ["remote", "hybrid", "onsite", "unknown"],
           description: "remote if the role can be done fully remotely, hybrid if partly, onsite if not, unknown if the page does not say.",
         },
-        applicants: {
-          type: "string",
-          description: "Number of applicants the page states, digits only (use 100 for 'over 100 applicants', 25 for 'be among the first 25 applicants'). Empty if not stated.",
-        },
         posted_date: {
           type: "string",
           description: "Date the job was posted, as YYYY-MM-DD, resolving relative dates like '3 weeks ago' against today. Empty if not stated.",
         },
       },
-      required: ["employer", "employer_sector", "skills", "success", "remote_eligibility", "applicants", "posted_date"],
+      required: ["employer", "employer_sector", "skills", "success", "remote_eligibility", "posted_date"],
     };
 
 if (!DATABASE_URL) throw new Error("DATABASE_URL is required");
@@ -81,7 +103,8 @@ if (!EXA_API_KEY) throw new Error("EXA_API_KEY is required");
 
 const sql = new SQL(DATABASE_URL);
 
-// Bump this to re-request every seed search on the next restart, even if it already ran.
+// Bump this to overwrite the seed searches' definitions on the next run. Every cycle already
+// requests every search, so it no longer controls whether a search runs.
 const SEED_VERSION = 5;
 
 const SEEDS = [
@@ -150,7 +173,7 @@ const SEEDS = [
   },
 ];
 
-// Re-applied every tick: CNPG may create the crawl_read role after this worker starts.
+// Applied once per cycle: CNPG may create the crawl_read role after the previous cycle ended.
 const READ_ROLE_GRANTS = `DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'crawl_read') THEN
       GRANT USAGE ON SCHEMA public TO crawl_read;
@@ -276,7 +299,6 @@ const DDL_STATEMENTS = [
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS enriched_at timestamptz`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS primary_source_url text`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS found_via bigint REFERENCES candidates (id)`,
-  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS applicants int`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS posted_at timestamptz`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS employer_sector text`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS is_job_posting boolean`,
@@ -289,6 +311,10 @@ const DDL_STATEMENTS = [
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS extract_version int`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS extract_model text`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS extracted_at timestamptz`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS detail_attempts int NOT NULL DEFAULT 0`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS detail_pending boolean NOT NULL DEFAULT false`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS detail_error text`,
+  `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS detail_tried_at timestamptz`,
   `CREATE TABLE IF NOT EXISTS excluded_employers (
     name text PRIMARY KEY,
     domains text[] NOT NULL DEFAULT '{}'::text[],
@@ -337,26 +363,49 @@ const DDL_STATEMENTS = [
   `COMMENT ON COLUMN candidates.first_seen_at IS 'When this URL was first discovered.'`,
   `COMMENT ON COLUMN candidates.last_seen_at IS 'When this URL was most recently discovered again.'`,
   `COMMENT ON COLUMN candidates.times_seen IS 'How many times this URL has been discovered across all searches and runs.'`,
-  `COMMENT ON COLUMN candidates.skills IS 'Special skills or expertise the posting asks for, summarized by Exa.'`,
-  `COMMENT ON COLUMN candidates.success IS 'What success looks like in the role, summarized by Exa.'`,
-  `COMMENT ON COLUMN candidates.remote_eligibility IS 'Whether the role can be done remotely: remote, hybrid, onsite or unknown, judged by Exa from the page.'`,
+  `COMMENT ON COLUMN candidates.skills IS 'Special skills or expertise the posting asks for, summarized by Exa. "not mentioned" means the page does not state it; "can''t find: <reason>" means fetching or extraction failed; both count as blank.'`,
+  `COMMENT ON COLUMN candidates.success IS 'What success looks like in the role, summarized by Exa. "not mentioned" means the page does not state it; "can''t find: <reason>" means fetching or extraction failed; both count as blank.'`,
+  `COMMENT ON COLUMN candidates.remote_eligibility IS 'Whether the role can be done remotely: remote, hybrid, onsite or unknown, judged by Exa from the page. "not mentioned" or "can''t find: <reason>" (fetching or extraction failed) count as unknown.'`,
   `COMMENT ON COLUMN candidates.highlights IS 'Most relevant sentences from the page about skills, success and remote work, joined with " … ".'`,
   `COMMENT ON COLUMN candidates.page_text IS 'Page text as fetched by Exa, capped in length.'`,
-  `COMMENT ON COLUMN candidates.job_title IS 'The job title alone, cleaned from the page title (company, site, location, remote markers and requisition IDs removed).'`,
+  `COMMENT ON COLUMN candidates.job_title IS 'The job title alone, cleaned from the page title (company, site, location, remote markers and requisition IDs removed). "not mentioned" or "can''t find: <reason>" count as blank.'`,
+  `COMMENT ON COLUMN candidates.employer_sector IS 'Kind of company the employer is: security, technology or other, judged from the page. "not mentioned" or "can''t find: <reason>" count as blank.'`,
   `COMMENT ON COLUMN candidates.excluded_employer IS 'Name of the excluded employer (see excluded_employers) this posting matches; null if not excluded.'`,
-  `COMMENT ON COLUMN candidates.employer IS 'Hiring company as named by Exa from the page (not the job board); used to match reposts of the same role.'`,
+  `COMMENT ON COLUMN candidates.employer IS 'Hiring company as named by Exa from the page (not the job board); used to match reposts of the same role. "not mentioned" means the page does not name it; "can''t find: <reason>" means fetching or extraction failed; both count as blank and never merge roles.'`,
   `COMMENT ON COLUMN candidates.role_id IS 'Identifies the real role: every repost of the same job on different sites shares one role_id.'`,
   `COMMENT ON COLUMN candidates.is_role_primary IS 'True for the one posting chosen to represent its role, preferring the employer''s own or ATS page.'`,
+  `CREATE OR REPLACE FUNCTION found_detail(v text) RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT CASE WHEN v IS NULL OR btrim(v) = '' OR v IN ('unknown', 'not mentioned') OR v LIKE 'can''t find%' THEN NULL ELSE v END $$`,
+  `COMMENT ON FUNCTION found_detail(text) IS 'The detail itself when it was found, or null when it is missing: null, blank, unknown, "not mentioned" (the page does not state it) or "can''t find: <reason>" (fetching or extraction failed). Every filter and merge rule reads details through this.'`,
+  // One-time: CREATE OR REPLACE cannot drop view columns, and the old view depends on the column
+  // dropped below, so a view that still has applicants goes first; READ_ROLE_GRANTS re-grants it
+  // right after migrate(). Later cycles replace the view in place, so readers never see it missing.
+  `DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'public' AND table_name = 'roles' AND column_name = 'applicants') THEN
+      DROP VIEW roles;
+    END IF;
+  END $$`,
+  `ALTER TABLE candidates DROP COLUMN IF EXISTS applicants`,
+  // Filters read found details only. Displayed details prefer a real value from any posting of the
+  // role (the primary first) and fall back to the primary's own value, so a marker shows only when
+  // no posting has anything real.
   `CREATE OR REPLACE VIEW roles AS
     SELECT c.role_id,
-           c.job_title,
-           coalesce(c.employer, (SELECT max(o.employer) FROM candidates o WHERE o.role_id = c.role_id)) AS employer,
-           (SELECT o.remote_eligibility FROM candidates o WHERE o.role_id = c.role_id AND o.remote_eligibility <> 'unknown'
-             ORDER BY o.is_role_primary DESC LIMIT 1) AS remote_eligibility,
+           coalesce(found_detail(c.job_title),
+                    (SELECT found_detail(o.job_title) FROM candidates o WHERE o.role_id = c.role_id AND found_detail(o.job_title) IS NOT NULL ORDER BY o.id LIMIT 1),
+                    c.job_title) AS job_title,
+           coalesce(found_detail(c.employer), (SELECT max(found_detail(o.employer)) FROM candidates o WHERE o.role_id = c.role_id), c.employer) AS employer,
+           coalesce((SELECT found_detail(o.remote_eligibility) FROM candidates o WHERE o.role_id = c.role_id AND found_detail(o.remote_eligibility) IS NOT NULL
+                      ORDER BY o.is_role_primary DESC LIMIT 1),
+                    nullif(c.remote_eligibility, 'unknown')) AS remote_eligibility,
            c.canonical_url AS url,
            c.domain,
-           coalesce(c.skills, (SELECT o.skills FROM candidates o WHERE o.role_id = c.role_id AND o.skills IS NOT NULL LIMIT 1)) AS skills,
-           coalesce(c.success, (SELECT o.success FROM candidates o WHERE o.role_id = c.role_id AND o.success IS NOT NULL LIMIT 1)) AS success,
+           coalesce(found_detail(c.skills),
+                    (SELECT found_detail(o.skills) FROM candidates o WHERE o.role_id = c.role_id AND found_detail(o.skills) IS NOT NULL LIMIT 1),
+                    c.skills) AS skills,
+           coalesce(found_detail(c.success),
+                    (SELECT found_detail(o.success) FROM candidates o WHERE o.role_id = c.role_id AND found_detail(o.success) IS NOT NULL LIMIT 1),
+                    c.success) AS success,
            coalesce(c.highlights, (SELECT o.highlights FROM candidates o WHERE o.role_id = c.role_id AND o.highlights IS NOT NULL LIMIT 1)) AS highlights,
            (SELECT min(o.published_at) FROM candidates o WHERE o.role_id = c.role_id) AS published_at,
            (SELECT max(o.last_seen_at) FROM candidates o WHERE o.role_id = c.role_id) AS last_seen_at,
@@ -365,11 +414,10 @@ const DDL_STATEMENTS = [
               JOIN sightings g ON g.candidate_id = o.id JOIN searches s ON s.id = g.search_id
              WHERE o.role_id = c.role_id) AS profiles,
            (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) AS excluded_employer,
-           (SELECT max(o.applicants) FROM candidates o WHERE o.role_id = c.role_id) AS applicants,
            (SELECT coalesce(min(o.posted_at), min(o.published_at), min(o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id) AS posted_at,
-           (a.excluded IS NULL AND a.remote = 'remote' AND a.applicants <= 30 AND a.posted >= now() - interval '1 month'
+           (a.excluded IS NULL AND a.remote = 'remote' AND a.posted >= now() - interval '1 month'
             AND a.is_job AND a.live <> 'closed' AND NOT a.tech AND NOT a.extract_failed AND a.has_detail) AS considered,
-           (SELECT max(o.employer_sector) FILTER (WHERE o.employer_sector IS NOT NULL) FROM candidates o WHERE o.role_id = c.role_id) AS employer_sector,
+           coalesce((SELECT max(found_detail(o.employer_sector)) FROM candidates o WHERE o.role_id = c.role_id), c.employer_sector) AS employer_sector,
            coalesce(c.is_job_posting, true) AS is_job_posting,
            c.live_status,
            CASE
@@ -379,7 +427,6 @@ const DDL_STATEMENTS = [
              WHEN a.live = 'closed' THEN 'posting closed'
              WHEN a.remote <> 'remote' THEN 'not remote (' || a.remote || ')'
              WHEN a.posted < now() - interval '1 month' THEN 'posted over a month ago'
-             WHEN a.applicants > 30 THEN 'over 30 applicants'
              WHEN a.extract_failed THEN 'details could not be extracted'
              WHEN NOT a.has_detail THEN 'no skills or success found'
            END AS not_considered_reason
@@ -387,9 +434,8 @@ const DDL_STATEMENTS = [
     CROSS JOIN LATERAL (
       SELECT
         (SELECT max(o.excluded_employer) FROM candidates o WHERE o.role_id = c.role_id) AS excluded,
-        coalesce((SELECT o.remote_eligibility FROM candidates o WHERE o.role_id = c.role_id AND o.remote_eligibility <> 'unknown'
+        coalesce((SELECT found_detail(o.remote_eligibility) FROM candidates o WHERE o.role_id = c.role_id AND found_detail(o.remote_eligibility) IS NOT NULL
                   ORDER BY o.is_role_primary DESC LIMIT 1), 'unknown') AS remote,
-        coalesce((SELECT max(o.applicants) FROM candidates o WHERE o.role_id = c.role_id), 0) AS applicants,
         (SELECT coalesce(min(o.posted_at), min(o.published_at), min(o.first_seen_at)) FROM candidates o WHERE o.role_id = c.role_id) AS posted,
         coalesce(c.is_job_posting, true) AS is_job,
         coalesce(c.live_status, 'unknown') AS live,
@@ -397,12 +443,11 @@ const DDL_STATEMENTS = [
         (c.extract_version IS NOT NULL AND c.extract_model IS NULL) AS extract_failed,
         (c.extract_version IS NULL
          OR EXISTS (SELECT 1 FROM candidates o WHERE o.role_id = c.role_id
-                    AND (coalesce(o.skills, '') <> '' OR coalesce(o.success, '') <> ''))) AS has_detail
+                    AND (found_detail(o.skills) IS NOT NULL OR found_detail(o.success) IS NOT NULL))) AS has_detail
     ) a
     WHERE c.is_role_primary`,
-  `COMMENT ON COLUMN candidates.applicants IS 'Number of applicants the page reports (e.g. LinkedIn "Over 100 applicants"), when shown.'`,
   `COMMENT ON COLUMN candidates.posted_at IS 'Date the job was posted, as stated on the page.'`,
-  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, has 30 or fewer applicants (when stated), was posted within the last month, is a real job posting that is still open, is not at a security or technology company, is not at an excluded employer, and had its details extracted. not_considered_reason gives the first rule a role failed.'`,
+  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, was posted within the last month, is a real job posting that is still open, is not at a security or technology company, is not at an excluded employer, and had its details extracted. not_considered_reason gives the first rule a role failed. A detail no posting of the role could supply shows as "not mentioned" (the page does not state it) or "can''t find: <reason>" (fetching or extraction failed); both count as missing in every rule.'`,
   `COMMENT ON COLUMN candidates.enriched_at IS 'When the enrichment stage last fetched this page directly to fill in employer and details and look for the primary source.'`,
   `COMMENT ON COLUMN candidates.primary_source_url IS 'Link from this page to the employer''s own or ATS posting, when one was found.'`,
   `COMMENT ON COLUMN candidates.found_via IS 'For postings discovered by following a link, the candidate whose page linked to it.'`,
@@ -413,6 +458,10 @@ const DDL_STATEMENTS = [
   `COMMENT ON COLUMN excluded_employers.domains IS 'The employer''s own web domains; Exa searches skip these and postings on them are flagged.'`,
   `COMMENT ON COLUMN excluded_employers.patterns IS 'Case-insensitive Postgres regular expressions matched against a posting''s URL and title.'`,
   `COMMENT ON COLUMN candidates.contents_fetched_at IS 'When the summary, highlights and page text were last refreshed.'`,
+  `COMMENT ON COLUMN candidates.detail_attempts IS 'Temporary failures so far while filling this posting''s details (fetching its page or extracting from it). After 3, the missing details get "can''t find: <reason>; max retries hit" and no more tries are made.'`,
+  `COMMENT ON COLUMN candidates.detail_pending IS 'True while a temporary failure awaits a retry: one 15 minutes later in the same cycle, then one in the next cycle.'`,
+  `COMMENT ON COLUMN candidates.detail_error IS 'Why the last attempt to fill this posting''s details failed (the reason written after "can''t find: "); null once an attempt succeeds.'`,
+  `COMMENT ON COLUMN candidates.detail_tried_at IS 'When the worker last tried to fill this posting''s details.'`,
 ];
 
 async function migrate() {
@@ -502,16 +551,18 @@ function normalizeTitle(raw) {
 }
 
 async function applyTitlesAndExclusions() {
+  // Placeholder text from a model is blanked, but the "not mentioned" marker is deliberate and stays.
   await sql`
     UPDATE candidates SET
-      skills = CASE WHEN skills ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))' THEN NULL ELSE skills END,
-      success = CASE WHEN success ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))' THEN NULL ELSE success END
-    WHERE skills ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))'
-       OR success ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))'
+      skills = CASE WHEN skills ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))' AND skills <> ${NOT_MENTIONED} THEN NULL ELSE skills END,
+      success = CASE WHEN success ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))' AND success <> ${NOT_MENTIONED} THEN NULL ELSE success END
+    WHERE (skills ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))' AND skills <> ${NOT_MENTIONED})
+       OR (success ~* '^\\s*(•\\s*)?(n/?a|none|unknown|not (specified|stated|mentioned|provided))' AND success <> ${NOT_MENTIONED})
   `;
+  // Only a real-looking name can be an aggregator to blank; a marker is not a name and stays.
   const named = await sql`SELECT id, employer FROM candidates WHERE employer IS NOT NULL`;
   for (const r of named) {
-    if (cleanEmployer(r.employer) === null) {
+    if (found(r.employer) !== null && cleanEmployer(r.employer) === null) {
       await sql`UPDATE candidates SET employer = NULL, enrich_attempts = LEAST(enrich_attempts, 1) WHERE id = ${r.id}`;
     }
   }
@@ -521,9 +572,14 @@ async function applyTitlesAndExclusions() {
     LIMIT 500
   `;
   for (const row of rows) {
+    const jobTitle = normalizeTitle(row.title);
+    // A marker job_title is never overwritten by a blank; a real cleaned title replaces it.
     await sql`
-      UPDATE candidates SET job_title = ${normalizeTitle(row.title)}, job_title_version = ${TITLE_VERSION},
-        is_job_posting = ${ROLE_WORDS.test(normalizeTitle(row.title) ?? "")}
+      UPDATE candidates SET
+        job_title = CASE WHEN ${jobTitle}::text IS NULL AND (job_title = ${NOT_MENTIONED} OR job_title LIKE ${`${CANT_FIND}%`})
+                         THEN job_title ELSE ${jobTitle}::text END,
+        job_title_version = ${TITLE_VERSION},
+        is_job_posting = ${ROLE_WORDS.test(jobTitle ?? "")}
       WHERE id = ${row.id}
     `;
   }
@@ -533,7 +589,7 @@ async function applyTitlesAndExclusions() {
       SELECT c2.id, (
         SELECT e.name FROM excluded_employers e
         WHERE EXISTS (SELECT 1 FROM unnest(e.domains) d WHERE c2.domain = d OR c2.domain LIKE '%.' || d)
-           OR EXISTS (SELECT 1 FROM unnest(e.patterns) p WHERE c2.canonical_url ~* p OR coalesce(c2.title, '') ~* p OR coalesce(c2.employer, '') ~* p)
+           OR EXISTS (SELECT 1 FROM unnest(e.patterns) p WHERE c2.canonical_url ~* p OR coalesce(c2.title, '') ~* p OR coalesce(found_detail(c2.employer), '') ~* p)
         ORDER BY e.name LIMIT 1
       ) AS name
       FROM candidates c2
@@ -586,15 +642,18 @@ function primaryRank(c) {
 // the URL, or the same title with closely matching skills/page text when the employer is unknown.
 async function clusterRoles() {
   const rows = await sql`
-    SELECT id, canonical_url, domain, lower(coalesce(job_title, title, '')) AS jt, employer,
+    SELECT id, canonical_url, domain, lower(coalesce(found_detail(job_title), title, '')) AS jt, employer,
            skills, highlights, left(page_text, 3000) AS page_text, first_seen_at, role_id, is_role_primary, found_via
     FROM candidates
   `;
-  // bigint columns may arrive as strings; key everything by number.
+  // bigint columns may arrive as strings; key everything by number. A missing employer or skills
+  // (blank, unknown or a marker) is null here, so an unknown employer stays a wildcard.
   for (const r of rows) {
     r.id = Number(r.id);
     r.role_id = r.role_id == null ? null : Number(r.role_id);
     r.found_via = r.found_via == null ? null : Number(r.found_via);
+    r.employer = found(r.employer);
+    r.skills = found(r.skills);
   }
   const parent = new Map(rows.map((r) => [r.id, r.id]));
   const find = (x) => {
@@ -671,21 +730,127 @@ async function clusterRoles() {
 
 const ENRICH_BATCH = Number(process.env.ENRICH_BATCH ?? 5);
 const SKIP_LINK_HOSTS = /(^|\.)(linkedin\.com|facebook\.com|twitter\.com|x\.com|instagram\.com|youtube\.com|google\.com|apple\.com|t\.co|bit\.ly)$/;
+const EXA_CONTENTS_TIMEOUT_MS = 60000;
+// Page text of this many characters or fewer is too little to extract details from.
+const MIN_PAGE_TEXT_CHARS = 200;
 
+// Why a posting's details could not be filled, typed so the caller knows whether trying again can
+// help. `temporary` failures may clear up (an outage, a rate limit, an account problem); persistent
+// ones will not (the page is gone, blocked or empty, or the model refuses it). `reason` is short,
+// plain, secret-free text that goes into the "can't find: <reason>" marker.
+class DetailError extends Error {
+  constructor(reason, temporary) {
+    super(reason);
+    this.name = "DetailError";
+    this.reason = reason;
+    this.temporary = temporary;
+  }
+}
+
+const REASON_MAX_CHARS = 120;
+
+// Provider error text can echo keys, tokens and links: strip those, squash whitespace, cap the length.
+function cleanReason(v, ...secrets) {
+  let s = String(v ?? "");
+  for (const k of [EXA_API_KEY, SERPER_API_KEY, ...secrets]) {
+    if (k && String(k).length >= 6) s = s.split(String(k)).join("***");
+  }
+  s = s
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/\bbearer\s+\S+/gi, "bearer ***")
+    .replace(/\b(?:sk|or|exa|key|token)[-_](?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{8,}/gi, "***")
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "***")
+    .replace(/\s+/g, " ")
+    .trim();
+  return s.length > REASON_MAX_CHARS ? `${s.slice(0, REASON_MAX_CHARS - 3).trimEnd()}...` : s;
+}
+
+const withDetail = (prefix, detail) => {
+  const d = String(detail ?? "").trim();
+  return d ? `${prefix}: ${d}` : prefix;
+};
+
+const isTimeout = (err) => err?.name === "TimeoutError" || err?.name === "AbortError";
+
+// The provider's own message from an error body: {"error": "..."} (Exa) or {"error": {"message": "..."}} (OpenRouter).
+function providerMessage(text) {
+  try {
+    const j = JSON.parse(text);
+    const e = j?.error;
+    return String(typeof e === "string" ? e : (e?.message ?? j?.message ?? ""));
+  } catch {
+    return String(text ?? "");
+  }
+}
+
+// Exa itself answered with an error status: nothing to do with the page. Every one is temporary so
+// a request bug (400/404) or an account problem keeps surfacing in the logs and gets retried.
+function exaHttpFailure(status, detail) {
+  if (status === 429) return new DetailError("page fetch rate-limited", true);
+  if (status === 401 || status === 402 || status === 403) return new DetailError(cleanReason(withDetail("page fetch account problem", detail)), true);
+  if (status >= 500) return new DetailError("page fetch service error", true);
+  return new DetailError("page fetch request rejected", true);
+}
+
+// /contents reports a per-URL failure inside a 200 response (statuses[].error.tag). `CRAWL_HTTP_<code>`
+// carries the target page's own HTTP status; any tag not listed here, like a missing result, is
+// treated as temporary.
+function exaStatusFailure(error) {
+  const tag = String(error?.tag ?? "");
+  const http = Number(tag.match(/^CRAWL_HTTP_(\d{3})$/)?.[1]);
+  if (tag === "CRAWL_NOT_FOUND") return new DetailError("page not found", false);
+  if (tag === "SOURCE_NOT_AVAILABLE") return new DetailError("page not available (blocked or login required)", false);
+  if (tag === "UNSUPPORTED_URL") return new DetailError("unsupported link", false);
+  if (tag === "CRAWL_TIMEOUT" || tag === "CRAWL_LIVECRAWL_TIMEOUT") return new DetailError("page timed out", true);
+  if (http === 404 || http === 410) return new DetailError("page gone", false);
+  if (http === 401 || http === 403 || http === 451) return new DetailError("page blocks access", false);
+  if (http === 408 || http === 429 || http >= 500) return new DetailError("page temporarily unavailable", true);
+  return new DetailError("page fetch failed", true);
+}
+
+// One outcome per requested URL, in order: { page } when Exa read it, or { failure } (a DetailError)
+// when it did not. A request-level failure (HTTP error, network, timeout) throws a DetailError instead.
 async function exaContents(urls, withLinks, fresh = false) {
-  const r = await fetch("https://api.exa.ai/contents", {
-    method: "POST",
-    headers: { "x-api-key": EXA_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      urls,
-      ...EXA_CONTENTS,
-      ...(withLinks ? { extras: { links: 50 } } : {}),
-      ...(fresh ? { maxAgeHours: 0 } : {}),
-    }),
+  let r;
+  try {
+    r = await fetch("https://api.exa.ai/contents", {
+      method: "POST",
+      headers: { "x-api-key": EXA_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        urls,
+        ...EXA_CONTENTS,
+        ...(withLinks ? { extras: { links: 50 } } : {}),
+        ...(fresh ? { maxAgeHours: 0 } : {}),
+      }),
+      signal: AbortSignal.timeout(EXA_CONTENTS_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new DetailError(isTimeout(err) ? "page fetch timed out" : "page fetch network error", true);
+  }
+  if (!r.ok) throw exaHttpFailure(r.status, providerMessage(await r.text().catch(() => "")));
+  let body;
+  try {
+    body = await r.json();
+  } catch {
+    throw new DetailError("page fetch failed", true);
+  }
+  const results = Array.isArray(body?.results) ? body.results : [];
+  const statuses = Array.isArray(body?.statuses) ? body.statuses : [];
+  // Results and statuses name the requested URL (url / id); with one URL there is nothing to match.
+  const pick = (list, u) => list.find((x) => x?.url === u || x?.id === u) ?? (urls.length === 1 ? list[0] : undefined);
+  return urls.map((u) => {
+    const page = pick(results, u);
+    if (page) return { page };
+    const status = pick(statuses, u);
+    return { failure: status?.status === "error" ? exaStatusFailure(status.error) : new DetailError("page fetch failed", true) };
   });
-  if (!r.ok) throw new Error(`exa contents ${r.status}: ${(await r.text()).slice(0, 200)}`);
-  const body = await r.json();
-  return body.results ?? [];
+}
+
+// One URL's page, or a DetailError saying why Exa could not read it.
+async function exaPage(url, withLinks, fresh = false) {
+  const [res] = await exaContents([url], withLinks, fresh);
+  if (res.failure) throw res.failure;
+  return res.page;
 }
 
 // Picks the link most likely to be the employer's own or ATS posting of this job.
@@ -711,11 +876,48 @@ function pickPrimaryLink(links, fromDomain, employer) {
   return best;
 }
 
-// Follow-up stage: fetch pages that lack employer or details, fill them in, and follow links
-// from generic boards to the primary source, which role clustering then prefers.
+// Follows a page's link to the employer's own or ATS posting of the same job and adds that posting
+// as a candidate (found_via this one) when it carries the same job title; it is new this cycle, so
+// fillDetails() picks it up. Best effort: a failure here goes into `errors` and never counts against
+// the page's own details.
+async function followPrimaryLink(row, page, c, tally, errors) {
+  try {
+    if (ATS_DOMAIN.test(row.domain)) return;
+    const link = pickPrimaryLink(page.extras?.links, row.domain, c.employer ?? found(row.employer));
+    if (!link) return;
+    const canonical = canonicalizeUrl(link);
+    await sql`UPDATE candidates SET primary_source_url = ${canonical} WHERE id = ${row.id}`;
+    tally.followed++;
+    const [existing] = await sql`SELECT id FROM candidates WHERE canonical_url = ${canonical}`;
+    if (existing) return;
+    const target = await exaPage(canonical, false);
+    // Only keep the linked page if it carries the same job title; an employer match alone let
+    // careers index pages and unrelated jobs through.
+    const targetContents = contentsFrom(target);
+    const sameTitle = normalizeTitle(target.title)?.toLowerCase() === String(found(row.job_title) ?? "").toLowerCase();
+    if (!sameTitle) return;
+    const [inserted] = await sql`
+      INSERT INTO candidates (canonical_url, url, domain, title, sources, found_via)
+      VALUES (${canonical}, ${link}, ${new URL(canonical).hostname}, ${target.title ?? null},
+              ARRAY['link']::text[], ${row.id})
+      ON CONFLICT (canonical_url) DO NOTHING
+      RETURNING id
+    `;
+    if (inserted) {
+      await saveContents(inserted.id, targetContents);
+      tally.added++;
+    }
+  } catch (err) {
+    errors.push(`link ${row.canonical_url}: ${err.reason ?? err.message}`.slice(0, 300));
+  }
+}
+
+// Link stage: fetch the page of each role's primary posting once, to find a link to the employer's
+// own or ATS posting of the job, which role clustering then prefers. Filling a posting's details is
+// fillDetails()'s job; it follows links too whenever it has to fetch a page itself.
 async function enrichCandidates() {
   const rows = await sql`
-    SELECT id, canonical_url, domain, employer, job_title, enrich_attempts
+    SELECT id, canonical_url, domain, employer, job_title
     FROM candidates
     WHERE excluded_employer IS NULL
       -- No follow-up spend on roles already ruled out for a known reason.
@@ -724,58 +926,31 @@ async function enrichCandidates() {
         WHERE r.role_id = candidates.role_id
           AND (r.excluded_employer IS NOT NULL
                OR r.remote_eligibility IN ('hybrid', 'onsite')
-               OR r.applicants > 30
                OR r.posted_at < now() - interval '1 month')
       )
-      AND (
-        (enrich_attempts < 2 AND page_text IS NULL)
-        OR (enrich_attempts < 1 AND is_role_primary AND primary_source_url IS NULL)
-      )
-    ORDER BY is_role_primary DESC NULLS LAST, id
+      AND enrich_attempts < 1 AND is_role_primary AND primary_source_url IS NULL
+    ORDER BY id
     LIMIT ${ENRICH_BATCH}
   `;
-  let filled = 0, followed = 0, added = 0;
+  let filled = 0;
+  const tally = { followed: 0, added: 0 };
   const errors = [];
   for (const row of rows) {
     await sql`UPDATE candidates SET enrich_attempts = enrich_attempts + 1, enriched_at = now() WHERE id = ${row.id}`;
     try {
-      // A retry asks Exa for a fresh crawl, since its cached copy already came back incomplete.
-      const [page] = await exaContents([row.canonical_url], true, row.enrich_attempts >= 1);
-      if (!page) continue;
+      const page = await exaPage(row.canonical_url, true);
       const c = contentsFrom(page);
       await saveContents(row.id, c);
       filled++;
-      if (ATS_DOMAIN.test(row.domain)) continue;
-      const link = pickPrimaryLink(page.extras?.links, row.domain, c.employer ?? row.employer);
-      if (!link) continue;
-      const canonical = canonicalizeUrl(link);
-      await sql`UPDATE candidates SET primary_source_url = ${canonical} WHERE id = ${row.id}`;
-      followed++;
-      const [existing] = await sql`SELECT id FROM candidates WHERE canonical_url = ${canonical}`;
-      if (existing) continue;
-      const [target] = await exaContents([canonical], false);
-      if (!target) continue;
-      // Only keep the linked page if it carries the same job title; an employer match alone let
-      // careers index pages and unrelated jobs through.
-      const targetContents = contentsFrom(target);
-      const sameTitle = normalizeTitle(target.title)?.toLowerCase() === String(row.job_title ?? "").toLowerCase();
-      if (!sameTitle) continue;
-      const [inserted] = await sql`
-        INSERT INTO candidates (canonical_url, url, domain, title, sources, found_via)
-        VALUES (${canonical}, ${link}, ${new URL(canonical).hostname}, ${target.title ?? null},
-                ARRAY['link']::text[], ${row.id})
-        ON CONFLICT (canonical_url) DO NOTHING
-        RETURNING id
-      `;
-      if (inserted) await saveContents(inserted.id, targetContents);
-      if (inserted) added++;
+      await followPrimaryLink(row, page, c, tally, errors);
     } catch (err) {
-      errors.push(`${row.canonical_url}: ${err.message}`.slice(0, 300));
+      errors.push(`${row.canonical_url}: ${err.reason ?? err.message}`.slice(0, 300));
     }
   }
   if (rows.length) {
-    console.log(JSON.stringify({ at: new Date().toISOString(), event: "enriched", checked: rows.length, filled, followed, added, errors }));
+    console.log(JSON.stringify({ at: new Date().toISOString(), event: "enriched", checked: rows.length, filled, ...tally, errors }));
   }
+  return rows.length;
 }
 
 const LLM_BATCH = Number(process.env.LLM_BATCH ?? 8);
@@ -794,7 +969,7 @@ async function openrouterKey() {
 
 // Models sometimes answer "Not specified" instead of leaving a field empty.
 function meaningful(v) {
-  const t = String(v ?? "").trim();
+  const t = found(v);
   return !t || /^(n\/?a|none|unknown|not (specified|stated|mentioned|provided)\b.*)$/i.test(t) ? null : t;
 }
 
@@ -826,6 +1001,64 @@ function bullets(v) {
   return items.length ? items.map((x) => `• ${x}`).join("\n") : null;
 }
 
+// OpenRouter's error codes, from an HTTP status or from an error inside a 200 response. 404 means the
+// model is not there: llmExtract() tries the next one.
+function modelStatusFailure(status, detail, key) {
+  if (status === 400) return new DetailError("model could not read the page", false);
+  if (status === 403) return new DetailError("model declined the page", false);
+  if (status === 404) return new DetailError("model unavailable", false);
+  if (status === 408 || status === 504) return new DetailError("model timed out", true);
+  if (status === 429) return new DetailError("model rate-limited", true);
+  if (status === 401 || status === 402) return new DetailError(cleanReason(withDetail("model account problem", detail), key), true);
+  if (status >= 500) return new DetailError("model service error", true);
+  return new DetailError(Number.isFinite(status) ? `model request failed (HTTP ${status})` : "model request failed", true);
+}
+
+// One model's answer as a JSON object, or a DetailError saying why there is none.
+async function llmCall(key, model, prompt) {
+  let r;
+  try {
+    r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        temperature: 0,
+      }),
+      signal: AbortSignal.timeout(90000),
+    });
+  } catch (err) {
+    throw new DetailError(isTimeout(err) ? "model timed out" : "model network error", true);
+  }
+  if (!r.ok) throw modelStatusFailure(r.status, providerMessage(await r.text().catch(() => "")), key);
+  let body;
+  try {
+    body = await r.json();
+  } catch {
+    throw new DetailError("model reply unreadable", true);
+  }
+  const choice = body?.choices?.[0];
+  // OpenRouter also reports errors inside a 200: a top-level error with no choices, or finish_reason "error".
+  if (body?.error && !choice) throw modelStatusFailure(Number(body.error.code), String(body.error.message ?? ""), key);
+  if (choice?.finish_reason === "error") throw new DetailError("model failed mid-reply", true);
+  const content = choice?.message?.content;
+  if (choice?.finish_reason === "length" && (typeof content !== "string" || !content.trim())) {
+    throw new DetailError("model ran out of output room", false);
+  }
+  let out = null;
+  try {
+    out = parseJsonLoose(content);
+  } catch {
+    // unreadable, handled below
+  }
+  if (!out || typeof out !== "object" || Array.isArray(out)) throw new DetailError("model reply unreadable", true);
+  return out;
+}
+
+// Tries the models in order. When every one fails the failure is temporary if any model's was (the
+// last such reason is the one reported), else persistent with the last reason.
 async function llmExtract(key, { title, url, text, stated }) {
   const today = new Date().toISOString().slice(0, 10);
   const prompt = [
@@ -841,101 +1074,248 @@ async function llmExtract(key, { title, url, text, stated }) {
     `Page text:`,
     String(text).slice(0, 12000),
   ].join("\n\n");
-  let lastErr;
+  const failures = [];
   for (const model of LLM_MODELS) {
     try {
-      const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "user", content: prompt }],
-          response_format: { type: "json_object" },
-          temperature: 0,
-        }),
-        signal: AbortSignal.timeout(90000),
-      });
-      if (!r.ok) throw new Error(`openrouter ${model} ${r.status}: ${(await r.text()).slice(0, 200)}`);
-      const body = await r.json();
-      const out = parseJsonLoose(body.choices?.[0]?.message?.content);
-      if (!out) throw new Error(`openrouter ${model}: unparseable reply`);
-      return { model, out };
+      return { model, out: await llmCall(key, model, prompt) };
     } catch (err) {
-      lastErr = err;
+      failures.push(err instanceof DetailError ? err : new DetailError("model network error", true));
     }
   }
-  throw lastErr;
+  const temporary = failures.filter((f) => f.temporary);
+  throw (temporary.length ? temporary.at(-1) : failures.at(-1)) ?? new DetailError("no model configured", true);
 }
 
-// Our model extracts details from page text for postings still in play. Values that came from
-// Google Jobs' structured data are kept; the model fills whatever is still blank or unknown.
-async function extractWithLlm() {
+// Our model's answer about a posting, as the values to store (null = the page does not state it).
+async function extractWithLlm(key, row, text) {
+  const statedSkills = found(row.stated_skills);
+  const statedSuccess = found(row.stated_success);
+  const stated = [statedSkills && `Qualifications: ${statedSkills}`, statedSuccess && `Responsibilities: ${statedSuccess}`]
+    .filter(Boolean)
+    .join("\n");
+  const { model, out } = await llmExtract(key, { title: row.title, url: row.canonical_url, text, stated });
+  return {
+    model,
+    c: {
+      employer: cleanEmployer(out.employer),
+      employerSector: ["security", "technology", "other"].includes(String(out.employer_sector)) ? String(out.employer_sector) : null,
+      skills: bullets(out.skills),
+      success: bullets(out.success),
+      remote: ["remote", "hybrid", "onsite"].includes(String(out.remote_eligibility)) ? String(out.remote_eligibility) : null,
+      postedAt: parsePostedDate(out.posted_date),
+      isJob: typeof out.is_job_posting === "boolean" ? out.is_job_posting : null,
+      jobTitle: meaningful(out.job_title),
+    },
+  };
+}
+
+function newCounts() {
+  return { targets: 0, filled: 0, not_mentioned: 0, cant_find: 0, pending: 0, max_retries: 0, followed: 0, added: 0, errors: [] };
+}
+
+// Runs fillDetails() batch after batch until a batch finds no target, and returns how many postings
+// it attempted. A thrown error leaves the tally of what was done so far in `counts`.
+async function drainDetails(cycleStart, retryFrom, counts) {
+  const start = counts.targets;
+  for (let i = 0; !shuttingDown; i++) {
+    if (i >= MAX_LOOP_ITERATIONS) {
+      loopCapHit(retryFrom === null ? "details" : "details_retry");
+      break;
+    }
+    const before = counts.targets;
+    await fillDetails(cycleStart, retryFrom, counts);
+    if (counts.targets === before) break;
+  }
+  return counts.targets - start;
+}
+
+// One log line per pass (a pass drains every batch of targets): how each target ended.
+function logDetails(pass, c) {
+  const { errors, ...counts } = c;
+  console.log(JSON.stringify({ at: new Date().toISOString(), event: "details_filled", pass, ...counts, errors: errors.length ? errors.slice(0, 20) : undefined }));
+}
+
+// Extraction already succeeded for this posting, so what the page does not state is final: every
+// detail still missing (blank, unknown or a can't-find marker) becomes "not mentioned".
+async function settleDetails(id) {
+  await sql`
+    UPDATE candidates SET
+      employer = coalesce(found_detail(employer), ${NOT_MENTIONED}),
+      employer_sector = coalesce(found_detail(employer_sector), ${NOT_MENTIONED}),
+      skills = coalesce(found_detail(skills), ${NOT_MENTIONED}),
+      success = coalesce(found_detail(success), ${NOT_MENTIONED}),
+      remote_eligibility = coalesce(found_detail(remote_eligibility), ${NOT_MENTIONED}),
+      job_title = coalesce(found_detail(job_title), ${NOT_MENTIONED}),
+      detail_pending = false,
+      detail_error = NULL
+    WHERE id = ${id}
+  `;
+  return "not_mentioned";
+}
+
+// Writes the model's values. Values that came from Google Jobs' structured data are kept; the model
+// fills whatever is still missing, and what it left empty (or called unknown) becomes "not mentioned".
+async function writeExtraction(row, c, model) {
+  const g = Boolean(row.from_google);
+  const [res] = await sql`
+    UPDATE candidates SET
+      employer = coalesce(found_detail(CASE WHEN ${g} THEN coalesce(found_detail(employer), ${c.employer}, employer) ELSE coalesce(${c.employer}, employer) END), ${NOT_MENTIONED}),
+      employer_sector = coalesce(found_detail(coalesce(${c.employerSector}, employer_sector)), ${NOT_MENTIONED}),
+      skills = coalesce(found_detail(coalesce(${c.skills}, skills)), ${NOT_MENTIONED}),
+      success = coalesce(found_detail(coalesce(${c.success}, success)), ${NOT_MENTIONED}),
+      remote_eligibility = coalesce(found_detail(CASE
+            WHEN ${g} AND found_detail(remote_eligibility) IS NOT NULL THEN remote_eligibility
+            ELSE coalesce(${c.remote}, remote_eligibility) END), ${NOT_MENTIONED}),
+      posted_at = CASE WHEN ${g} THEN coalesce(posted_at, ${c.postedAt}) ELSE coalesce(${c.postedAt}, posted_at) END,
+      is_job_posting = CASE WHEN ${c.isJob} IS NULL THEN is_job_posting ELSE (${c.isJob} AND coalesce(is_job_posting, true)) END,
+      job_title = coalesce(found_detail(coalesce(${c.jobTitle}::text, job_title)), ${NOT_MENTIONED}),
+      job_title_version = CASE WHEN ${c.jobTitle}::text IS NULL THEN job_title_version ELSE ${TITLE_VERSION}::int END,
+      extract_version = ${EXTRACT_VERSION},
+      extract_model = ${model},
+      extracted_at = now(),
+      detail_pending = false,
+      detail_error = NULL
+    WHERE id = ${row.id}
+    RETURNING ${NOT_MENTIONED} IN (employer, employer_sector, skills, success, remote_eligibility, job_title) AS has_not_mentioned
+  `;
+  return res.has_not_mentioned ? "not_mentioned" : "filled";
+}
+
+// Gets the page text details are extracted from: the page's stored text when search results brought
+// enough of it, else Exa's fetch of the page (which also follows its link to the primary source).
+async function fetchPageText(row, counts) {
+  await sql`UPDATE candidates SET enrich_attempts = enrich_attempts + 1, enriched_at = now() WHERE id = ${row.id}`;
+  // A retry asks Exa for a fresh crawl, since its cached copy already came back incomplete.
+  const page = await exaPage(row.canonical_url, true, row.enrich_attempts >= 1);
+  const c = contentsFrom(page);
+  await saveContents(row.id, c);
+  await followPrimaryLink(row, page, c, counts, counts.errors);
+  if ((c.pageText?.length ?? 0) <= MIN_PAGE_TEXT_CHARS) throw new DetailError("page has no readable text", false);
+  return c.pageText;
+}
+
+// A failed attempt. Persistent: every missing detail gets "can't find: <reason>". Temporary: the
+// posting waits for a retry, until MAX_DETAIL_TRIES temporary failures, when it gets
+// "can't find: <reason>; max retries hit". A failure in the model step also stamps extraction as
+// failed (extract_version set, extract_model null), which the roles view reports as "details could
+// not be extracted"; a page failure leaves extraction unstamped.
+async function recordFailure(row, err, step, counts) {
+  counts.errors.push(`${row.canonical_url}: ${err.reason}${err.temporary ? " (temporary)" : ""}`.slice(0, 300));
+  const tries = row.detail_attempts + (err.temporary ? 1 : 0);
+  const gaveUp = err.temporary && tries >= MAX_DETAIL_TRIES;
+  if (err.temporary && !gaveUp) {
+    await sql`
+      UPDATE candidates SET detail_attempts = ${tries}, detail_pending = true, detail_error = ${err.reason}
+      WHERE id = ${row.id}
+    `;
+    return "pending";
+  }
+  const marker = `${CANT_FIND}: ${err.reason}${gaveUp ? `; ${MAX_RETRIES_NOTE}` : ""}`;
+  const stamp = step === "model";
+  await sql`
+    UPDATE candidates SET
+      employer = CASE WHEN found_detail(employer) IS NULL THEN ${marker} ELSE employer END,
+      employer_sector = CASE WHEN found_detail(employer_sector) IS NULL THEN ${marker} ELSE employer_sector END,
+      skills = CASE WHEN found_detail(skills) IS NULL THEN ${marker} ELSE skills END,
+      success = CASE WHEN found_detail(success) IS NULL THEN ${marker} ELSE success END,
+      remote_eligibility = CASE WHEN found_detail(remote_eligibility) IS NULL THEN ${marker} ELSE remote_eligibility END,
+      job_title = CASE WHEN found_detail(job_title) IS NULL THEN ${marker} ELSE job_title END,
+      extract_version = CASE WHEN ${stamp} THEN ${EXTRACT_VERSION}::int ELSE extract_version END,
+      extract_model = CASE WHEN ${stamp} THEN NULL ELSE extract_model END,
+      extracted_at = CASE WHEN ${stamp} THEN now() ELSE extracted_at END,
+      detail_attempts = ${tries},
+      detail_pending = false,
+      detail_error = ${err.reason}
+    WHERE id = ${row.id}
+  `;
+  return gaveUp ? "max_retries" : "cant_find";
+}
+
+// Fills one posting's details and says how it ended: filled, not_mentioned, cant_find, pending or
+// max_retries. The attempt is stamped first, so even a crash leaves the posting out of this pass.
+async function fillOne(row, key, counts) {
+  await sql`UPDATE candidates SET detail_tried_at = now() WHERE id = ${row.id}`;
+  // Page text and extraction that already succeeded are not repeated.
+  if (row.extracted) return await settleDetails(row.id);
+  let step = "page";
+  let result;
+  try {
+    const text = row.has_text ? row.page_text : await fetchPageText(row, counts);
+    step = "model";
+    result = await extractWithLlm(key, row, text);
+  } catch (err) {
+    if (!(err instanceof DetailError)) throw err;
+    return await recordFailure(row, err, step, counts);
+  }
+  return await writeExtraction(row, result.c, result.model);
+}
+
+// Fills the details (employer, sector, skills, success, remote, job title) of up to LLM_BATCH
+// postings still in play, tallying how each ended into `counts` as it goes (a pass shares one
+// tally across its batches and keeps it if a batch throws). Targets are postings that are new this
+// cycle (first seen at or after `cycleStart`), primaries of roles currently considered, and
+// postings waiting on a retry, each only while some detail is missing and the role is not ruled
+// out. A posting is attempted at most once per pass: the normal pass skips anything tried since
+// `cycleStart`; the retry pass (`retryFrom` = when it started) takes only postings that went
+// pending earlier in this cycle and not yet in this pass.
+async function fillDetails(cycleStart, retryFrom = null, counts = newCounts()) {
   const key = await openrouterKey();
-  if (!key) return 0;
+  if (!key) {
+    console.error(JSON.stringify({ at: new Date().toISOString(), event: "details_skipped", reason: "no openrouter key" }));
+    return counts;
+  }
+  const retry = retryFrom !== null;
   const rows = await sql`
-    SELECT c.id, c.title, c.canonical_url, c.page_text, c.skills AS stated_skills, c.success AS stated_success,
-           ('google_jobs' = ANY(c.sources)) AS from_google
+    WITH rr AS (
+      SELECT role_id, considered,
+             coalesce(excluded_employer IS NOT NULL OR remote_eligibility IN ('hybrid', 'onsite')
+                      OR posted_at < now() - interval '1 month' OR live_status = 'closed', false) AS ruled_out
+      FROM roles
+    )
+    SELECT c.id, c.title, c.canonical_url, c.domain, c.employer, c.job_title, c.page_text,
+           c.skills AS stated_skills, c.success AS stated_success, c.enrich_attempts, c.detail_attempts,
+           coalesce('google_jobs' = ANY(c.sources), false) AS from_google,
+           x.has_text, x.extracted
     FROM candidates c
-    WHERE c.page_text IS NOT NULL AND length(c.page_text) > 200
-      AND c.excluded_employer IS NULL
-      AND c.extract_version IS DISTINCT FROM ${EXTRACT_VERSION}
-      AND NOT EXISTS (
-        SELECT 1 FROM roles r
-        WHERE r.role_id = c.role_id
-          AND (r.excluded_employer IS NOT NULL OR r.remote_eligibility IN ('hybrid', 'onsite')
-               OR r.applicants > 30 OR r.posted_at < now() - interval '1 month'
-               OR r.live_status = 'closed')
-      )
+    LEFT JOIN rr ON rr.role_id = c.role_id
+    CROSS JOIN LATERAL (
+      SELECT coalesce(c.extract_version = ${EXTRACT_VERSION} AND c.extract_model IS NOT NULL, false) AS extracted,
+             coalesce(length(c.page_text) > ${MIN_PAGE_TEXT_CHARS}, false) AS has_text,
+             -- missing is blank, unknown or a marker. unsettled is missing and not already not mentioned.
+             (found_detail(c.employer) IS NULL OR found_detail(c.employer_sector) IS NULL
+              OR found_detail(c.skills) IS NULL OR found_detail(c.success) IS NULL
+              OR found_detail(c.remote_eligibility) IS NULL OR found_detail(c.job_title) IS NULL) AS missing,
+             ((found_detail(c.employer) IS NULL AND c.employer IS DISTINCT FROM ${NOT_MENTIONED})
+              OR (found_detail(c.employer_sector) IS NULL AND c.employer_sector IS DISTINCT FROM ${NOT_MENTIONED})
+              OR (found_detail(c.skills) IS NULL AND c.skills IS DISTINCT FROM ${NOT_MENTIONED})
+              OR (found_detail(c.success) IS NULL AND c.success IS DISTINCT FROM ${NOT_MENTIONED})
+              OR (found_detail(c.remote_eligibility) IS NULL AND c.remote_eligibility IS DISTINCT FROM ${NOT_MENTIONED})
+              OR (found_detail(c.job_title) IS NULL AND c.job_title IS DISTINCT FROM ${NOT_MENTIONED})) AS unsettled
+    ) x
+    WHERE c.excluded_employer IS NULL
+      -- No follow-up spend on roles already ruled out for a known reason.
+      AND NOT coalesce(rr.ruled_out, false)
+      -- An extracted posting only gets not mentioned written over what is still blank.
+      AND x.missing AND (x.unsettled OR NOT x.extracted)
+      AND CASE WHEN ${retry}::boolean
+               THEN c.detail_pending AND c.detail_tried_at >= ${cycleStart}::timestamptz AND c.detail_tried_at < ${retryFrom ?? cycleStart}::timestamptz
+               ELSE (c.detail_tried_at IS NULL OR c.detail_tried_at < ${cycleStart}::timestamptz)
+                    AND (c.first_seen_at >= ${cycleStart}::timestamptz OR c.detail_pending
+                         -- A considered primary whose page was already tried and has no usable text is not
+                         -- fetched again every cycle. It is picked up again once search results bring text.
+                         OR (c.is_role_primary AND coalesce(rr.considered, false)
+                             AND (x.has_text OR c.detail_tried_at IS NULL)))
+          END
     ORDER BY c.is_role_primary DESC NULLS LAST, c.id
     LIMIT ${LLM_BATCH}
   `;
-  let done = 0;
-  const errors = [];
   for (const row of rows) {
-    try {
-      const stated = [row.stated_skills && `Qualifications: ${row.stated_skills}`, row.stated_success && `Responsibilities: ${row.stated_success}`]
-        .filter(Boolean)
-        .join("\n");
-      const { model, out } = await llmExtract(key, { title: row.title, url: row.canonical_url, text: row.page_text, stated });
-      const c = {
-        employer: cleanEmployer(out.employer),
-        employerSector: ["security", "technology", "other"].includes(String(out.employer_sector)) ? String(out.employer_sector) : null,
-        skills: bullets(out.skills),
-        success: bullets(out.success),
-        remote: ["remote", "hybrid", "onsite"].includes(String(out.remote_eligibility)) ? String(out.remote_eligibility) : null,
-        applicants: parseApplicants(out.applicants, null),
-        postedAt: parsePostedDate(out.posted_date),
-        isJob: typeof out.is_job_posting === "boolean" ? out.is_job_posting : null,
-        jobTitle: meaningful(out.job_title),
-      };
-      const g = Boolean(row.from_google);
-      await sql`
-        UPDATE candidates SET
-          employer = CASE WHEN ${g} THEN coalesce(employer, ${c.employer}) ELSE coalesce(${c.employer}, employer) END,
-          employer_sector = coalesce(${c.employerSector}, employer_sector),
-          skills = coalesce(${c.skills}, skills),
-          success = coalesce(${c.success}, success),
-          remote_eligibility = CASE
-            WHEN ${g} AND coalesce(remote_eligibility, 'unknown') <> 'unknown' THEN remote_eligibility
-            ELSE coalesce(${c.remote}, remote_eligibility) END,
-          applicants = coalesce(${c.applicants}, applicants),
-          posted_at = CASE WHEN ${g} THEN coalesce(posted_at, ${c.postedAt}) ELSE coalesce(${c.postedAt}, posted_at) END,
-          is_job_posting = CASE WHEN ${c.isJob} IS NULL THEN is_job_posting ELSE (${c.isJob} AND coalesce(is_job_posting, true)) END,
-          job_title = coalesce(${c.jobTitle}::text, job_title),
-          job_title_version = CASE WHEN ${c.jobTitle}::text IS NULL THEN job_title_version ELSE ${TITLE_VERSION}::int END,
-          extract_version = ${EXTRACT_VERSION},
-          extract_model = ${model},
-          extracted_at = now()
-        WHERE id = ${row.id}
-      `;
-      done++;
-    } catch (err) {
-      errors.push(`${row.canonical_url}: ${err.message}`.slice(0, 300));
-      await sql`UPDATE candidates SET extract_version = ${EXTRACT_VERSION}, extracted_at = now() WHERE id = ${row.id}`;
-    }
+    if (shuttingDown) break;
+    const outcome = await fillOne(row, key, counts);
+    counts.targets++;
+    counts[outcome]++;
   }
-  if (rows.length) console.log(JSON.stringify({ at: new Date().toISOString(), event: "llm_extracted", checked: rows.length, done, errors }));
-  return rows.length;
+  return counts;
 }
 
 const LIVE_BATCH = Number(process.env.LIVE_BATCH ?? 10);
@@ -960,7 +1340,8 @@ async function checkLive(url) {
   }
 }
 
-// Checks the primary posting of every role still in consideration, oldest check first, daily.
+// Checks the primary posting of every role still in consideration, oldest check first, skipping
+// any checked in the last day; one batch per call, returning how many it checked.
 async function checkLiveness() {
   const rows = await sql`
     SELECT c.id, c.canonical_url FROM candidates c
@@ -1089,7 +1470,7 @@ async function exaSearch(q) {
 const AGGREGATOR_NAMES = /^(jobgether|jobsy|jobtrail|taskium|hiring ?camp|asian ?careers|jobs ?radar|jobera|notify ?careers|built ?in.*|the ?muse|dice|simplify( jobs)?|swooped|haystack|ihire.*|jobscroller|worksynergy|workvista|remoteforge|skillcore|jobgrow|linkedin|indeed|glassdoor|ziprecruiter|ms)$/i;
 
 function cleanEmployer(e) {
-  const v = typeof e === "string" ? e.trim() : "";
+  const v = typeof e === "string" ? found(e) : null;
   return v && !AGGREGATOR_NAMES.test(normEmployer(v)) ? v : null;
 }
 
@@ -1103,19 +1484,8 @@ function contentsFrom(o) {
     remoteEligibility: normalizeRemote(summary.remote_eligibility),
     highlights: Array.isArray(o.highlights) && o.highlights.length ? o.highlights.join(" … ") : null,
     pageText: typeof o.text === "string" ? o.text.slice(0, PAGE_TEXT_MAX_CHARS) : null,
-    applicants: parseApplicants(summary.applicants, o.text),
     postedAt: parsePostedDate(summary.posted_date),
   };
-}
-
-// Applicant count from the summary, falling back to phrases like "Over 100 applicants" in the page text.
-function parseApplicants(fromSummary, text) {
-  const n = Number(String(fromSummary ?? "").replace(/[^0-9]/g, ""));
-  if (String(fromSummary ?? "").trim() && Number.isFinite(n) && n > 0) return n;
-  const m = String(text ?? "").match(/(?:over|more than)?\s*(\d[\d,]*)\+?\s+applicants|first\s+(\d+)\s+applicants/i);
-  if (!m) return null;
-  const v = Number((m[1] ?? m[2]).replace(/,/g, ""));
-  return Number.isFinite(v) ? v : null;
 }
 
 function parsePostedDate(v) {
@@ -1125,19 +1495,28 @@ function parsePostedDate(v) {
   return Number.isNaN(d.getTime()) || d > new Date() ? null : d;
 }
 
+// Every cycle reruns every search, so this also runs when a posting is seen again. Once our model has
+// extracted a posting, the details it found are kept; a repeat sighting only fills what is still
+// missing. The posted date only ever moves earlier: relative ages ("30+ days ago") would otherwise
+// creep forward with each sighting.
 async function saveContents(candidateId, c) {
   await sql`
     UPDATE candidates SET
-      employer = COALESCE(${c.employer}, employer),
-      employer_sector = COALESCE(${c.employerSector ?? null}, employer_sector),
-      skills = COALESCE(${c.skills}, skills),
-      success = COALESCE(${c.success}, success),
-      remote_eligibility = CASE WHEN ${c.remoteEligibility} = 'unknown' AND remote_eligibility IS NOT NULL
+      employer = CASE WHEN extract_model IS NOT NULL AND found_detail(employer) IS NOT NULL
+                      THEN employer ELSE COALESCE(${c.employer}, employer) END,
+      employer_sector = CASE WHEN extract_model IS NOT NULL AND found_detail(employer_sector) IS NOT NULL
+                             THEN employer_sector ELSE COALESCE(${c.employerSector ?? null}, employer_sector) END,
+      skills = CASE WHEN extract_model IS NOT NULL AND found_detail(skills) IS NOT NULL
+                    THEN skills ELSE COALESCE(${c.skills}, skills) END,
+      success = CASE WHEN extract_model IS NOT NULL AND found_detail(success) IS NOT NULL
+                     THEN success ELSE COALESCE(${c.success}, success) END,
+      remote_eligibility = CASE WHEN extract_model IS NOT NULL AND found_detail(remote_eligibility) IS NOT NULL
+                                THEN remote_eligibility
+                                WHEN ${c.remoteEligibility} = 'unknown' AND remote_eligibility IS NOT NULL
                                 THEN remote_eligibility ELSE ${c.remoteEligibility} END,
       highlights = COALESCE(${c.highlights}, highlights),
       page_text = COALESCE(${c.pageText}, page_text),
-      applicants = COALESCE(${c.applicants ?? null}, applicants),
-      posted_at = COALESCE(${c.postedAt ?? null}, posted_at),
+      posted_at = LEAST(${c.postedAt ?? null}::timestamptz, posted_at),
       contents_fetched_at = now()
     WHERE id = ${candidateId}
   `;
@@ -1219,7 +1598,6 @@ async function googleJobsSearch(q, key) {
         remoteEligibility: remoteFromGoogle(job),
         highlights: null,
         pageText: typeof description === "string" ? description.slice(0, PAGE_TEXT_MAX_CHARS) : null,
-        applicants: null,
         postedAt: googlePostedAt(job),
       },
     };
@@ -1239,36 +1617,6 @@ async function runGoogleJobs(search, run, key, counts, errors) {
     }
   }
   await sql`UPDATE searches SET google_jobs_run_at = now() WHERE id = ${search.id}`;
-}
-
-// Runs Google Jobs once for searches that have never run it, as soon as a SerpApi key is present,
-// without re-running their Exa queries.
-async function googleJobsBackfill() {
-  const key = await serpapiKey();
-  if (!key) return false;
-  const [search] = await sql`
-    SELECT id, name, to_jsonb(google_jobs_queries) AS google_jobs_queries
-    FROM searches
-    WHERE google_jobs_run_at IS NULL AND cardinality(google_jobs_queries) > 0
-    ORDER BY id
-    LIMIT 1
-  `;
-  if (!search) return false;
-  const [run] = await sql`
-    INSERT INTO search_runs (search_id, started_at, status) VALUES (${search.id}, now(), 'running') RETURNING *
-  `;
-  const counts = { google_jobs: 0, inserted: 0, updated: 0 };
-  const errors = [];
-  await runGoogleJobs(search, run, key, counts, errors);
-  const status = errors.length ? "error" : "ok";
-  await sql`
-    UPDATE search_runs SET finished_at = now(), status = ${status}, google_jobs_results = ${counts.google_jobs},
-      candidates_inserted = ${counts.inserted}, candidates_updated = ${counts.updated},
-      error = ${errors.length ? errors.join(" | ") : null}
-    WHERE id = ${run.id}
-  `;
-  console.log(JSON.stringify({ at: new Date().toISOString(), event: "google_jobs_backfill", search: search.name, ...counts, errors }));
-  return true;
 }
 
 async function storeResults({ search, run, source, query, results }) {
@@ -1399,81 +1747,176 @@ async function runSearch(search, run) {
       error_detail: errors.length ? errors.map((e) => e.slice(0, 300)) : undefined,
     }),
   );
+  return counts;
 }
 
+// A signal sets this flag and ends any wait in progress: the cycle checks it between steps, starts
+// nothing new, closes the database and exits non-zero.
 let shuttingDown = false;
-let pendingResolve = null;
+let stopSignal = null;
+const SIGNAL_EXIT = { SIGINT: 130, SIGTERM: 143 };
+const sleepers = new Set();
 
-function sleep(ms) {
+function shutdown(signal) {
+  shuttingDown = true;
+  stopSignal ??= signal;
+  for (const wake of [...sleepers]) wake();
+}
+
+// Waits `ms` milliseconds, or less when a signal arrives; returns at once once shutting down.
+function interruptibleSleep(ms) {
+  if (shuttingDown || !(ms > 0)) return Promise.resolve();
   return new Promise((resolve) => {
-    pendingResolve = resolve;
-    setTimeout(resolve, ms);
+    const wake = () => {
+      clearTimeout(timer);
+      sleepers.delete(wake);
+      resolve();
+    };
+    const timer = setTimeout(wake, ms);
+    sleepers.add(wake);
   });
 }
 
-function shutdown() {
-  shuttingDown = true;
-  pendingResolve?.();
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+function cycleError(event, err, extra = {}) {
+  console.error(JSON.stringify({ at: new Date().toISOString(), event, ...extra, error: err?.message ?? String(err) }));
 }
 
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+function loopCapHit(loop) {
+  console.error(JSON.stringify({ at: new Date().toISOString(), event: "loop_cap_hit", loop, max_iterations: MAX_LOOP_ITERATIONS }));
+}
 
-async function tick() {
-  try {
-    await sql.unsafe(READ_ROLE_GRANTS);
-  } catch (err) {
-    console.error(JSON.stringify({ at: new Date().toISOString(), event: "grant_error", error: err.message }));
-  }
+// Title cleanup, exclusions and role merging; an error is logged and the cycle carries on.
+async function cleanupRoles() {
   try {
     await applyTitlesAndExclusions();
     const r = await clusterRoles();
     if (r.changed) console.log(JSON.stringify({ at: new Date().toISOString(), event: "roles_clustered", ...r }));
   } catch (err) {
-    console.error(JSON.stringify({ at: new Date().toISOString(), event: "cleanup_error", error: err.message }));
+    cycleError("cleanup_error", err);
   }
-  let claimed;
+}
+
+// One full discovery cycle: run every profile's searches, merge duplicate roles, fill in the details
+// of this cycle's new postings and of considered roles (retrying temporary failures once after a
+// wait), then recheck every considered role's liveness. Returns the work done: `extracted` counts
+// postings whose details were attempted; `pending` those left waiting for the next cycle's try and
+// `max_retries` those that ran out of tries.
+async function runCycle() {
+  const total = { searches: 0, inserted: 0, updated: 0, enriched: 0, extracted: 0, pending: 0, max_retries: 0, liveness_checked: 0 };
+  // The cycle's start by the database's clock, which first_seen_at and detail_tried_at also use.
+  const [{ t: cycleStart }] = await sql`SELECT now()::text AS t`;
+
+  // Request every search, then claim and run them until none are left. Google Jobs runs inside
+  // runSearch, so it reruns every cycle too.
   try {
-    claimed = await claimSearch();
+    await sql`UPDATE searches SET run_requested_at = now()`;
+    for (let i = 0; !shuttingDown; i++) {
+      if (i >= MAX_LOOP_ITERATIONS) {
+        loopCapHit("search");
+        break;
+      }
+      const claimed = await claimSearch();
+      if (!claimed) break;
+      try {
+        const counts = await runSearch(claimed.search, claimed.run);
+        total.searches++;
+        total.inserted += counts.inserted;
+        total.updated += counts.updated;
+      } catch (err) {
+        cycleError("run_error", err, { search: claimed.search.name });
+      }
+    }
   } catch (err) {
-    console.error(JSON.stringify({ at: new Date().toISOString(), event: "claim_error", error: err.message }));
-    return;
+    cycleError("claim_error", err);
   }
-  if (!claimed) {
-    try {
-      if (await googleJobsBackfill()) return;
-    } catch (err) {
-      console.error(JSON.stringify({ at: new Date().toISOString(), event: "google_jobs_error", error: err.message }));
+
+  if (!shuttingDown) await cleanupRoles();
+
+  // Fill every target's details, then follow links from the primaries not fetched yet (which can add
+  // new postings to fill), until neither finds work. Details go first so a page is fetched once,
+  // not once for links and again for details. An error stops that stage for the rest of the cycle
+  // instead of retrying it in a loop.
+  const first = newCounts();
+  let enrichOn = true;
+  let detailsOn = true;
+  for (let i = 0; !shuttingDown && (enrichOn || detailsOn); i++) {
+    if (i >= MAX_LOOP_ITERATIONS) {
+      loopCapHit("details");
+      break;
     }
-    try {
-      await checkLiveness();
-    } catch (err) {
-      console.error(JSON.stringify({ at: new Date().toISOString(), event: "liveness_error", error: err.message }));
+    let n1 = 0;
+    let n2 = 0;
+    if (detailsOn) {
+      const before = first.targets;
+      try {
+        await drainDetails(cycleStart, null, first);
+      } catch (err) {
+        detailsOn = false;
+        cycleError("details_error", err);
+      }
+      n2 = first.targets - before;
     }
-    try {
-      await extractWithLlm();
-    } catch (err) {
-      console.error(JSON.stringify({ at: new Date().toISOString(), event: "llm_error", error: err.message }));
+    if (shuttingDown) break;
+    if (enrichOn) {
+      try {
+        n1 = await enrichCandidates();
+        total.enriched += n1;
+      } catch (err) {
+        enrichOn = false;
+        cycleError("enrich_error", err);
+      }
     }
-    try {
-      await enrichCandidates();
-    } catch (err) {
-      console.error(JSON.stringify({ at: new Date().toISOString(), event: "enrich_error", error: err.message }));
-    }
-    return;
+    if (!n1 && !n2) break;
   }
-  try {
-    await runSearch(claimed.search, claimed.run);
-  } catch (err) {
-    console.error(
-      JSON.stringify({
-        at: new Date().toISOString(),
-        event: "run_error",
-        search: claimed.search.name,
-        error: err.message,
-      }),
-    );
+  if (first.targets) logDetails("first", first);
+
+  // Postings that failed for a temporary reason this cycle get one more try after a wait; the next
+  // cycle's normal pass tries any still pending a third and last time.
+  const retry = newCounts();
+  if (first.pending && !shuttingDown) {
+    console.log(JSON.stringify({ at: new Date().toISOString(), event: "retry_wait", pending: first.pending, delay_ms: RETRY_DELAY_MS }));
+    await interruptibleSleep(RETRY_DELAY_MS);
+    if (!shuttingDown) {
+      try {
+        const [{ t: retryFrom }] = await sql`SELECT now()::text AS t`;
+        await drainDetails(cycleStart, retryFrom, retry);
+      } catch (err) {
+        cycleError("details_error", err, { pass: "retry" });
+      }
+      if (retry.targets) logDetails("retry", retry);
+    }
   }
+  total.extracted = first.targets + retry.targets;
+  total.max_retries = first.max_retries + retry.max_retries;
+  if (!shuttingDown) {
+    // Postings tried this cycle that still wait for the next cycle's try.
+    const [{ n }] = await sql`SELECT count(*)::int AS n FROM candidates WHERE detail_pending AND detail_tried_at >= ${cycleStart}::timestamptz`;
+    total.pending = n;
+  }
+
+  // Final cleanup: newly found employers and page text change which postings merge into one role.
+  if (!shuttingDown) await cleanupRoles();
+
+  // Every considered role whose primary posting was not checked in the last day.
+  for (let i = 0; !shuttingDown; i++) {
+    if (i >= MAX_LOOP_ITERATIONS) {
+      loopCapHit("liveness");
+      break;
+    }
+    try {
+      const n = await checkLiveness();
+      if (!n) break;
+      total.liveness_checked += n;
+    } catch (err) {
+      cycleError("liveness_error", err);
+      break;
+    }
+  }
+
+  return total;
 }
 
 // Diagnostic: titles that appear on more than one canonical URL, to see why dedupe misses.
@@ -1486,10 +1929,10 @@ async function logDuplicateReport() {
       FROM candidates
     `;
     const groups = await sql`
-      SELECT lower(coalesce(job_title, title)) AS title, count(*)::int AS n,
+      SELECT lower(coalesce(found_detail(job_title), title)) AS title, count(*)::int AS n,
              array_agg(canonical_url ORDER BY canonical_url) AS urls
       FROM candidates
-      GROUP BY lower(coalesce(job_title, title))
+      GROUP BY lower(coalesce(found_detail(job_title), title))
       HAVING count(*) > 1
       ORDER BY count(*) DESC
       LIMIT 15
@@ -1498,11 +1941,10 @@ async function logDuplicateReport() {
       SELECT count(*)::int AS roles,
              count(*) FILTER (WHERE coalesce(domain, '') = '')::int AS blank_domain,
              count(*) FILTER (WHERE coalesce(url, '') = '')::int AS blank_url,
-             count(*) FILTER (WHERE coalesce(employer, '') = '')::int AS blank_employer,
-             count(*) FILTER (WHERE coalesce(skills, '') = '')::int AS blank_skills,
-             count(*) FILTER (WHERE coalesce(success, '') = '')::int AS blank_success,
-             count(*) FILTER (WHERE coalesce(remote_eligibility, 'unknown') = 'unknown')::int AS unknown_remote,
-             count(*) FILTER (WHERE applicants IS NOT NULL)::int AS with_applicants,
+             count(*) FILTER (WHERE found_detail(employer) IS NULL)::int AS blank_employer,
+             count(*) FILTER (WHERE found_detail(skills) IS NULL)::int AS blank_skills,
+             count(*) FILTER (WHERE found_detail(success) IS NULL)::int AS blank_success,
+             count(*) FILTER (WHERE found_detail(remote_eligibility) IS NULL)::int AS unknown_remote,
              count(*) FILTER (WHERE considered)::int AS considered,
              (array_agg(url) FILTER (WHERE coalesce(domain, '') = ''))[1:5] AS blank_domain_samples
       FROM roles
@@ -1513,39 +1955,33 @@ async function logDuplicateReport() {
   }
 }
 
-// Re-derive Google Jobs remote flag and posting age from stored raw results (fixes earlier rows).
-async function backfillGoogleJobsFields() {
-  const rows = await sql`
-    SELECT DISTINCT ON (candidate_id) candidate_id, raw FROM sightings
-    WHERE source = 'google_jobs' ORDER BY candidate_id, seen_at DESC
-  `;
-  for (const r of rows) {
-    const job = typeof r.raw === "string" ? JSON.parse(r.raw) : r.raw;
-    const posted = googlePostedAt(job);
-    await sql`
-      UPDATE candidates SET
-        remote_eligibility = CASE WHEN ${googleWorkFromHome(job)} THEN 'remote' ELSE remote_eligibility END,
-        posted_at = COALESCE(${posted}, posted_at)
-      WHERE id = ${Number(r.candidate_id)}
-    `;
-  }
-  return rows.length;
-}
-
+// Runs one cycle and returns the process exit code: 0 when it finished, non-zero when a signal cut it short.
 async function main() {
+  const started = Date.now();
   await migrate();
+  try {
+    await sql.unsafe(READ_ROLE_GRANTS);
+  } catch (err) {
+    cycleError("grant_error", err);
+  }
   await seed();
   console.log(JSON.stringify({ at: new Date().toISOString(), event: "startup", seed_version: SEED_VERSION }));
   await applyTitlesAndExclusions();
-  console.log(JSON.stringify({ at: new Date().toISOString(), event: "google_jobs_fields_backfilled", candidates: await backfillGoogleJobsFields() }));
   await logDuplicateReport();
-  while (!shuttingDown) {
-    await tick();
-    if (shuttingDown) break;
-    await sleep(POLL_INTERVAL_MS);
+  const total = shuttingDown ? null : await runCycle();
+  if (total && !shuttingDown) {
+    const seconds = Math.round((Date.now() - started) / 1000);
+    console.log(JSON.stringify({ at: new Date().toISOString(), event: "cycle_done", ...total, seconds }));
   }
   await sql.close();
-  console.log(JSON.stringify({ at: new Date().toISOString(), event: "shutdown" }));
+  console.log(JSON.stringify({ at: new Date().toISOString(), event: "shutdown", signal: stopSignal ?? undefined }));
+  return shuttingDown ? SIGNAL_EXIT[stopSignal] ?? 1 : 0;
 }
 
-await main();
+let exitCode = 1;
+try {
+  exitCode = await main();
+} catch (err) {
+  cycleError("fatal", err);
+}
+process.exit(exitCode);

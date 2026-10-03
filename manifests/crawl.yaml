@@ -162,8 +162,8 @@ spec:
             limits:
               memory: 128Mi
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: CronJob
 metadata:
   name: discovery-worker
   namespace: ssint-main-crawl
@@ -172,12 +172,89 @@ metadata:
     env: main
     capability: crawl
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: discovery-worker
+  # Runs one full crawl cycle every other day (07:23 UTC) and exits.
+  schedule: "23 7 */2 * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 7200
+      ttlSecondsAfterFinished: 172800
+      template:
+        metadata:
+          labels:
+            app: discovery-worker
+            entity: ssint
+            env: main
+            capability: crawl
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: discovery-worker
+              image: oven/bun:1-alpine
+              imagePullPolicy: IfNotPresent
+              command: ["bun", "/scripts/discovery-worker.mjs"]
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: crawl-pg-app
+                      key: uri
+                - name: SERPER_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: serper-api-key
+                      key: api_key
+                - name: EXA_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: exa-api-key
+                      key: api_key
+              resources:
+                requests:
+                  memory: 64Mi
+                limits:
+                  memory: 256Mi
+              volumeMounts:
+                - name: discovery-worker-script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: serpapi-api-key
+                  mountPath: /secrets/serpapi
+                  readOnly: true
+                - name: openrouter-api-key
+                  mountPath: /secrets/openrouter
+                  readOnly: true
+          volumes:
+            - name: discovery-worker-script
+              configMap:
+                name: discovery-worker-script
+            - name: serpapi-api-key
+              secret:
+                secretName: serpapi-api-key
+                optional: true
+            - name: openrouter-api-key
+              secret:
+                secretName: openrouter-api-key
+                optional: true
+---
+# One-time: runs the first cycle now rather than at the next scheduled time; remove once it has
+# completed. No ttlSecondsAfterFinished, or Flux would re-create it (and re-run the cycle) after the TTL.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: discovery-worker-first-run
+  namespace: ssint-main-crawl
+  labels:
+    entity: ssint
+    env: main
+    capability: crawl
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
   template:
     metadata:
       labels:
@@ -186,6 +263,7 @@ spec:
         env: main
         capability: crawl
     spec:
+      restartPolicy: Never
       containers:
         - name: discovery-worker
           image: oven/bun:1-alpine
