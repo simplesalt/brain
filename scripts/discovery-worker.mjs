@@ -5,6 +5,8 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 const EXA_API_KEY = process.env.EXA_API_KEY;
 const SERPAPI_KEY_FILE = process.env.SERPAPI_KEY_FILE ?? "/secrets/serpapi/api_key";
+// Schema-only run: apply the DDL and read grants, then exit. No seeding, no searches, no paid calls.
+const MIGRATE_ONLY = ["1", "true"].includes(String(process.env.MIGRATE_ONLY ?? "").trim().toLowerCase());
 // Guard on every drain-until-empty loop in a cycle; hitting it is logged as loop_cap_hit.
 const MAX_LOOP_ITERATIONS = 200;
 const RESULTS_PER_QUERY = 20;
@@ -338,6 +340,19 @@ const DDL_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS sightings_candidate_id_idx ON sightings (candidate_id)`,
   `CREATE INDEX IF NOT EXISTS sightings_search_id_idx ON sightings (search_id)`,
   `CREATE INDEX IF NOT EXISTS sightings_run_id_idx ON sightings (run_id)`,
+  // Written only by an outside procedure (gbrain); the worker never inserts, updates or deletes here.
+  // The roles view reads it (status, gbrain_ref), so it must exist before the view is replaced below.
+  `CREATE TABLE IF NOT EXISTS job_tracking (
+    canonical_url text PRIMARY KEY REFERENCES candidates (canonical_url),
+    status text CHECK (status IN ('applied', 'interviewing', 'no')),
+    gbrain_ref text CHECK (char_length(gbrain_ref) <= 2000),
+    updated_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `COMMENT ON TABLE job_tracking IS 'Where you stand on each job, and a pointer into gbrain. Written only by an outside procedure; the discovery worker never writes it. One row per job. To record or change a job, take the url shown for it in the roles view and upsert: INSERT INTO job_tracking (canonical_url, status, gbrain_ref) VALUES (<url>, <status>, <gbrain_ref>) ON CONFLICT (canonical_url) DO UPDATE SET status = EXCLUDED.status, gbrain_ref = EXCLUDED.gbrain_ref, updated_at = now(). Send both status and gbrain_ref every time: the update replaces both, so a value you leave out is cleared. Any posting address of the role works (the canonical_url of any candidates row with the same role_id), but it must already exist in candidates. The roles view shows status and gbrain_ref from the most recently updated row among all of a role''s postings, so a label survives when reposts merge into the role or a better posting becomes its primary. A NULL status means blank (no label). Status is a label only: it never changes considered or not_considered_reason.'`,
+  `COMMENT ON COLUMN job_tracking.canonical_url IS 'The job''s posting address: the url column of the roles view, or any other posting address of the same role. Must already exist in candidates.canonical_url.'`,
+  `COMMENT ON COLUMN job_tracking.status IS 'Where you stand on this job: exactly one of applied, interviewing or no. NULL means blank (no label yet); any other value is rejected. A label only: it does not change considered, not_considered_reason or any other rule.'`,
+  `COMMENT ON COLUMN job_tracking.gbrain_ref IS 'Free-form reference into gbrain for this job, plain text or JSON, at most 2000 characters (longer is rejected). NULL when there is none.'`,
+  `COMMENT ON COLUMN job_tracking.updated_at IS 'When this row was last written. Set it to now() on every update (the upsert in the table comment does); the roles view uses the most recently updated row among a role''s postings.'`,
   `COMMENT ON TABLE searches IS 'A saved job-discovery profile: who we are looking for and the queries used to find them.'`,
   `COMMENT ON COLUMN searches.name IS 'Short label identifying this search profile (not shown to candidates).'`,
   `COMMENT ON COLUMN searches.role IS 'Target job title or role family this search looks for.'`,
@@ -429,7 +444,14 @@ const DDL_STATEMENTS = [
              WHEN a.posted < now() - interval '1 month' THEN 'posted over a month ago'
              WHEN a.extract_failed THEN 'details could not be extracted'
              WHEN NOT a.has_detail THEN 'no skills or success found'
-           END AS not_considered_reason
+           END AS not_considered_reason,
+           -- Appended last (CREATE OR REPLACE VIEW only allows new columns at the end). Written only by the
+           -- outside procedure via job_tracking; the most recently updated row among the role's postings wins
+           -- (canonical_url breaks a tie, so both columns come from the same row). Never read by any rule above.
+           (SELECT t.status FROM job_tracking t JOIN candidates o ON o.canonical_url = t.canonical_url
+             WHERE o.role_id = c.role_id ORDER BY t.updated_at DESC, t.canonical_url LIMIT 1) AS status,
+           (SELECT t.gbrain_ref FROM job_tracking t JOIN candidates o ON o.canonical_url = t.canonical_url
+             WHERE o.role_id = c.role_id ORDER BY t.updated_at DESC, t.canonical_url LIMIT 1) AS gbrain_ref
     FROM candidates c
     CROSS JOIN LATERAL (
       SELECT
@@ -447,7 +469,7 @@ const DDL_STATEMENTS = [
     ) a
     WHERE c.is_role_primary`,
   `COMMENT ON COLUMN candidates.posted_at IS 'Date the job was posted, as stated on the page.'`,
-  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, was posted within the last month, is a real job posting that is still open, is not at a security or technology company, is not at an excluded employer, and had its details extracted. not_considered_reason gives the first rule a role failed. A detail no posting of the role could supply shows as "not mentioned" (the page does not state it) or "can''t find: <reason>" (fetching or extraction failed); both count as missing in every rule.'`,
+  `COMMENT ON VIEW roles IS 'One row per real role: reposts across job sites are merged, showing the best posting and the details gathered from all copies. considered is true when the role is fully remote, was posted within the last month, is a real job posting that is still open, is not at a security or technology company, is not at an excluded employer, and had its details extracted. not_considered_reason gives the first rule a role failed. A detail no posting of the role could supply shows as "not mentioned" (the page does not state it) or "can''t find: <reason>" (fetching or extraction failed); both count as missing in every rule. status and gbrain_ref come from the job_tracking table, written only by an outside procedure and never by the worker: status is blank, or exactly one of applied, interviewing or no; gbrain_ref is a free-form reference into gbrain, up to 2000 characters. Both show the most recently updated entry among all postings of the role, and neither changes considered, not_considered_reason or any other rule.'`,
   `COMMENT ON COLUMN candidates.enriched_at IS 'When the enrichment stage last fetched this page directly to fill in employer and details and look for the primary source.'`,
   `COMMENT ON COLUMN candidates.primary_source_url IS 'Link from this page to the employer''s own or ATS posting, when one was found.'`,
   `COMMENT ON COLUMN candidates.found_via IS 'For postings discovered by following a link, the candidate whose page linked to it.'`,
@@ -1973,6 +1995,11 @@ async function main() {
     await sql.unsafe(READ_ROLE_GRANTS);
   } catch (err) {
     cycleError("grant_error", err);
+  }
+  if (MIGRATE_ONLY) {
+    console.log(JSON.stringify({ at: new Date().toISOString(), event: "migrated" }));
+    await sql.close();
+    return 0;
   }
   await seed();
   console.log(JSON.stringify({ at: new Date().toISOString(), event: "startup", seed_version: SEED_VERSION }));
