@@ -106,19 +106,27 @@ data:
     const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 120);
     const PROCESS_INTERVAL_MS = Number(process.env.PROCESS_INTERVAL_MS ?? 10_000);
     const PROCESS_BATCH = Number(process.env.PROCESS_BATCH ?? 20);
+    const HEALTH_MAX_EVENT_AGE_H = Number(process.env.HEALTH_MAX_EVENT_AGE_H ?? 48);
+    const HEALTH_MAX_BACKLOG_MIN = Number(process.env.HEALTH_MAX_BACKLOG_MIN ?? 15);
 
-    if (!DATABASE_URL) {
-      console.error('FATAL: DATABASE_URL must be set');
-      process.exit(1);
-    }
-    if (!DUXSOUP_API_KEY) {
-      console.error('WARN: DUXSOUP_API_KEY not set — /duxsoup/events will reject every request with 401');
-    }
-    if (!DUXSOUP_USER_ID || !DUXSOUP_API_KEY) {
-      console.error('WARN: DUXSOUP_USER_ID / DUXSOUP_API_KEY not fully set — duxsoup-settings poll will be skipped');
+    // `healthcheck` only reads the heartbeat Lease: no database, no server, no
+    // Dux Soup poll, so it needs none of the env below.
+    const HEALTHCHECK = process.argv[2] === 'healthcheck';
+
+    if (!HEALTHCHECK) {
+      if (!DATABASE_URL) {
+        console.error('FATAL: DATABASE_URL must be set');
+        process.exit(1);
+      }
+      if (!DUXSOUP_API_KEY) {
+        console.error('WARN: DUXSOUP_API_KEY not set — /duxsoup/events will reject every request with 401');
+      }
+      if (!DUXSOUP_USER_ID || !DUXSOUP_API_KEY) {
+        console.error('WARN: DUXSOUP_USER_ID / DUXSOUP_API_KEY not fully set — duxsoup-settings poll will be skipped');
+      }
     }
 
-    const sql = new SQL(DATABASE_URL);
+    const sql = HEALTHCHECK ? null : new SQL(DATABASE_URL);
 
     // ---------------------------------------------------------------------------
     // Schema (idempotent; re-run safely on every startup)
@@ -373,6 +381,16 @@ data:
       return { token: _k8sToken, ca: _k8sCa };
     }
 
+    async function k8sGet(path) {
+      const { token, ca } = k8sAuth();
+      const r = await fetch(`${K8S_HOST}${path}`, {
+        tls: { ca },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!r.ok) throw new Error(`k8s GET ${path} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      return r.json();
+    }
+
     async function k8sPatch(path, body) {
       const { token, ca } = k8sAuth();
       const r = await fetch(`${K8S_HOST}${path}`, {
@@ -402,7 +420,8 @@ data:
           count(*) FILTER (WHERE processed_at IS NOT NULL)::int AS ingested_total,
           count(*) FILTER (WHERE processed_at IS NULL AND attempts > 0)::int AS failed_total,
           count(*) FILTER (WHERE processed_at IS NULL)::int AS pending,
-          max(received_at) AS last_event_at
+          max(received_at) AS last_event_at,
+          min(received_at) FILTER (WHERE processed_at IS NULL) AS oldest_unprocessed_at
         FROM events
       `;
       const [sessRow] = await sql`SELECT payload FROM events WHERE type = 'session' ORDER BY received_at DESC LIMIT 1`;
@@ -428,6 +447,7 @@ data:
         [`${ANN}/failed-total`]: String(stats?.failed_total ?? ''),
         [`${ANN}/pending`]: String(stats?.pending ?? ''),
         [`${ANN}/last-event-at`]: stats?.last_event_at ? new Date(stats.last_event_at).toISOString() : '',
+        [`${ANN}/oldest-unprocessed-at`]: stats?.oldest_unprocessed_at ? new Date(stats.oldest_unprocessed_at).toISOString() : '',
         [`${ANN}/session-state`]: JSON.stringify(stats?.sessionState ?? {}),
         [`${ANN}/rccommand-last-error`]: String(stats?.rcError ?? '').slice(0, 400),
       };
@@ -437,6 +457,67 @@ data:
       };
       try { await k8sPatch(LEASE_PATH, body); }
       catch (e) { console.error(`heartbeat: Lease PATCH failed: ${e.message}`); }
+    }
+
+    // Staleness is judged here, not in /readyz: a NotReady pod is dropped from
+    // its Service, and the webhooks that would clear it arrive through that
+    // Service. Pure (no I/O) so the thresholds can be exercised offline.
+    function evaluateHealth(lease, {
+      now = Date.now(),
+      maxEventAgeH = HEALTH_MAX_EVENT_AGE_H,
+      maxBacklogMin = HEALTH_MAX_BACKLOG_MIN,
+    } = {}) {
+      const renewTime = lease?.spec?.renewTime;
+      if (!renewTime) return { ok: false, message: 'no heartbeat yet (Lease has no renewTime — ingest has not reported)' };
+      const maxAgeSec = lease.spec?.leaseDurationSeconds ?? HEARTBEAT_MAX_AGE_SEC;
+      const hbAgeSec = (now - new Date(renewTime).getTime()) / 1000;
+      if (!Number.isFinite(hbAgeSec) || hbAgeSec > maxAgeSec) {
+        return { ok: false, message: `heartbeat stale (${Math.round(hbAgeSec)}s > ${maxAgeSec}s max) — ingest is not heartbeating` };
+      }
+      const ann = lease.metadata?.annotations ?? {};
+      if (!ann[`${ANN}/received-total`]) {
+        return { ok: false, message: 'ingest could not read its event stats (database unreachable?)' };
+      }
+      const lastEventAt = ann[`${ANN}/last-event-at`] ?? '';
+      const oldestAt = ann[`${ANN}/oldest-unprocessed-at`] ?? '';
+
+      let eventAge = 'none yet';
+      if (lastEventAt) {
+        const ageH = (now - new Date(lastEventAt).getTime()) / 3_600_000;
+        if (!Number.isFinite(ageH)) return { ok: false, message: `last-event-at is not a valid timestamp: ${lastEventAt}` };
+        if (ageH > maxEventAgeH) {
+          return { ok: false, message: `no Dux Soup event received in ${ageH.toFixed(1)}h (max ${maxEventAgeH}h)` };
+        }
+        eventAge = `${ageH.toFixed(1)}h`;
+      }
+      if (oldestAt) {
+        const ageMin = (now - new Date(oldestAt).getTime()) / 60_000;
+        if (!Number.isFinite(ageMin)) return { ok: false, message: `oldest-unprocessed-at is not a valid timestamp: ${oldestAt}` };
+        if (ageMin > maxBacklogMin) {
+          return { ok: false, message: `oldest unprocessed event is ${ageMin.toFixed(1)}m old (max ${maxBacklogMin}m)` };
+        }
+      }
+      return {
+        ok: true,
+        message: `received=${ann[`${ANN}/received-total`] ?? '?'} ingested=${ann[`${ANN}/ingested-total`] ?? '?'} pending=${ann[`${ANN}/pending`] ?? '?'} last_event_age=${eventAge}`,
+      };
+    }
+
+    // Run as `bun duxsoup-ingest.mjs healthcheck` by the duxsoup-ingest-health
+    // pod's readiness probe; reads only the heartbeat Lease.
+    async function healthcheck() {
+      let lease;
+      try { lease = await k8sGet(LEASE_PATH); }
+      catch (e) {
+        console.error(`UNHEALTHY: Lease GET failed: ${e.message}`);
+        process.exit(1);
+      }
+      const verdict = evaluateHealth(lease);
+      if (!verdict.ok) {
+        console.error(`UNHEALTHY: ${verdict.message}`);
+        process.exit(1);
+      }
+      console.log(`OK: ${verdict.message}`);
     }
 
     // ---------------------------------------------------------------------------
@@ -964,29 +1045,15 @@ data:
       return Response.json({ profiles });
     }
 
+    // Ready means "can accept and store events"; event freshness and backlog
+    // are the health pod's concern (see evaluateHealth).
     async function handleReadyz() {
-      let agg;
       try {
-        const rows = await sql`
-          SELECT count(*)::int AS total,
-                 max(received_at) AS last_event_at,
-                 min(received_at) FILTER (WHERE processed_at IS NULL) AS oldest_unprocessed
-          FROM events
-        `;
-        agg = rows[0];
+        const [{ total }] = await sql`SELECT count(*)::int AS total FROM events`;
+        return Response.json({ ready: true, total });
       } catch (e) {
         return Response.json({ ready: false, reason: `database unreachable: ${e.message}` }, { status: 503 });
       }
-      const now = Date.now();
-      if (agg.total > 0 && agg.last_event_at) {
-        const ageH = (now - new Date(agg.last_event_at).getTime()) / 3_600_000;
-        if (ageH > 48) return Response.json({ ready: false, reason: `no event received in ${ageH.toFixed(1)}h (max 48h)` }, { status: 503 });
-      }
-      if (agg.oldest_unprocessed) {
-        const ageMin = (now - new Date(agg.oldest_unprocessed).getTime()) / 60_000;
-        if (ageMin > 15) return Response.json({ ready: false, reason: `oldest unprocessed event is ${ageMin.toFixed(1)}m old (max 15m)` }, { status: 503 });
-      }
-      return Response.json({ ready: true, total: agg.total });
     }
 
     async function main() {
@@ -1021,7 +1088,8 @@ data:
       console.log(`duxsoup-ingest listening on :${PORT}`);
     }
 
-    await main();
+    if (HEALTHCHECK) await healthcheck();
+    else await main();
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -1045,7 +1113,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "1"
+        simplesalt.company/restart-epoch: "2"
     spec:
       serviceAccountName: duxsoup-ingest
       containers:
@@ -1131,3 +1199,97 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duxsoup-ingest-health
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: duxsoup-ingest-heartbeat-reader
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["duxsoup-ingest-heartbeat"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duxsoup-ingest-heartbeat-reader
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: duxsoup-ingest-heartbeat-reader
+subjects:
+  - kind: ServiceAccount
+    name: duxsoup-ingest-health
+    namespace: ssint-main-msg
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duxsoup-ingest-health
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: duxsoup-ingest-health
+  template:
+    metadata:
+      labels:
+        app: duxsoup-ingest-health
+        entity: ssint
+        env: main
+        capability: msg
+    spec:
+      serviceAccountName: duxsoup-ingest-health
+      containers:
+        - name: health
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          readinessProbe:
+            exec:
+              command: ["bun", "/scripts/duxsoup-ingest.mjs", "healthcheck"]
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 15
+            successThreshold: 1
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: duxsoup-ingest-script
