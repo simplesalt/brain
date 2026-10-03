@@ -241,12 +241,12 @@ spec:
                 secretName: openrouter-api-key
                 optional: true
 ---
-# One-time: runs the first cycle now rather than at the next scheduled time; remove once it has
-# completed. No ttlSecondsAfterFinished, or Flux would re-create it (and re-run the cycle) after the TTL.
+# One-time: reruns a cycle now so postings the first cycle left untried get their details; remove once
+# it has completed. No ttlSecondsAfterFinished, or Flux would re-create it (and re-run the cycle) after the TTL.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: discovery-worker-first-run
+  name: discovery-worker-catch-up
   namespace: ssint-main-crawl
   labels:
     entity: ssint

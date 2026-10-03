@@ -1109,6 +1109,11 @@ async function extractWithLlm(key, row, text) {
   };
 }
 
+// Postings first seen from this date on get their details filled even if the cycle that found them
+// ended early; older ones only when they are a considered role's primary (the jobs found before
+// detail markers existed keep their blanks).
+const DETAILS_SINCE = "2026-10-03T00:00:00Z";
+
 function newCounts() {
   return { targets: 0, filled: 0, not_mentioned: 0, cant_find: 0, pending: 0, max_retries: 0, followed: 0, added: 0, errors: [] };
 }
@@ -1167,7 +1172,7 @@ async function writeExtraction(row, c, model) {
             WHEN ${g} AND found_detail(remote_eligibility) IS NOT NULL THEN remote_eligibility
             ELSE coalesce(${c.remote}, remote_eligibility) END), ${NOT_MENTIONED}),
       posted_at = CASE WHEN ${g} THEN coalesce(posted_at, ${c.postedAt}) ELSE coalesce(${c.postedAt}, posted_at) END,
-      is_job_posting = CASE WHEN ${c.isJob} IS NULL THEN is_job_posting ELSE (${c.isJob} AND coalesce(is_job_posting, true)) END,
+      is_job_posting = CASE WHEN ${c.isJob}::boolean IS NULL THEN is_job_posting ELSE (${c.isJob}::boolean AND coalesce(is_job_posting, true)) END,
       job_title = coalesce(found_detail(coalesce(${c.jobTitle}::text, job_title)), ${NOT_MENTIONED}),
       job_title_version = CASE WHEN ${c.jobTitle}::text IS NULL THEN job_title_version ELSE ${TITLE_VERSION}::int END,
       extract_version = ${EXTRACT_VERSION},
@@ -1235,25 +1240,28 @@ async function recordFailure(row, err, step, counts) {
 // max_retries. The attempt is stamped first, so even a crash leaves the posting out of this pass.
 async function fillOne(row, key, counts) {
   await sql`UPDATE candidates SET detail_tried_at = now() WHERE id = ${row.id}`;
-  // Page text and extraction that already succeeded are not repeated.
-  if (row.extracted) return await settleDetails(row.id);
   let step = "page";
-  let result;
   try {
+    // Page text and extraction that already succeeded are not repeated.
+    if (row.extracted) return await settleDetails(row.id);
     const text = row.has_text ? row.page_text : await fetchPageText(row, counts);
     step = "model";
-    result = await extractWithLlm(key, row, text);
+    const result = await extractWithLlm(key, row, text);
+    step = "write";
+    return await writeExtraction(row, result.c, result.model);
   } catch (err) {
-    if (!(err instanceof DetailError)) throw err;
-    return await recordFailure(row, err, step, counts);
+    // Anything unexpected (a bug, a database hiccup) is retried like a temporary failure, so one bad
+    // posting can neither stop the pass nor be skipped silently.
+    const e = err instanceof DetailError ? err : new DetailError(cleanReason(`internal error: ${err?.message ?? err}`), true);
+    return await recordFailure(row, e, step, counts);
   }
-  return await writeExtraction(row, result.c, result.model);
 }
 
 // Fills the details (employer, sector, skills, success, remote, job title) of up to LLM_BATCH
 // postings still in play, tallying how each ended into `counts` as it goes (a pass shares one
 // tally across its batches and keeps it if a batch throws). Targets are postings that are new this
-// cycle (first seen at or after `cycleStart`), primaries of roles currently considered, and
+// cycle (first seen at or after `cycleStart`, or first seen since DETAILS_SINCE with no outcome
+// recorded, so a cycle cut short leaves nothing behind), primaries of roles currently considered, and
 // postings waiting on a retry, each only while some detail is missing and the role is not ruled
 // out. A posting is attempted at most once per pass: the normal pass skips anything tried since
 // `cycleStart`; the retry pass (`retryFrom` = when it started) takes only postings that went
@@ -1301,6 +1309,8 @@ async function fillDetails(cycleStart, retryFrom = null, counts = newCounts()) {
                THEN c.detail_pending AND c.detail_tried_at >= ${cycleStart}::timestamptz AND c.detail_tried_at < ${retryFrom ?? cycleStart}::timestamptz
                ELSE (c.detail_tried_at IS NULL OR c.detail_tried_at < ${cycleStart}::timestamptz)
                     AND (c.first_seen_at >= ${cycleStart}::timestamptz OR c.detail_pending
+                         -- Nothing recorded yet (never tried, or its attempt died before an outcome).
+                         OR (c.first_seen_at >= ${DETAILS_SINCE}::timestamptz AND c.detail_error IS NULL)
                          -- A considered primary whose page was already tried and has no usable text is not
                          -- fetched again every cycle. It is picked up again once search results bring text.
                          OR (c.is_role_primary AND coalesce(rr.considered, false)
