@@ -8,7 +8,7 @@ resources:
   - manifests/hermes-proxy.yaml
   - manifests/gbrain-embedding-secret.yaml
   - manifests/gbrain-reranker-secret.yaml
-  - manifests/gbrain-mcp-server-token.yaml
+  - manifests/gbrain-mcp-server-token-cleanup.yaml
   - manifests/email-collector.yaml
   - manifests/calendar-collector.yaml
   - manifests/lease-sweep.yaml

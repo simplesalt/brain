@@ -1,0 +1,139 @@
+# One-off cleanup after reverting the minted MCP-server gbrain token: drops its
+# access_tokens row (matched by hash) and deletes both Secrets the old Job made
+# outside git. Remove this file once the Job has completed.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gbrain-mcp-server-token-cleanup
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gbrain-mcp-server-token-cleanup
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "delete"]
+    resourceNames: ["gbrain-mcp-server-token"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gbrain-mcp-server-token-cleanup
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gbrain-mcp-server-token-cleanup
+subjects:
+  - kind: ServiceAccount
+    name: gbrain-mcp-server-token-cleanup
+    namespace: ssint-main-ai
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gbrain-mcp-server-token-cleanup
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "delete"]
+    resourceNames: ["gbrain-mcp-server-token"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gbrain-mcp-server-token-cleanup
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gbrain-mcp-server-token-cleanup
+subjects:
+  - kind: ServiceAccount
+    name: gbrain-mcp-server-token-cleanup
+    namespace: ssint-main-ai
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cleanup-gbrain-mcp-server-token
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app: cleanup-gbrain-mcp-server-token
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      serviceAccountName: gbrain-mcp-server-token-cleanup
+      restartPolicy: OnFailure
+      initContainers:
+        - name: drop-token-row
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "-e"]
+          args:
+            - |
+              import { SQL } from "bun";
+              const t = process.env.MCP_SERVER_TOKEN;
+              if (!t) { console.log("no minted token Secret; nothing to drop"); process.exit(0); }
+              const h = new Bun.CryptoHasher("sha256").update(t).digest("hex");
+              const db = new SQL(process.env.DATABASE_URL);
+              const r = await db`DELETE FROM access_tokens WHERE token_hash = ${h}`;
+              await db.end();
+              console.log(`dropped ${r.count} access_tokens row(s) for the minted token`);
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+            - name: MCP_SERVER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-mcp-server-token
+                  key: token
+                  optional: true
+      containers:
+        - name: delete-secrets
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              kubectl delete secret gbrain-mcp-server-token -n ssint-main-ai --ignore-not-found
+              kubectl delete secret gbrain-mcp-server-token -n flux-system --ignore-not-found
+              echo "gbrain-mcp-server-token Secrets removed"

@@ -162,16 +162,6 @@ spec:
                 await db.end();
                 console.log("gbrain: hermes-mcp bearer asserted");
               ' || echo "WARN: token seed failed; hermes /mcp calls will 401"
-              bun -e '
-                import { SQL } from "bun";
-                const t = process.env.MCP_SERVER_TOKEN;
-                if (!t) { console.error("MCP_SERVER_TOKEN empty"); process.exit(1); }
-                const h = new Bun.CryptoHasher("sha256").update(t).digest("hex");
-                const db = new SQL(process.env.DATABASE_URL);
-                await db`INSERT INTO access_tokens (name, token_hash) VALUES (${"mcp-server"}, ${h}) ON CONFLICT (token_hash) DO NOTHING`;
-                await db.end();
-                console.log("gbrain: mcp-server bearer asserted");
-              ' || echo "WARN: mcp-server token seed failed; SimpleSalt MCP server /mcp calls will 401"
               exec $GBRAIN serve --http --bind 0.0.0.0
           env:
             - name: DATABASE_URL
@@ -204,14 +194,6 @@ spec:
                   optional: true
             - name: GBRAIN_REMOTE_TOKEN
               value: "gbrain-mcp"
-            # Deliberately not optional: env is read only at container start, so an
-            # optional miss would never be seeded. The pod waits for the Secret that
-            # Job generate-gbrain-mcp-server-token mints; the old pod keeps serving.
-            - name: MCP_SERVER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: gbrain-mcp-server-token
-                  key: token
             - name: GBRAIN_HTTP_CORS_ORIGIN
               value: "http://localhost:3131"
           ports:
