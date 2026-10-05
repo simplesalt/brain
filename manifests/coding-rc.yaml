@@ -27,7 +27,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.16.0"
+      version: "0.25.0"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -47,8 +47,8 @@ spec:
       slug: basis
       ref: main
     oauthSecret:
-      create: false
-      name: claude-oauth-basis
+      create: true
+      seedFrom: claude-oauth-basis
     resources:
       builder:
         requests:
@@ -125,7 +125,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.16.0"
+      version: "0.25.0"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -145,8 +145,8 @@ spec:
       slug: oci
       ref: main
     oauthSecret:
-      create: false
-      name: claude-oauth-oci
+      create: true
+      seedFrom: claude-oauth-oci
     resources:
       builder:
         requests:
@@ -173,7 +173,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.16.0"
+      version: "0.25.0"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -217,7 +217,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.16.0"
+      version: "0.25.0"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
