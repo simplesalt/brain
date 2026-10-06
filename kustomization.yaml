@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - manifests/ai.yaml
   - manifests/gbrain-preflight.yaml
+  - manifests/gbrain-align-embedding-width.yaml
   - manifests/crawl.yaml
   - manifests/hindsight-chart.yaml
   - manifests/big-agi.yaml

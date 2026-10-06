@@ -1,0 +1,346 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-align-embedding-width
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-align-embedding-width
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-db
+          image: postgres:17-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - until pg_isready -h gbrain-pg-rw -p 5432; do echo "waiting for gbrain-pg-rw:5432"; sleep 2; done
+        - name: install-gbrain
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ ! -x /install/bin/gbrain ]; then
+                BUN_INSTALL=/install bun install -g github:garrytan/gbrain#492b5528238dfea0ed9e3ee491805d83af86f6a6 \
+                  || { echo "FATAL: gbrain install failed"; exit 1; }
+              fi
+          volumeMounts:
+            - name: gbrain-install
+              mountPath: /install
+      containers:
+        - name: align
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PATH="/install/bin:$PATH"
+              TARGET_MODEL=openai:text-embedding-3-small
+              TARGET_DIM=1536
+              EXPECTED_SCHEMA=141
+              export TARGET_MODEL TARGET_DIM EXPECTED_SCHEMA
+              ARGS="--to $TARGET_MODEL --dim $TARGET_DIM --reranker keep"
+
+              fail() { echo "FATAL: $1"; exit 1; }
+              section() { echo; echo "== $1 =="; }
+
+              if [ -x /install/bin/gbrain ] && /install/bin/gbrain --version >/dev/null 2>&1; then
+                GBRAIN="/install/bin/gbrain"
+              else
+                CLI="$(find /install -maxdepth 8 -path '*/gbrain/src/cli.ts' 2>/dev/null | head -1)"
+                if [ -z "$CLI" ]; then
+                  echo "FATAL: gbrain CLI not found. /install layout:"
+                  ls -la /install /install/bin 2>&1
+                  find /install -maxdepth 8 -name cli.ts 2>/dev/null | head
+                  exit 1
+                fi
+                GBRAIN="bun $CLI"
+              fi
+              echo "gbrain-align-embedding-width: using $GBRAIN at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+              [ "${GBRAIN_EMBEDDING_MODEL:-}" = "$TARGET_MODEL" ] || fail "GBRAIN_EMBEDDING_MODEL must be $TARGET_MODEL"
+              [ "${GBRAIN_EMBEDDING_DIMENSIONS:-}" = "$TARGET_DIM" ] || fail "GBRAIN_EMBEDDING_DIMENSIONS must be $TARGET_DIM"
+              [ -n "${OPENAI_API_KEY:-}" ] || fail "OPENAI_API_KEY is empty; the migration's live probe needs it"
+
+              cat > /tmp/align.mjs <<'JS'
+              import { SQL } from "bun";
+              import { readFileSync, writeFileSync } from "node:fs";
+
+              const mode = process.argv[2];
+              const arg = process.argv[3];
+              const model = process.env.TARGET_MODEL;
+              const dim = Number(process.env.TARGET_DIM);
+              const schema = Number(process.env.EXPECTED_SCHEMA);
+              const sig = model + ":" + dim;
+              const bare = model.slice(model.indexOf(":") + 1);
+              const db = new SQL(process.env.DATABASE_URL);
+
+              const show = (title, rows) => {
+                console.log("-- " + title);
+                if (rows.length === 0) console.log("   (no rows)");
+                for (const r of rows) console.log("   " + JSON.stringify(r));
+              };
+              const widthOf = (type) => {
+                const m = /\((\d+)\)/.exec(type || "");
+                return m ? Number(m[1]) : null;
+              };
+              const typeOf = (cols, tbl) => cols.find((c) => c.tbl === tbl && c.col === "embedding")?.type ?? null;
+              const cfgOf = (rows) => Object.fromEntries(rows.map((r) => [r.key, r.value]));
+              const finish = async (code) => {
+                await db.end();
+                process.exit(code);
+              };
+
+              async function readOnly(work) {
+                const out = {};
+                await db.begin(async (tx) => {
+                  await tx`SET TRANSACTION READ ONLY`;
+                  await work(tx, out);
+                });
+                return out;
+              }
+
+              async function readColsAndConfig(tx, o) {
+                o.cols = [...(await tx`SELECT c.relname AS tbl, a.attname AS col, format_type(a.atttypid, a.atttypmod) AS type FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' AND format_type(a.atttypid, a.atttypmod) ~ '^(vector|halfvec)' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1, 2`)];
+                o.config = [...(await tx`SELECT key, value FROM config WHERE key IN ('embedding_model', 'embedding_dimensions', 'search_embedding_column', 'embedding_columns', 'version') OR key LIKE 'embedding_migration.%' ORDER BY key`)];
+              }
+
+              async function readState(maxId) {
+                return await readOnly(async (tx, o) => {
+                  await readColsAndConfig(tx, o);
+                  o.counts = (await tx`SELECT (SELECT count(*) FROM content_chunks)::int AS content_chunks, (SELECT count(embedding) FROM content_chunks)::int AS content_chunks_embedded, (SELECT count(*) FROM takes)::int AS takes, (SELECT count(*) FROM facts)::int AS facts, (SELECT count(*) FROM query_cache)::int AS query_cache`)[0];
+                  o.pages = [...(await tx`SELECT embedding_signature, contextual_retrieval_mode, chunker_version, count(*)::int AS pages, (count(*) FILTER (WHERE deleted_at IS NULL))::int AS live FROM pages GROUP BY 1, 2, 3 ORDER BY 4 DESC`)];
+                  o.models = [...(await tx`SELECT model, count(*)::int AS chunks, count(embedding)::int AS embedded FROM content_chunks GROUP BY model ORDER BY 2 DESC`)];
+                  o.maxId = maxId === undefined ? (await tx`SELECT COALESCE(max(id), 0)::int AS m FROM content_chunks`)[0].m : maxId;
+                  o.fp = (await tx`SELECT count(*)::int AS n, md5(COALESCE(string_agg(id::text || md5(embedding::text), ',' ORDER BY id), '')) AS fp FROM content_chunks WHERE embedding IS NOT NULL AND id <= ${o.maxId}`)[0];
+                });
+              }
+
+              async function stateMode() {
+                const pre = arg === "post" ? JSON.parse(readFileSync("/tmp/pre.json", "utf8")) : null;
+                const s = await readState(pre ? pre.maxId : undefined);
+                show("vector and halfvec columns", s.cols);
+                show("row counts", [s.counts]);
+                show("config rows", s.config);
+                show("pages by signature, context mode, chunker", s.pages);
+                show("content_chunks by model", s.models);
+                show("content_chunks embedded vectors up to id " + s.maxId + " (fingerprint)", [s.fp]);
+                writeFileSync("/tmp/" + arg + ".json", JSON.stringify(s));
+                await finish(0);
+              }
+
+              async function guardMode() {
+                const g = await readOnly(async (tx, o) => {
+                  await readColsAndConfig(tx, o);
+                  o.facts = (await tx`SELECT count(*)::int AS n FROM facts`)[0].n;
+                  o.nullChunks = (await tx`SELECT count(*)::int AS n FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE cc.embedding IS NULL AND NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip')`)[0].n;
+                  o.victims = (await tx`SELECT count(*)::int AS n FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE cc.embedding IS NOT NULL AND NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip') AND (p.embedding_signature IS NULL OR p.embedding_signature <> ${sig})`)[0].n;
+                  o.falseStamps = (await tx`SELECT count(*)::int AS n FROM pages p WHERE p.embedding_signature = ${sig} AND p.deleted_at IS NULL AND NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip') AND EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id = p.id AND c.embedding IS NOT NULL AND c.model IS NOT NULL AND c.model <> ${model} AND c.model <> ${bare})`)[0].n;
+                  o.drift = (await tx`SELECT count(*)::int AS n FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE cc.embedding IS NOT NULL AND cc.embedded_text_hash IS NOT NULL AND cc.embedded_text_hash <> md5(cc.chunk_text) AND NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip')`)[0].n;
+                });
+                const cfg = cfgOf(g.config);
+                const inflight = "embedding_migration.state" in cfg;
+                const aligned = widthOf(typeOf(g.cols, "content_chunks")) === dim
+                  && widthOf(typeOf(g.cols, "facts")) === dim
+                  && widthOf(typeOf(g.cols, "query_cache")) === dim
+                  && cfg.embedding_dimensions === String(dim)
+                  && cfg.embedding_model === model
+                  && !inflight;
+                if (aligned) {
+                  console.log("ALREADY ALIGNED: every embedding column is " + dim + " wide and the config row says " + dim + "; nothing to do.");
+                  await finish(10);
+                }
+                const checks = [
+                  ["schema version " + cfg.version + " is at least " + schema + " (a lower one would make gbrain migrate the schema just by connecting)", Number(cfg.version) >= schema],
+                  ["content_chunks.embedding is vector(" + dim + ") (is " + typeOf(g.cols, "content_chunks") + ")", typeOf(g.cols, "content_chunks") === "vector(" + dim + ")"],
+                  ["facts has 0 rows (has " + g.facts + ")", g.facts === 0],
+                  ["0 content_chunks have a NULL vector, so the re-embed pass has nothing to embed (has " + g.nullChunks + ")", g.nullChunks === 0],
+                  ["0 embedded chunks sit on pages whose signature is not " + sig + ", so none would be nulled (has " + g.victims + ")", g.victims === 0],
+                  ["0 pages carry a false " + sig + " stamp (has " + g.falseStamps + ")", g.falseStamps === 0],
+                  ["0 embedded chunks have drifted text, so none would be nulled (has " + g.drift + ")", g.drift === 0],
+                  ["no custom embedding column registry", (!cfg.search_embedding_column || cfg.search_embedding_column === "embedding") && !cfg.embedding_columns],
+                  ["no migration marker in flight", !inflight],
+                ];
+                let bad = 0;
+                for (const [label, ok] of checks) {
+                  console.log((ok ? "   ok    " : "   FAIL  ") + label);
+                  if (!ok) bad++;
+                }
+                if (bad > 0) {
+                  console.log("GUARD FAILED: " + bad + " check(s); nothing was changed.");
+                  await finish(1);
+                }
+                console.log("GUARDS PASSED: the apply step cannot null or re-embed any content_chunks vector.");
+                await finish(0);
+              }
+
+              async function planMode() {
+                const raw = readFileSync(arg, "utf8");
+                const start = raw.search(/^\{\s*$/m);
+                if (start < 0) {
+                  console.log("GUARD FAILED: no JSON plan in the dry-run output; nothing was changed.");
+                  await finish(1);
+                }
+                let env;
+                try {
+                  env = JSON.parse(raw.slice(start));
+                } catch {
+                  env = JSON.parse(raw.slice(start, raw.lastIndexOf("\n}") + 2));
+                }
+                if (env.status === "skipped_no_work") {
+                  const o = await readOnly(async (tx, out) => {
+                    out.config = [...(await tx`SELECT key, value FROM config WHERE key IN ('embedding_model', 'embedding_dimensions')`)];
+                  });
+                  const cfg = cfgOf(o.config);
+                  if (cfg.embedding_dimensions === String(dim) && cfg.embedding_model === model) {
+                    console.log("PLAN: gbrain says nothing to migrate and the config row already says " + dim + "; nothing to do.");
+                    await finish(10);
+                  }
+                  console.log("GUARD FAILED: gbrain says nothing to migrate, so it will not write the config row, which says " + cfg.embedding_model + " at " + cfg.embedding_dimensions + "; that needs a reviewed manual update. Nothing was changed.");
+                  await finish(1);
+                }
+                const p = env.plan || {};
+                const v = env.verified || {};
+                const d = v.details || {};
+                const blockerOk = new RegExp("^(facts|query_cache)\\.embedding is \\d+d, target is " + dim + "d$");
+                const checks = [
+                  ["plan status is planned (is " + env.status + ")", env.status === "planned"],
+                  ["target is " + sig, p.to_model === model && p.to_dims === dim],
+                  ["content_chunks column is already " + dim + " wide, so no rebuild (column " + p.column_dims + ", dim_change " + p.dim_change + ")", p.column_dims === dim && p.dim_change === false],
+                  ["plan re-embeds 0 chunks (" + p.chunks_to_embed + ")", p.chunks_to_embed === 0],
+                  ["plan clears 0 false stamps (" + p.false_stamped_chunks + ") and 0 null-signature chunks (" + p.null_signature_chunks + ")", p.false_stamped_chunks === 0 && p.null_signature_chunks === 0],
+                  ["0 pages at the synopsis tier (" + p.synopsis_tier_pages + ")", p.synopsis_tier_pages === 0],
+                  ["0 stale chunks, 0 false stamps, 0 missing vectors, 0 chunkless pages (" + d.stale_wide + ", " + d.false_stamped_chunks + ", " + d.missing_embeddings + ", " + d.chunkless_pages + ")", d.stale_wide === 0 && d.false_stamped_chunks === 0 && d.missing_embeddings === 0 && d.chunkless_pages === 0],
+                  ["no migration marker (" + d.marker + ") and the runtime config pins the target (" + d.file_plane_ok + ")", d.marker === "none" && d.file_plane_ok === true],
+                  ["the only blockers are facts and query_cache widths: " + JSON.stringify(v.blockers), Array.isArray(v.blockers) && v.blockers.length > 0 && v.blockers.every((b) => blockerOk.test(b))],
+                ];
+                let bad = 0;
+                for (const [label, ok] of checks) {
+                  console.log((ok ? "   ok    " : "   FAIL  ") + label);
+                  if (!ok) bad++;
+                }
+                if (bad > 0) {
+                  console.log("PLAN GUARD FAILED: " + bad + " check(s); nothing was changed.");
+                  await finish(1);
+                }
+                console.log("PLAN GUARD PASSED: the plan touches only facts, query_cache and the config row.");
+                await finish(0);
+              }
+
+              async function verifyMode() {
+                const pre = JSON.parse(readFileSync("/tmp/pre.json", "utf8"));
+                const post = JSON.parse(readFileSync("/tmp/post.json", "utf8"));
+                const cfg = cfgOf(post.config);
+                const checks = [
+                  ["content_chunks.embedding is vector(" + dim + ") (is " + typeOf(post.cols, "content_chunks") + ")", typeOf(post.cols, "content_chunks") === "vector(" + dim + ")"],
+                  ["facts.embedding is " + dim + " wide (is " + typeOf(post.cols, "facts") + ")", widthOf(typeOf(post.cols, "facts")) === dim],
+                  ["query_cache.embedding is " + dim + " wide (is " + typeOf(post.cols, "query_cache") + ")", widthOf(typeOf(post.cols, "query_cache")) === dim],
+                  ["takes.embedding is " + dim + " wide (is " + typeOf(post.cols, "takes") + ")", widthOf(typeOf(post.cols, "takes")) === dim],
+                  ["config embedding_dimensions is " + dim + " (is " + cfg.embedding_dimensions + ")", cfg.embedding_dimensions === String(dim)],
+                  ["config embedding_model is " + model + " (is " + cfg.embedding_model + ")", cfg.embedding_model === model],
+                  ["no migration marker left in flight", !("embedding_migration.state" in cfg)],
+                  ["completion record written", "embedding_migration.completed" in cfg],
+                  ["facts still has 0 rows (has " + post.counts.facts + ")", post.counts.facts === 0],
+                  ["content_chunks vectors up to id " + pre.maxId + " are byte-identical to before (" + pre.fp.n + " before, " + post.fp.n + " after)", pre.fp.n === post.fp.n && pre.fp.fp === post.fp.fp],
+                ];
+                let bad = 0;
+                for (const [label, ok] of checks) {
+                  console.log((ok ? "   ok    " : "   FAIL  ") + label);
+                  if (!ok) bad++;
+                }
+                console.log(bad > 0 ? "POST-CHECK FAILED: " + bad + " check(s)." : "POST-CHECK PASSED.");
+                await finish(bad > 0 ? 1 : 0);
+              }
+
+              try {
+                if (mode === "state") await stateMode();
+                else if (mode === "guard") await guardMode();
+                else if (mode === "plan") await planMode();
+                else if (mode === "verify") await verifyMode();
+                else throw new Error("unknown mode " + mode);
+              } catch (e) {
+                console.log("ERROR: " + (e instanceof Error ? e.message : String(e)));
+                await finish(1);
+              }
+              JS
+
+              section "1. pre-state (read-only SQL)"
+              bun /tmp/align.mjs state pre || fail "could not read the pre-state"
+
+              section "2. pre-apply guards (read-only SQL)"
+              bun /tmp/align.mjs guard
+              rc=$?
+              if [ "$rc" -eq 10 ]; then exit 0; fi
+              [ "$rc" -eq 0 ] || fail "pre-apply guards failed; nothing was changed"
+
+              section "3. gbrain status before"
+              $GBRAIN migrate embeddings --status || fail "gbrain status failed; nothing was changed"
+
+              section "4. gbrain dry-run plan"
+              $GBRAIN migrate embeddings $ARGS --dry-run --json > /tmp/plan.out 2> /tmp/plan.err
+              rc=$?
+              cat /tmp/plan.err
+              cat /tmp/plan.out
+              [ "$rc" -eq 0 ] || fail "gbrain dry-run exited $rc; nothing was changed"
+              bun /tmp/align.mjs plan /tmp/plan.out
+              rc=$?
+              if [ "$rc" -eq 10 ]; then exit 0; fi
+              [ "$rc" -eq 0 ] || fail "plan guard failed; nothing was changed"
+
+              section "5. apply"
+              $GBRAIN migrate embeddings $ARGS --yes
+              apply_rc=$?
+              echo "apply exited $apply_rc"
+
+              section "6. post-state (read-only SQL)"
+              bun /tmp/align.mjs state post || echo "WARN: could not read the post-state"
+              section "7. gbrain status after"
+              $GBRAIN migrate embeddings --status
+              section "8. post-check"
+              bun /tmp/align.mjs verify
+              verify_rc=$?
+
+              [ "$apply_rc" -eq 0 ] || fail "apply exited $apply_rc"
+              [ "$verify_rc" -eq 0 ] || fail "post-check failed"
+              echo "gbrain-align-embedding-width: done at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+            - name: GBRAIN_EMBEDDING_MODEL
+              value: openai:text-embedding-3-small
+            - name: GBRAIN_EMBEDDING_DIMENSIONS
+              value: "1536"
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-embedding-secret
+                  key: OPENAI_API_KEY
+                  optional: true
+          resources:
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: gbrain-install
+              mountPath: /install
+      volumes:
+        - name: gbrain-install
+          emptyDir: {}
