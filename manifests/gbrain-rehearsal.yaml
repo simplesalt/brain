@@ -8,7 +8,7 @@ metadata:
     env: main
     capability: ai
 data:
-  GBRAIN_REHEARSAL_SHA: "6e1e826286079c0ebc0a6a3b07ccd11475b3cf33"
+  GBRAIN_REHEARSAL_SHA: "f8d1e3936d908935ce96e18c14249aecd85fb5b2"
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -80,7 +80,7 @@ spec:
   template:
     metadata:
       annotations:
-        simplesalt.company/restart-epoch: "2"
+        simplesalt.company/restart-epoch: "3"
       labels:
         app: gbrain-rehearsal
         entity: ssint
@@ -623,9 +623,9 @@ spec:
               exit 0
           env:
             - name: RUNNER_MODE
-              value: apply-repairs
+              value: inspect
             - name: RUNNER_RUN_ID
-              value: "4"
+              value: "5"
             - name: RUNNER_REPAIR_ARGS
               value: ""
             - name: RUNNER_WAIT_FOR_SERVE
