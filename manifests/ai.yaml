@@ -443,7 +443,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        simplesalt.company/restart-epoch: "3"
+        simplesalt.company/restart-epoch: "4"
     spec:
       securityContext:
         fsGroup: 10000
