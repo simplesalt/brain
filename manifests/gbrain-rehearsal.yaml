@@ -1,0 +1,679 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gbrain-rehearsal-version
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  GBRAIN_REHEARSAL_SHA: "5cfb84f1d3a809c70064c292c23db3d538d5c551"
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: gbrain-pg-rehearsal
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+    resiliency.simplesalt.company/ha: exempt
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+  bootstrap:
+    initdb:
+      database: gbrain
+      owner: gbrain
+      encoding: UTF8
+      localeCollate: C
+      localeCType: C
+      import:
+        type: microservice
+        databases:
+          - gbrain
+        source:
+          externalCluster: gbrain-pg-source
+        postImportApplicationSQL:
+          - CREATE EXTENSION IF NOT EXISTS vector;
+          - CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          - CREATE EXTENSION IF NOT EXISTS pgcrypto;
+  externalClusters:
+    - name: gbrain-pg-source
+      connectionParameters:
+        host: gbrain-pg-rw
+        user: gbrain
+        dbname: gbrain
+      password:
+        name: gbrain-pg-app
+        key: password
+  managed:
+    roles:
+      - name: gbrain
+        ensure: present
+        login: true
+        superuser: true
+        bypassrls: true
+        passwordSecret:
+          name: gbrain-pg-rehearsal-app
+  storage:
+    size: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gbrain-rehearsal
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gbrain-rehearsal
+  template:
+    metadata:
+      annotations:
+        simplesalt.company/restart-epoch: "1"
+      labels:
+        app: gbrain-rehearsal
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      initContainers:
+        - name: wait-for-db
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              i=0
+              until pg_isready -h gbrain-pg-rehearsal-rw -p 5432; do
+                i=$((i + 1))
+                if [ "$i" -ge 450 ]; then echo "FATAL: gbrain-pg-rehearsal-rw:5432 not ready after 900s"; exit 1; fi
+                echo "waiting for gbrain-pg-rehearsal-rw:5432"
+                sleep 2
+              done
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 26
+            runAsGroup: 26
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+        - name: install-gbrain
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              GBRAIN_SHA="${GBRAIN_REHEARSAL_SHA:?GBRAIN_REHEARSAL_SHA is unset}"
+              echo "installing gbrain at ${GBRAIN_SHA}"
+              if [ ! -x /install/bin/gbrain ]; then
+                BUN_INSTALL=/install bun install -g "github:garrytan/gbrain#${GBRAIN_SHA}" \
+                  || { echo "FATAL: gbrain install failed"; exit 1; }
+              fi
+          env:
+            - name: GBRAIN_REHEARSAL_SHA
+              valueFrom:
+                configMapKeyRef:
+                  name: gbrain-rehearsal-version
+                  key: GBRAIN_REHEARSAL_SHA
+          volumeMounts:
+            - name: gbrain-install
+              mountPath: /install
+      containers:
+        - name: gbrain
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PATH="/install/bin:$PATH"
+              if [ -x /install/bin/gbrain ] && /install/bin/gbrain --version >/dev/null 2>&1; then
+                GBRAIN="/install/bin/gbrain"
+              else
+                CLI="$(find /install -maxdepth 8 -path '*/gbrain/src/cli.ts' 2>/dev/null | head -1)"
+                if [ -z "$CLI" ]; then
+                  echo "FATAL: gbrain CLI not found. /install layout:"
+                  ls -la /install /install/bin 2>&1
+                  find /install -maxdepth 8 -name cli.ts 2>/dev/null | head
+                  sleep 120; exit 1
+                fi
+                GBRAIN="bun $CLI"
+              fi
+              echo "Using gbrain command: $GBRAIN"
+              $GBRAIN init --non-interactive \
+                || $GBRAIN init --migrate-only \
+                || echo "WARN: gbrain init failed; serve may not work correctly"
+              $GBRAIN config set mcp.publish_advisor true \
+                || echo "WARN: config set mcp.publish_advisor failed (non-fatal)"
+              $GBRAIN config set search.reranker.model voyage:rerank-2.5 \
+                || echo "WARN: config set search.reranker.model failed (non-fatal)"
+              $GBRAIN config set facts.extraction_model openrouter:minimax/minimax-m2.7 \
+                || echo "WARN: config set facts.extraction_model failed (non-fatal)"
+              $GBRAIN config set cycle.conversation_facts_backfill.enabled true \
+                || echo "WARN: config set cycle.conversation_facts_backfill.enabled failed (non-fatal)"
+              bun -e '
+                import { SQL } from "bun";
+                const t = process.env.GBRAIN_REMOTE_TOKEN;
+                if (!t) { console.error("FATAL: GBRAIN_REMOTE_TOKEN unset"); process.exit(1); }
+                const h = new Bun.CryptoHasher("sha256").update(t).digest("hex");
+                const db = new SQL(process.env.DATABASE_URL);
+                await db`INSERT INTO access_tokens (name, token_hash) VALUES (${"hermes-mcp"}, ${h}) ON CONFLICT (token_hash) DO NOTHING`;
+                await db.end();
+                console.log("gbrain: hermes-mcp bearer asserted");
+              ' || echo "WARN: token seed failed; hermes /mcp calls will 401"
+              exec $GBRAIN serve --http --bind 0.0.0.0
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: uri
+            - name: GBRAIN_CHAT_MODEL
+              value: openrouter:minimax/minimax-m2.7
+            - name: GBRAIN_CHAT_FALLBACK_CHAIN
+              value: openrouter:openai/gpt-oss-120b
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: HINDSIGHT_API_LLM_API_KEY
+            - name: GBRAIN_EMBEDDING_MODEL
+              value: openai:text-embedding-3-small
+            - name: GBRAIN_EMBEDDING_DIMENSIONS
+              value: "1536"
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-embedding-secret
+                  key: OPENAI_API_KEY
+                  optional: true
+            - name: VOYAGE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-reranker-secret
+                  key: VOYAGE_API_KEY
+                  optional: true
+            - name: GBRAIN_REMOTE_TOKEN
+              value: "gbrain-mcp"
+            - name: GBRAIN_HTTP_CORS_ORIGIN
+              value: "http://localhost:3131"
+          ports:
+            - name: mcp
+              containerPort: 3131
+          startupProbe:
+            periodSeconds: 10
+            failureThreshold: 90
+            httpGet:
+              path: /health
+              port: 3131
+          livenessProbe:
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 10
+            httpGet:
+              path: /health
+              port: 3131
+          readinessProbe:
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 10
+            httpGet:
+              path: /health
+              port: 3131
+          resources:
+            requests:
+              memory: 128Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: gbrain-install
+              mountPath: /install
+        - name: autopilot
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PATH="/install/bin:$PATH"
+              for i in $(seq 1 60); do
+                if [ -x /install/bin/gbrain ] && /install/bin/gbrain --version >/dev/null 2>&1; then
+                  GBRAIN="/install/bin/gbrain"; break
+                fi
+                CLI="$(find /install -maxdepth 8 -path '*/gbrain/src/cli.ts' 2>/dev/null | head -1)"
+                if [ -n "$CLI" ]; then GBRAIN="bun $CLI"; break; fi
+                echo "autopilot: waiting for gbrain install ($i)"; sleep 5
+              done
+              if [ -z "$GBRAIN" ]; then echo "FATAL: gbrain CLI not found for autopilot"; sleep 120; exit 1; fi
+              echo "autopilot using: $GBRAIN"
+              CLI="$(find /install -maxdepth 8 -path '*/gbrain/src/cli.ts' 2>/dev/null | head -1)"
+              if [ -n "$CLI" ]; then
+                printf '#!/bin/sh\nexec bun %s "$@"\n' "$CLI" > /usr/local/bin/gbrain
+                chmod +x /usr/local/bin/gbrain
+                GBRAIN=/usr/local/bin/gbrain
+              fi
+              exec $GBRAIN autopilot --repo /tmp --interval 60
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: uri
+            - name: GBRAIN_CHAT_MODEL
+              value: openrouter:minimax/minimax-m2.7
+            - name: GBRAIN_CHAT_FALLBACK_CHAIN
+              value: openrouter:openai/gpt-oss-120b
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: HINDSIGHT_API_LLM_API_KEY
+            - name: GBRAIN_EMBEDDING_MODEL
+              value: openai:text-embedding-3-small
+            - name: GBRAIN_EMBEDDING_DIMENSIONS
+              value: "1536"
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-embedding-secret
+                  key: OPENAI_API_KEY
+                  optional: true
+          resources:
+            requests:
+              memory: 128Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: gbrain-install
+              mountPath: /install
+      volumes:
+        - name: gbrain-install
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gbrain-rehearsal
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  selector:
+    app: gbrain-rehearsal
+  ports:
+    - name: mcp
+      port: 3131
+      targetPort: 3131
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-rehearsal-runner
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-rehearsal-runner
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-db
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              i=0
+              until pg_isready -h gbrain-pg-rehearsal-rw -p 5432; do
+                i=$((i + 1))
+                if [ "$i" -ge 450 ]; then echo "FATAL: gbrain-pg-rehearsal-rw:5432 not ready after 900s"; exit 1; fi
+                echo "waiting for gbrain-pg-rehearsal-rw:5432"
+                sleep 2
+              done
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 26
+            runAsGroup: 26
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+        - name: install-gbrain
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              GBRAIN_SHA="${GBRAIN_REHEARSAL_SHA:?GBRAIN_REHEARSAL_SHA is unset}"
+              echo "installing gbrain at ${GBRAIN_SHA}"
+              if [ ! -x /install/bin/gbrain ]; then
+                BUN_INSTALL=/install bun install -g "github:garrytan/gbrain#${GBRAIN_SHA}" \
+                  || { echo "FATAL: gbrain install failed"; exit 1; }
+              fi
+          env:
+            - name: GBRAIN_REHEARSAL_SHA
+              valueFrom:
+                configMapKeyRef:
+                  name: gbrain-rehearsal-version
+                  key: GBRAIN_REHEARSAL_SHA
+          volumeMounts:
+            - name: gbrain-install
+              mountPath: /install
+      containers:
+        - name: runner
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PATH="/install/bin:$PATH"
+              MODE="${RUNNER_MODE:-inspect}"
+              case "$MODE" in
+                inspect|apply-repairs) ;;
+                *) echo "FATAL: RUNNER_MODE must be inspect or apply-repairs (got: $MODE)"; exit 1 ;;
+              esac
+              case "${DATABASE_URL#*@}" in
+                gbrain-pg-rehearsal-rw*) ;;
+                *) echo "FATAL: DATABASE_URL does not target gbrain-pg-rehearsal-rw; refusing to run"; exit 1 ;;
+              esac
+
+              if [ -x /install/bin/gbrain ] && /install/bin/gbrain --version >/dev/null 2>&1; then
+                GBRAIN="/install/bin/gbrain"
+              else
+                CLI="$(find /install -maxdepth 8 -path '*/gbrain/src/cli.ts' 2>/dev/null | head -1)"
+                if [ -z "$CLI" ]; then
+                  echo "FATAL: gbrain CLI not found. /install layout:"
+                  ls -la /install /install/bin 2>&1
+                  exit 1
+                fi
+                GBRAIN="bun $CLI"
+              fi
+
+              mkdir -p /work
+              cat > /work/q.ts <<'EOF'
+              import { SQL } from "bun";
+
+              const text = process.argv[2] ?? "";
+              if (!/^\s*(select|show|with)\b/i.test(text) || /;\s*\S/.test(text)) {
+                console.log("REFUSED (read-only inspection runs a single SELECT, SHOW or WITH only): " + text);
+                process.exit(1);
+              }
+
+              const show = (v: unknown): string => {
+                if (v === null || v === undefined) return "(null)";
+                if (v instanceof Date) return v.toISOString();
+                if (typeof v === "object") return JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x));
+                return String(v);
+              };
+
+              const db = new SQL(process.env.DATABASE_URL as string);
+              try {
+                const rows = await db.begin(async (tx) => {
+                  await tx.unsafe("SET TRANSACTION READ ONLY");
+                  await tx.unsafe("SET LOCAL statement_timeout = 60000");
+                  await tx.unsafe("SET LOCAL lock_timeout = 5000");
+                  return await tx.unsafe(text);
+                });
+                if (rows.length === 0) {
+                  console.log("(0 rows)");
+                } else {
+                  const cols = Object.keys(rows[0]);
+                  console.log(cols.join(" | "));
+                  for (const row of rows) console.log(cols.map((c) => show(row[c])).join(" | "));
+                }
+              } catch (e) {
+                console.log("ERROR: " + (e instanceof Error ? e.message : String(e)));
+                process.exitCode = 1;
+              } finally {
+                await db.end();
+              }
+              EOF
+
+              FAILED=""
+
+              section() {
+                echo
+                echo "=============================================================="
+                echo "== $1"
+                echo "=============================================================="
+              }
+
+              run() {
+                echo "+ $*"
+                "$@" 2>&1
+                rc=$?
+                echo "[exit $rc]"
+                if [ "$rc" -ne 0 ]; then
+                  FAILED="$FAILED
+                - $*"
+                fi
+                echo
+              }
+
+              q() {
+                bun /work/q.ts "$1"
+                echo
+              }
+
+              echo "gbrain-rehearsal-runner: mode=$MODE run-id=${RUNNER_RUN_ID:-none} gbrain-sha=${GBRAIN_REHEARSAL_SHA:-unknown} at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "target database: ${DATABASE_URL#*@}"
+              echo "gbrain command: $GBRAIN"
+
+              if [ "${RUNNER_WAIT_FOR_SERVE:-true}" = "true" ]; then
+                section "waiting for gbrain-rehearsal to finish startup (init and migrations)"
+                i=0
+                until wget -q -T 3 -O /dev/null http://gbrain-rehearsal:3131/health; do
+                  i=$((i + 1))
+                  if [ "$i" -ge 180 ]; then echo "WARN: gbrain-rehearsal not healthy after 900s; continuing anyway"; break; fi
+                  echo "waiting for gbrain-rehearsal /health ($i)"
+                  sleep 5
+                done
+              fi
+
+              if [ "$MODE" = "apply-repairs" ]; then
+                section "A1. gbrain repair safe-chunks --apply"
+                run $GBRAIN repair safe-chunks --apply $RUNNER_REPAIR_ARGS
+                section "A2. gbrain repair timeline --apply"
+                run $GBRAIN repair timeline --apply $RUNNER_REPAIR_ARGS
+              fi
+
+              section "1. gbrain --version"
+              run $GBRAIN --version
+
+              section "2. gbrain doctor --json"
+              run $GBRAIN doctor --json
+
+              section "3. gbrain sources list --json"
+              run $GBRAIN sources list --json
+
+              section "4. gbrain config get sync.repo_path"
+              run $GBRAIN config get sync.repo_path
+
+              section "5. gbrain sources writer status --probe --json (exists from the 6e1e826 build)"
+              run $GBRAIN sources writer status --probe --json
+
+              section "6. gbrain repair safe-chunks (dry run; exists from the 6e1e826 build)"
+              run $GBRAIN repair safe-chunks
+
+              section "7. gbrain repair timeline (dry run; exists from the 6e1e826 build)"
+              run $GBRAIN repair timeline
+
+              section "8. gbrain migrate embeddings --status"
+              run $GBRAIN migrate embeddings --status
+
+              section "S0. connection and read-only guard"
+              q "SELECT current_database() AS db, current_user AS role, current_setting('transaction_read_only') AS transaction_read_only, pg_size_pretty(pg_database_size(current_database())) AS database_size, now() AS at"
+
+              section "S0b. optional columns present at this schema version"
+              q "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND ((table_name = 'pages' AND column_name IN ('chunker_version','contextual_retrieval_mode','embedding_signature','deleted_at')) OR (table_name = 'sources' AND column_name IN ('archived','chunker_version','contextual_retrieval_mode')) OR (table_name = 'timeline_entries' AND column_name = 'source')) ORDER BY 1, 2"
+
+              section "S1. config rows (secret-like keys redacted, credentials in URLs redacted)"
+              q "SELECT key, CASE WHEN key ~* 'secret|key|token|password' THEN '<redacted>' ELSE regexp_replace(value, '://[^/@ ]*@', '://<redacted>@') END AS value FROM config WHERE key IN ('sync.repo_path','sync.write_through','embedding_model','embedding_dimensions','search.mode','search.reranker.model','version') OR key LIKE 'persistence%' OR key LIKE 'sync.%' OR key LIKE 'search.%' OR key LIKE 'embedding%' OR key LIKE 'chunker%' OR key LIKE 'contextual%' ORDER BY key"
+
+              section "S2. sources"
+              q "SELECT id, name, regexp_replace(local_path, '://[^/@ ]*@', '://<redacted>@') AS local_path, regexp_replace(config->>'github_repo', '://[^/@ ]*@', '://<redacted>@') AS github_repo, config->>'federated' AS federated, archived, last_sync_at, left(last_commit, 12) AS last_commit, chunker_version, contextual_retrieval_mode, (SELECT string_agg(k, ',' ORDER BY k) FROM jsonb_object_keys(config) AS k) AS config_keys FROM sources ORDER BY id"
+
+              section "S3a. pages per source (live vs soft-deleted)"
+              q "SELECT CASE WHEN GROUPING(source_id) = 1 THEN '(all)' ELSE source_id END AS source_id, count(*) AS pages, count(*) FILTER (WHERE deleted_at IS NULL) AS live, count(*) FILTER (WHERE deleted_at IS NOT NULL) AS deleted FROM pages GROUP BY ROLLUP (source_id) ORDER BY pages DESC"
+
+              section "S3b. pages per type (live vs soft-deleted)"
+              q "SELECT CASE WHEN GROUPING(type) = 1 THEN '(all)' ELSE type END AS type, count(*) AS pages, count(*) FILTER (WHERE deleted_at IS NULL) AS live, count(*) FILTER (WHERE deleted_at IS NOT NULL) AS deleted FROM pages GROUP BY ROLLUP (type) ORDER BY pages DESC"
+
+              section "S4a. column widths: embedding column types (every public table with a vector or halfvec column)"
+              q "SELECT c.relname AS tbl, a.attname AS col, format_type(a.atttypid, a.atttypmod) AS type FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' AND format_type(a.atttypid, a.atttypmod) ~ '^(vector|halfvec)' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1, 2"
+
+              section "S4a2. column widths: bounded character columns"
+              q "SELECT table_name, column_name, data_type, character_maximum_length FROM information_schema.columns WHERE table_schema = 'public' AND character_maximum_length IS NOT NULL ORDER BY 1, 2 LIMIT 200"
+
+              section "S4a3. row counts of tables with vector columns"
+              q "SELECT 'facts' AS tbl, count(*) AS rows FROM facts"
+              q "SELECT 'query_cache' AS tbl, count(*) AS rows FROM query_cache"
+
+              section "S4b. content_chunks embedding coverage by model"
+              q "SELECT model, count(*) AS chunks, count(embedding) AS embedded, count(*) - count(embedding) AS unembedded FROM content_chunks GROUP BY model ORDER BY chunks DESC"
+
+              section "S4c. takes embedding coverage"
+              q "SELECT count(*) AS takes, count(embedding) AS embedded FROM takes"
+
+              section "S5a. timeline_entries total"
+              q "SELECT count(*) AS timeline_entries, count(DISTINCT page_id) AS pages_with_entries FROM timeline_entries"
+
+              section "S5b. timeline_entries per source prefix"
+              q "SELECT split_part(source, ':', 1) AS source_prefix, count(*) AS entries FROM timeline_entries GROUP BY 1 ORDER BY 2 DESC LIMIT 100"
+
+              section "S5c. timeline_entries per page (top 25 pages)"
+              q "SELECT t.page_id, p.slug, count(*) AS entries FROM timeline_entries t LEFT JOIN pages p ON p.id = t.page_id GROUP BY t.page_id, p.slug ORDER BY 3 DESC, 1 LIMIT 25"
+
+              section "S5d. timeline_entries per page (distribution: entries per page vs number of pages)"
+              q "SELECT entries, count(*) AS pages FROM (SELECT page_id, count(*) AS entries FROM timeline_entries GROUP BY page_id) per_page GROUP BY entries ORDER BY entries DESC LIMIT 50"
+
+              section "S6a. pages.chunker_version distribution"
+              q "SELECT chunker_version, count(*) AS pages FROM pages GROUP BY 1 ORDER BY 1"
+
+              section "S6b. pages.contextual_retrieval_mode distribution"
+              q "SELECT contextual_retrieval_mode, count(*) AS pages FROM pages GROUP BY 1 ORDER BY 2 DESC"
+
+              section "S6c. pages.embedding_signature distribution"
+              q "SELECT embedding_signature, count(*) AS pages FROM pages GROUP BY 1 ORDER BY 2 DESC"
+
+              section "S7a. minion_jobs by status"
+              q "SELECT status, count(*) AS jobs, min(created_at) AS oldest_created, max(updated_at) AS last_updated FROM minion_jobs GROUP BY status ORDER BY jobs DESC"
+
+              section "S7b. minion_jobs by queue, name, status"
+              q "SELECT queue, name, status, count(*) AS jobs FROM minion_jobs GROUP BY 1, 2, 3 ORDER BY 1, 2, 3 LIMIT 200"
+
+              section "S8. access_tokens (names only, no hashes)"
+              q "SELECT count(*) AS total, count(*) FILTER (WHERE revoked_at IS NULL) AS active, count(*) FILTER (WHERE revoked_at IS NOT NULL) AS revoked FROM access_tokens"
+              q "SELECT name, created_at, last_used_at, revoked_at IS NOT NULL AS revoked FROM access_tokens ORDER BY created_at"
+
+              section "S9. schema and server version"
+              q "SELECT key, value AS gbrain_schema_version FROM config WHERE key = 'version'"
+              q "SELECT version() AS postgres"
+              q "SELECT extname, extversion FROM pg_extension ORDER BY 1"
+
+              echo
+              echo "gbrain-rehearsal-runner: complete (mode $MODE) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              if [ -n "$FAILED" ]; then
+                echo "commands that exited non-zero (expected for commands newer than the installed gbrain):$FAILED"
+              fi
+              exit 0
+          env:
+            - name: RUNNER_MODE
+              value: inspect
+            - name: RUNNER_RUN_ID
+              value: "1"
+            - name: RUNNER_REPAIR_ARGS
+              value: ""
+            - name: RUNNER_WAIT_FOR_SERVE
+              value: "true"
+            - name: GBRAIN_REHEARSAL_SHA
+              valueFrom:
+                configMapKeyRef:
+                  name: gbrain-rehearsal-version
+                  key: GBRAIN_REHEARSAL_SHA
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: uri
+            - name: GBRAIN_CHAT_MODEL
+              value: openrouter:minimax/minimax-m2.7
+            - name: GBRAIN_CHAT_FALLBACK_CHAIN
+              value: openrouter:openai/gpt-oss-120b
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: HINDSIGHT_API_LLM_API_KEY
+            - name: GBRAIN_EMBEDDING_MODEL
+              value: openai:text-embedding-3-small
+            - name: GBRAIN_EMBEDDING_DIMENSIONS
+              value: "1536"
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-embedding-secret
+                  key: OPENAI_API_KEY
+                  optional: true
+            - name: VOYAGE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-reranker-secret
+                  key: VOYAGE_API_KEY
+                  optional: true
+          resources:
+            requests:
+              memory: 128Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: gbrain-install
+              mountPath: /install
+            - name: work
+              mountPath: /work
+      volumes:
+        - name: gbrain-install
+          emptyDir: {}
+        - name: work
+          emptyDir: {}
