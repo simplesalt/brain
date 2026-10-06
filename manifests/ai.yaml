@@ -475,44 +475,23 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              export HOME=/opt/data
-              mkdir -p /opt/data/.local/bin
-
-              if [ ! -x /opt/data/.local/bin/claude ]; then
-                curl -fsSL https://claude.ai/install.sh | bash \
-                  || echo "WARN: claude install failed"
-              fi
-
-              if [ ! -x /opt/data/.local/bin/gh ]; then
-                GH_VER=2.63.2
-                case "$(uname -m)" in
-                  x86_64) GH_ARCH=amd64 ;;
-                  aarch64|arm64) GH_ARCH=arm64 ;;
-                  *) GH_ARCH=amd64 ;;
-                esac
-                ( curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_${GH_ARCH}.tar.gz" \
-                    | tar -xz -C /tmp \
-                  && cp "/tmp/gh_${GH_VER}_linux_${GH_ARCH}/bin/gh" /opt/data/.local/bin/gh ) \
-                  || echo "WARN: gh install failed"
-              fi
-
-              GBRAIN_VER=$(curl -fsSL https://raw.githubusercontent.com/garrytan/gbrain/master/VERSION 2>/dev/null || echo "")
+              GBRAIN_SHA=492b5528238dfea0ed9e3ee491805d83af86f6a6
               STORED_VER=$(cat /opt/data/skills/.gbrain-version 2>/dev/null || echo "")
-              if [ -n "$GBRAIN_VER" ] && [ "$GBRAIN_VER" != "$STORED_VER" ]; then
+              if [ "$GBRAIN_SHA" != "$STORED_VER" ]; then
                 if (
                   rm -rf /opt/data/skills.stage /opt/data/skills.old /tmp/gbrain.tar.gz \
                   && mkdir -p /opt/data/skills.stage \
-                  && curl -fsSL -o /tmp/gbrain.tar.gz https://github.com/garrytan/gbrain/archive/refs/heads/master.tar.gz \
+                  && curl -fsSL -o /tmp/gbrain.tar.gz "https://github.com/garrytan/gbrain/archive/${GBRAIN_SHA}.tar.gz" \
                   && gzip -t /tmp/gbrain.tar.gz \
-                  && tar -xzf /tmp/gbrain.tar.gz -C /opt/data/skills.stage gbrain-master/skills \
-                  && test -n "$(ls -A /opt/data/skills.stage/gbrain-master/skills 2>/dev/null)" \
-                  && echo "$GBRAIN_VER" > /opt/data/skills.stage/gbrain-master/skills/.gbrain-version \
+                  && tar -xzf /tmp/gbrain.tar.gz -C /opt/data/skills.stage "gbrain-${GBRAIN_SHA}/skills" \
+                  && test -n "$(ls -A /opt/data/skills.stage/gbrain-${GBRAIN_SHA}/skills 2>/dev/null)" \
+                  && echo "$GBRAIN_SHA" > /opt/data/skills.stage/gbrain-${GBRAIN_SHA}/skills/.gbrain-version \
                   && chown -R 10000:10000 /opt/data/skills.stage \
                   && { [ ! -d /opt/data/skills ] || mv /opt/data/skills /opt/data/skills.old; } \
-                  && mv /opt/data/skills.stage/gbrain-master/skills /opt/data/skills
+                  && mv /opt/data/skills.stage/gbrain-${GBRAIN_SHA}/skills /opt/data/skills
                 ); then
                   rm -rf /opt/data/skills.stage /opt/data/skills.old /tmp/gbrain.tar.gz
-                  echo "gbrain skills synced to $GBRAIN_VER"
+                  echo "gbrain skills synced to $GBRAIN_SHA"
                 else
                   if [ ! -d /opt/data/skills ] && [ -d /opt/data/skills.old ]; then
                     mv /opt/data/skills.old /opt/data/skills
@@ -522,21 +501,95 @@ spec:
                 fi
               fi
 
-              if [ -x /opt/data/.local/bin/claude ]; then
-                /opt/data/.local/bin/claude plugin marketplace add vectorize-io/hindsight 2>/dev/null \
-                  || echo "WARN: hindsight plugin marketplace add failed"
-                /opt/data/.local/bin/claude plugin install hindsight-memory 2>/dev/null \
-                  || echo "WARN: hindsight plugin install failed"
-                chown -R 10000:10000 /opt/data/.claude 2>/dev/null \
-                  || echo "WARN: chown .claude failed"
-              else
-                echo "WARN: claude not installed, skipping hindsight plugin install"
-              fi
+              python3 -c '
+              import os, re, shutil, yaml
+
+              seed_path = "/seed/skills.yaml"
+              bundled_root = "/opt/hermes/skills"
+              skills_root = "/opt/data/skills"
+              marker_path = "/opt/data/.no-bundled-skills"
+              owner = 10000
+
+              def skill_name(skill_dir):
+                  fallback = os.path.basename(skill_dir)
+                  try:
+                      with open(os.path.join(skill_dir, "SKILL.md"), encoding="utf-8") as f:
+                          text = f.read()
+                      match = re.search(r"\n---\s*\n", text[3:]) if text.startswith("---") else None
+                      if match:
+                          name = yaml.safe_load(text[3:match.start() + 3]).get("name")
+                          if name:
+                              return str(name).strip()
+                  except Exception:
+                      pass
+                  return fallback
+
+              def skill_dirs(root):
+                  found = [d for d, _, files in os.walk(root) if "SKILL.md" in files]
+                  return sorted(found, key=lambda d: d.count(os.sep))
+
+              def chown_tree(root):
+                  os.lchown(root, owner, owner)
+                  for dirpath, dirnames, filenames in os.walk(root):
+                      for name in dirnames + filenames:
+                          os.lchown(os.path.join(dirpath, name), owner, owner)
+
+              try:
+                  with open(seed_path) as f:
+                      allow = yaml.safe_load(f)
+                  gbrain = allow["gbrain"]
+                  bundled = allow["bundled"]
+                  for names in (gbrain, bundled):
+                      if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                          raise ValueError("gbrain and bundled must be lists of skill names")
+              except Exception as e:
+                  print("ERROR: cannot read allow-list %s (%s); removing all skills" % (seed_path, e))
+                  gbrain, bundled = [], []
+              allowed = set(gbrain) | set(bundled)
+
+              os.makedirs(skills_root, exist_ok=True)
+              for src in skill_dirs(bundled_root):
+                  if src != bundled_root and skill_name(src) in bundled:
+                      dest = os.path.join(skills_root, os.path.relpath(src, bundled_root))
+                      shutil.rmtree(dest, ignore_errors=True)
+                      shutil.copytree(src, dest)
+
+              removed = 0
+              for d in skill_dirs(skills_root):
+                  if os.path.isdir(d) and skill_name(d) not in allowed:
+                      if d == skills_root:
+                          os.remove(os.path.join(d, "SKILL.md"))
+                      else:
+                          shutil.rmtree(d)
+                      removed += 1
+
+              open(marker_path, "w").close()
+
+              kept = {"gbrain": set(), "bundled": set()}
+              for d in skill_dirs(skills_root):
+                  name = skill_name(d)
+                  kept["gbrain" if name in gbrain else "bundled"].add(name)
+              missing = 0
+              for kind, names in (("gbrain", gbrain), ("bundled", bundled)):
+                  for name in names:
+                      if name in kept[kind]:
+                          print("kept %s skill: %s" % (kind, name))
+                      else:
+                          missing += 1
+                          print("ERROR: allow-listed %s skill missing: %s" % (kind, name))
+              print("skills: kept %d gbrain, %d bundled; removed %d; missing %d" % (len(kept["gbrain"]), len(kept["bundled"]), removed, missing))
+
+              chown_tree(skills_root)
+              os.lchown(marker_path, owner, owner)
+              ' || { echo "ERROR: skills step failed; removing all skills"; rm -rf /opt/data/skills; touch /opt/data/.no-bundled-skills; }
 
               exit 0
           volumeMounts:
             - name: home
               mountPath: /opt/data
+            - name: config-seed
+              mountPath: /seed
+              readOnly: true
         - name: seed-hermes-config
           image: docker.io/nousresearch/hermes-agent:latest@sha256:192c6d84eccfbc14959df4084a14dd5d3c5fda7be57579282689c9ecd2b00f4d
           imagePullPolicy: IfNotPresent
@@ -576,26 +629,6 @@ spec:
               ' || { echo "FATAL: python merge failed, falling back to cp"; cp /seed/config.yaml /opt/data/config.yaml; }
               chown 10000:10000 /opt/data/config.yaml
               chmod 600 /opt/data/config.yaml
-              printf 'export PATH="/opt/data/.local/bin:$PATH"\n' > /opt/data/.bashrc
-              chown 10000:10000 /opt/data/.bashrc
-              chmod 644 /opt/data/.bashrc
-              printf 'export PATH="/opt/data/.local/bin:$PATH"\n' > /opt/data/.bash_profile
-              chown 10000:10000 /opt/data/.bash_profile
-              chmod 644 /opt/data/.bash_profile
-              mkdir -p /opt/data/.config/gh
-              printf 'github.com:\n    oauth_token: %s\n    git_protocol: https\n' \
-                  "$GITHUB_TOKEN" > /opt/data/.config/gh/hosts.yml
-              chown -R 10000:10000 /opt/data/.config
-              chmod 700 /opt/data/.config/gh
-              chmod 600 /opt/data/.config/gh/hosts.yml
-
-              mkdir -p /opt/data/.hindsight
-              printf '{"hindsightApiUrl":"%s","hindsightApiToken":"%s","bankId":"%s"}\n' \
-                "$HINDSIGHT_API_URL" "$HINDSIGHT_API_KEY" "$HINDSIGHT_BANK_ID" \
-                > /opt/data/.hindsight/claude-code.json
-              chown -R 10000:10000 /opt/data/.hindsight
-              chmod 700 /opt/data/.hindsight
-              chmod 600 /opt/data/.hindsight/claude-code.json
 
               mkdir -p /opt/data/hindsight
               printf '{"mode":"local_external","apiKey":"%s","api_url":"%s","banks":{"%s":{"bankId":"%s","budget":"mid","enabled":true}},"recall_budget":"low","recall_prefetch_method":"recall","recall_max_tokens":250,"recall_max_input_chars":300,"recall_types":"observation"}\n' \
@@ -604,24 +637,6 @@ spec:
               chown -R 10000:10000 /opt/data/hindsight
               chmod 700 /opt/data/hindsight
               chmod 600 /opt/data/hindsight/config.json
-
-              mkdir -p /opt/data/.claude
-              printf '%s\n' '{"mcpServers":{"hermes":{"command":"hermes","args":["mcp","serve"]}}}' \
-                > /opt/data/.claude/claude.json
-              printf '%s\n' '{"alwaysThinkingEnabled":true,"thinkingEffort":"high","autoMemoryEnabled":false,"autoCompactTokens":400000,"permissions":{"defaultMode":"bypassPermissions"},"model":"sonnet"}' \
-                > /opt/data/.claude/settings.json
-              cp /seed/hermes-claude.md /opt/data/.claude/CLAUDE.md
-              chown -R 10000:10000 /opt/data/.claude
-              chmod 755 /opt/data/.claude
-              chmod 644 /opt/data/.claude/claude.json
-              chmod 644 /opt/data/.claude/settings.json
-              chmod 644 /opt/data/.claude/CLAUDE.md
-
-              mkdir -p /opt/data/skills/build
-              cp /seed/build-skill.md /opt/data/skills/build/SKILL.md
-              chown -R 10000:10000 /opt/data/skills/build
-              chmod 775 /opt/data/skills/build
-              chmod 664 /opt/data/skills/build/SKILL.md
 
               cp /seed/SOUL.md /opt/data/SOUL.md
 
@@ -675,11 +690,6 @@ spec:
               ln -sf /run/secret-env/.env /opt/data/.env
               chown -h 10000:10000 /opt/data/.env
           env:
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-secrets
-                  key: GITHUB_TOKEN
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -728,11 +738,6 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: FIRECRAWL_API_KEY
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-secrets
-                  key: GITHUB_TOKEN
             - name: CLOUDFLARE_API_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -770,11 +775,6 @@ spec:
               value: "true"
             - name: WEBHOOK_PORT
               value: "8644"
-            - name: _HERMES_FORCE_GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-secrets
-                  key: GITHUB_TOKEN
             - name: GBRAIN_REMOTE_TOKEN
               value: "gbrain-mcp"
           ports:

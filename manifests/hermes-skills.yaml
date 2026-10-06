@@ -1,0 +1,27 @@
+gbrain:
+  - query
+  - briefing
+  - daily-task-prep
+  - resolve-before-asking
+  - idea-lineage
+  - repo-architecture
+  - fact-check
+  - ask-user
+  - capture
+  - brain-ops
+  - brain-ingest-gate
+  - enrich
+  - article-enrichment
+  - concept-synthesis
+  - citation-graph-ingest
+  - signal-detector
+  - daily-task-manager
+  - blog-ingest
+  - strategic-reading
+  - draft-in-voice
+bundled:
+  - hermes-agent
+  - humanizer
+  - youtube-content
+  - arxiv
+  - maps

@@ -23,8 +23,7 @@ configMapGenerator:
     namespace: ssint-main-ai
     files:
       - config.yaml=manifests/hermes-config.yaml
-      - build-skill.md=manifests/build-skill.md
-      - hermes-claude.md=manifests/hermes-claude.md
+      - skills.yaml=manifests/hermes-skills.yaml
       - SOUL.md=manifests/SOUL.md
       - AGENTS.md=manifests/AGENTS.md
   - name: lease-sweep-script

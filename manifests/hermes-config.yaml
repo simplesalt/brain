@@ -19,7 +19,6 @@ agent:
     episodic memory across sessions.
 
   disabled_toolsets:
-    - skills
     - search
     - x_search
     - video
@@ -49,7 +48,7 @@ platform_toolsets:
     - cronjob
     - delegation
     - memory
-    - messaging
+    - skills
     - terminal
     - vision
     - web
@@ -57,14 +56,16 @@ platform_toolsets:
 terminal:
   backend: local
   env_passthrough:
-    - GITHUB_TOKEN
-    - CLAUDE_CODE_OAUTH_TOKEN
     - GBRAIN_REMOTE_TOKEN
 
 memory:
   provider: hindsight
   memory_enabled: false
   user_profile_enabled: false
+
+skills:
+  write_approval: true
+  creation_nudge_interval: 0
 
 web:
   backend: firecrawl
