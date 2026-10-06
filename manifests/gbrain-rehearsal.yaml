@@ -623,9 +623,9 @@ spec:
               exit 0
           env:
             - name: RUNNER_MODE
-              value: inspect
+              value: apply-repairs
             - name: RUNNER_RUN_ID
-              value: "3"
+              value: "4"
             - name: RUNNER_REPAIR_ARGS
               value: ""
             - name: RUNNER_WAIT_FOR_SERVE
