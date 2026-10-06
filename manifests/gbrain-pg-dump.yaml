@@ -1,0 +1,517 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gbrain-pg-dumps
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-pg-dump
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 604800
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-pg-dump
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    cnpg.io/cluster: gbrain-pg
+      containers:
+        - name: dump
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PGOPTIONS='-c default_transaction_read_only=on'
+              export PGAPPNAME=gbrain-pg-dump
+
+              DUMP_DIR=/dumps
+              TABLES="pages content_chunks timeline_entries facts access_tokens"
+              REQUIRED="pages content_chunks timeline_entries config access_tokens"
+              partial=""
+
+              fail() {
+                echo "FATAL: $*"
+                if [ -n "$partial" ]; then rm -f "$partial"; fi
+                exit 1
+              }
+
+              section() {
+                echo
+                echo "=============================================================="
+                echo "== $1"
+                echo "=============================================================="
+              }
+
+              q() {
+                case "$1" in
+                  SELECT*|SHOW*) ;;
+                  *) echo "REFUSED (read-only dump job runs SELECT/SHOW only): $1"; return 1 ;;
+                esac
+                PGOPTIONS="$PGOPTIONS -c statement_timeout=60000 -c lock_timeout=5000" \
+                  psql -X -q -A -t -v ON_ERROR_STOP=1 -c "$1" "$DATABASE_URL"
+              }
+
+              val() {
+                printf '%s\n' "$1" | grep "^$2=" | cut -d= -f2-
+              }
+
+              snapshot() {
+                for t in $TABLES; do
+                  n=$(q "SELECT count(*) FROM $t") || return 1
+                  echo "${1}_${t}=${n}"
+                done
+                v=$(q "SELECT value FROM config WHERE key = 'version'") || return 1
+                echo "${1}_config_version=${v:-none}"
+              }
+
+              case "$DUMP_LABEL" in
+                ""|*[!A-Za-z0-9._-]*) fail "DUMP_LABEL must be non-empty and use only letters, digits, dot, underscore and hyphen (got: $DUMP_LABEL)" ;;
+              esac
+              case "$DATABASE_URL" in
+                *@gbrain-pg-rw[.:/]*) ;;
+                *) fail "DATABASE_URL does not target gbrain-pg-rw; refusing to dump" ;;
+              esac
+              if [ ! -d "$DUMP_DIR" ] || [ ! -w "$DUMP_DIR" ]; then
+                fail "$DUMP_DIR is not a writable directory (is the gbrain-pg-dumps volume mounted?)"
+              fi
+
+              echo "gbrain-pg-dump: logical backup of database gbrain, label=$DUMP_LABEL, started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "target: ${DATABASE_URL#*@}"
+              echo "this job only reads from the database: default_transaction_read_only=on, SELECT/SHOW only, pg_dump read-only snapshot"
+
+              i=0
+              until pg_isready -h gbrain-pg-rw -p 5432; do
+                i=$((i + 1))
+                if [ "$i" -ge 90 ]; then fail "gbrain-pg-rw:5432 not ready after 180s"; fi
+                echo "waiting for gbrain-pg-rw:5432"
+                sleep 2
+              done
+
+              section "0. connection, read-only and primary guards"
+              [ "$(q "SELECT current_database()")" = "gbrain" ] || fail "connected database is not gbrain"
+              [ "$(q "SHOW default_transaction_read_only")" = "on" ] || fail "default_transaction_read_only is not on; refusing to continue"
+              [ "$(q "SELECT pg_is_in_recovery()")" = "f" ] || fail "gbrain-pg-rw is in recovery (not the primary); refusing to dump"
+              q "SELECT current_user AS role, version() AS postgres"
+              pg_dump --version
+
+              db_bytes=$(q "SELECT pg_database_size(current_database())") || fail "cannot read database size"
+              avail_kb=$(df -Pk "$DUMP_DIR" | tail -n 1 | tr -s ' ' | cut -d ' ' -f 4)
+              echo "database size: $db_bytes bytes; free space under $DUMP_DIR: $avail_kb KiB"
+              if [ "$((avail_kb * 1024))" -lt "$db_bytes" ]; then
+                fail "less free space under $DUMP_DIR than the database size; refusing to start"
+              fi
+
+              server_version=$(q "SELECT current_setting('server_version')") || fail "cannot read server version"
+              db_locale=$(q "SELECT pg_encoding_to_char(encoding) || ' ' || coalesce(datcollate, '-') || ' ' || coalesce(datctype, '-') FROM pg_database WHERE datname = current_database()") || fail "cannot read database locale"
+              db_settings=$(q "SELECT coalesce(string_agg(setconfig::text, '; '), '(none)') FROM pg_db_role_setting WHERE setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())") || fail "cannot read database-level settings"
+              extensions=$(q "SELECT string_agg(extname || ' ' || extversion, ', ' ORDER BY extname) FROM pg_extension") || fail "cannot read extensions"
+              public_tables=$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'") || fail "cannot count public tables"
+              public_indexes=$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public'") || fail "cannot count public indexes"
+              echo "encoding/collate/ctype: $db_locale"
+              echo "database-level settings: $db_settings"
+              echo "extensions: $extensions"
+              echo "public tables: $public_tables, public indexes: $public_indexes"
+
+              section "1. live row counts before the dump"
+              BEFORE=$(snapshot before) || fail "could not read live row counts before the dump (schema not as expected); nothing was written"
+              echo "$BEFORE"
+
+              section "2. pg_dump (custom format, ownership and privileges kept)"
+              TS=$(date -u +%Y%m%dT%H%M%SZ)
+              base="gbrain-${DUMP_LABEL}-${TS}.dump"
+              final="$DUMP_DIR/$base"
+              if [ -e "$final" ] || [ -e "$final.partial" ]; then fail "$base already exists"; fi
+              partial="$final.partial"
+              echo "writing $partial"
+              pg_dump --format=custom --compress=gzip:6 --lock-wait-timeout=60s --verbose \
+                --file="$partial" --dbname="$DATABASE_URL" || fail "pg_dump failed; partial file removed"
+
+              AFTER=$(snapshot after) || AFTER="after_counts=unavailable"
+              section "3. live row counts after the dump"
+              echo "$AFTER"
+
+              section "4. verify the dump file"
+              [ -s "$partial" ] || fail "dump file is missing or empty"
+              size=$(wc -c < "$partial")
+              echo "size: $size bytes"
+              toc=$(pg_restore --list "$partial") || fail "pg_restore --list failed on the dump"
+              entries=$(printf '%s\n' "$toc" | grep -c '^[0-9][0-9]*;')
+              echo "pg_restore --list: ok, $entries archive entries"
+              for t in $REQUIRED; do
+                if printf '%s\n' "$toc" | grep -q " TABLE public $t " && printf '%s\n' "$toc" | grep -q " TABLE DATA public $t "; then
+                  echo "  ok   public.$t (definition and data present)"
+                else
+                  fail "public.$t is missing from the dump"
+                fi
+              done
+              pg_restore --file=/dev/null "$partial" || fail "full read of every dump block failed (archive is corrupt)"
+              echo "full read of every dump block: ok"
+
+              section "5. finalise"
+              mv "$partial" "$final" || fail "could not rename the finished dump into place"
+              partial=""
+              {
+                echo "dump_file=$base"
+                echo "label=$DUMP_LABEL"
+                echo "created_utc=$TS"
+                echo "server_version=$server_version"
+                echo "database_encoding_collate_ctype=$db_locale"
+                echo "database_settings=$db_settings"
+                echo "extensions=$extensions"
+                echo "public_tables=$public_tables"
+                echo "public_indexes=$public_indexes"
+                echo "$BEFORE"
+                echo "$AFTER"
+              } > "$final.info" || fail "could not write $base.info"
+              sync
+              (cd "$DUMP_DIR" && sha256sum "$base" > "$base.sha256" && sha256sum -c "$base.sha256") || fail "checksum write or re-check failed; $base has no .sha256 and must not be trusted"
+              sync
+              ls -l "$DUMP_DIR"
+
+              section "6. summary"
+              echo "dump:     $final"
+              echo "size:     $size bytes"
+              echo "sha256:   $(cut -d ' ' -f 1 "$final.sha256")"
+              echo "rows (live database, before -> after the dump):"
+              for t in $TABLES; do
+                b=$(val "$BEFORE" "before_$t")
+                a=$(val "$AFTER" "after_$t")
+                if [ -n "$b" ] && [ -n "$a" ]; then
+                  echo "  $t: $b -> $a (delta $((a - b)))"
+                else
+                  echo "  $t: before=${b:-unavailable} after=${a:-unavailable}"
+                fi
+              done
+              echo "a non-zero delta means a writer changed the live database during the dump; the dump holds one consistent snapshot taken between the two counts. Stop all gbrain writers before the dump for an exact rollback point."
+              echo
+              echo "NEXT (for the parent; this job has done none of it):"
+              echo "  1. Run Job gbrain-pg-dump-verify-restore from this same manifest. It restores the newest dump with this label into a throwaway database on the rehearsal cluster only, compares row counts with the numbers above, drops the database, and ends with RESULT: PASS or RESULT: FAIL."
+              echo "  2. Start the upgrade only after that job prints RESULT: PASS."
+              echo "  3. This dump is the rollback artifact. Keep PVC gbrain-pg-dumps: it is annotated prune: disabled, but its StorageClass reclaim policy is Delete, so deleting the PVC deletes the dump. The volume is node-local; it does not survive losing its node."
+              echo "  4. Rollback outline (a separate reviewed step): stop every gbrain writer; as role gbrain on gbrain-pg-rw run DROP DATABASE gbrain WITH (FORCE) then CREATE DATABASE gbrain TEMPLATE template0 with the encoding, collate and ctype recorded in $base.info; then pg_restore --exit-on-error --single-transaction --dbname=gbrain $DUMP_DIR/$base from a Job that mounts gbrain-pg-dumps."
+              echo
+              echo "gbrain-pg-dump: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              exit 0
+          env:
+            - name: DUMP_LABEL
+              value: "trial-2026-10-06"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: dumps
+              mountPath: /dumps
+      volumes:
+        - name: dumps
+          persistentVolumeClaim:
+            claimName: gbrain-pg-dumps
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-pg-dump-verify-restore
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 604800
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-pg-dump-verify-restore
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    cnpg.io/cluster: gbrain-pg
+      containers:
+        - name: verify-restore
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PGAPPNAME=gbrain-pg-dump-verify-restore
+
+              DUMP_DIR=/dumps
+              TARGET_HOST=gbrain-pg-rehearsal-rw
+              RESTORE_DB=gbrain_restore_check
+              TABLES="pages content_chunks timeline_entries facts access_tokens"
+              REQUIRED="pages content_chunks timeline_entries config access_tokens"
+              created=""
+              status=PASS
+
+              cleanup() {
+                if [ "$created" = "yes" ]; then
+                  if [ "$KEEP_DB" = "true" ]; then
+                    echo "KEEP_DB=true: leaving database $RESTORE_DB on $PGHOST for inspection; drop it by hand when done"
+                  else
+                    echo "dropping database $RESTORE_DB on $PGHOST"
+                    psql -X -q -h "$PGHOST" -d postgres -c "DROP DATABASE IF EXISTS $RESTORE_DB WITH (FORCE)" \
+                      || echo "WARN: could not drop $RESTORE_DB on $PGHOST; drop it by hand"
+                  fi
+                fi
+              }
+              trap cleanup EXIT
+              trap 'exit 143' TERM INT
+
+              fail() {
+                echo "FATAL: $*"
+                echo "RESULT: FAIL"
+                exit 1
+              }
+
+              section() {
+                echo
+                echo "=============================================================="
+                echo "== $1"
+                echo "=============================================================="
+              }
+
+              adm() {
+                psql -X -q -A -t -v ON_ERROR_STOP=1 -h "$PGHOST" -d postgres -c "$1"
+              }
+
+              rq() {
+                psql -X -q -A -t -v ON_ERROR_STOP=1 -h "$PGHOST" -d "$RESTORE_DB" -c "$1"
+              }
+
+              val() {
+                grep "^$1=" "$info" | cut -d= -f2-
+              }
+
+              if [ "$PGHOST" != "$TARGET_HOST" ]; then
+                fail "PGHOST is '$PGHOST'; this job restores only into $TARGET_HOST"
+              fi
+              if [ -n "${PGHOSTADDR:-}" ] || [ -n "${PGSERVICE:-}" ] || [ -n "${PGSERVICEFILE:-}" ] || [ -n "${DATABASE_URL:-}" ]; then
+                fail "PGHOSTADDR, PGSERVICE, PGSERVICEFILE and DATABASE_URL must be unset so the host cannot be redirected"
+              fi
+              if [ ! -d "$DUMP_DIR" ]; then
+                fail "$DUMP_DIR is missing (is the gbrain-pg-dumps volume mounted?)"
+              fi
+              case "$DUMP_LABEL" in
+                ""|*[!A-Za-z0-9._*-]*) fail "DUMP_LABEL must be non-empty and use only letters, digits, dot, underscore, hyphen or * (got: $DUMP_LABEL)" ;;
+              esac
+
+              echo "gbrain-pg-dump-verify-restore: started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "restore target: $PGHOST (rehearsal cluster only), throwaway database $RESTORE_DB, dump label filter: $DUMP_LABEL"
+
+              i=0
+              until pg_isready -h "$PGHOST" -p 5432; do
+                i=$((i + 1))
+                if [ "$i" -ge 90 ]; then fail "$PGHOST:5432 not ready after 180s"; fi
+                echo "waiting for $PGHOST:5432"
+                sleep 2
+              done
+
+              section "1. rehearsal connection and privileges"
+              adm "SELECT current_user || ' on ' || coalesce(nullif(current_setting('cluster_name', true), ''), '(cluster_name unset)') || ', ' || version()"
+              if [ "$(adm "SELECT rolsuper FROM pg_roles WHERE rolname = current_user")" != "t" ]; then
+                fail "role $PGUSER on $PGHOST is not a superuser, which restoring the vector extension and creating the database need; the rehearsal cluster would need enableSuperuserAccess or a superuser managed role"
+              fi
+              echo "role $PGUSER is a superuser on $PGHOST: ok"
+
+              section "2. locate the newest finished dump"
+              file=""
+              i=0
+              while [ -z "$file" ]; do
+                for f in $(ls -1t "$DUMP_DIR"/gbrain-${DUMP_LABEL}-*.dump 2>/dev/null); do
+                  if [ -f "$f.sha256" ] && [ -f "$f.info" ]; then file="$f"; break; fi
+                done
+                if [ -n "$file" ]; then break; fi
+                i=$((i + 1))
+                if [ "$i" -ge 120 ]; then fail "no finished dump (a .dump with its .info and .sha256) matching gbrain-${DUMP_LABEL}-*.dump after 600s"; fi
+                echo "waiting for a finished dump in $DUMP_DIR ($i)"
+                sleep 5
+              done
+              base=$(basename "$file")
+              info="$file.info"
+              echo "dump: $file"
+              ls -l "$file" "$file.sha256" "$info"
+              (cd "$DUMP_DIR" && sha256sum -c "$base.sha256") || fail "checksum of $base does not match its .sha256"
+
+              section "3. dump contents"
+              toc=$(pg_restore --list "$file") || fail "pg_restore --list failed on $base"
+              for t in $REQUIRED; do
+                if printf '%s\n' "$toc" | grep -q " TABLE public $t " && printf '%s\n' "$toc" | grep -q " TABLE DATA public $t "; then
+                  echo "  ok   public.$t (definition and data present)"
+                else
+                  fail "public.$t is missing from $base"
+                fi
+              done
+              echo "recorded at dump time:"
+              cat "$info"
+
+              section "4. create the throwaway database and restore"
+              adm "DROP DATABASE IF EXISTS $RESTORE_DB WITH (FORCE)" || fail "could not clear a leftover $RESTORE_DB"
+              adm "CREATE DATABASE $RESTORE_DB TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'" || fail "could not create $RESTORE_DB"
+              created=yes
+              echo "created $RESTORE_DB on $PGHOST"
+              src_locale=$(val database_encoding_collate_ctype)
+              if [ "$src_locale" != "UTF8 C C" ]; then
+                echo "WARN: source database encoding/collate/ctype is '$src_locale' but $RESTORE_DB was created as 'UTF8 C C'"
+              fi
+              echo "restoring at $(date -u +%Y-%m-%dT%H:%M:%SZ) (single transaction, stops at the first error, ownership and privileges kept)"
+              pg_restore --host="$PGHOST" --dbname="$RESTORE_DB" --exit-on-error --single-transaction --no-password "$file" \
+                || fail "pg_restore into $RESTORE_DB failed"
+              echo "restore finished at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+              section "5. restored database checks"
+              rq "SELECT extname || ' ' || extversion FROM pg_extension ORDER BY extname"
+              for t in $TABLES; do
+                r=$(rq "SELECT count(*) FROM $t") || { echo "  $t: count query failed"; status=FAIL; continue; }
+                b=$(val "before_$t")
+                a=$(val "after_$t")
+                if [ -z "$b" ] || [ -z "$a" ]; then
+                  echo "  $t: restored=$r, no live counts recorded in $base.info"
+                  status=FAIL
+                  continue
+                fi
+                lo=$b
+                hi=$a
+                if [ "$lo" -gt "$hi" ]; then lo=$a; hi=$b; fi
+                if [ "$r" -ge "$lo" ] && [ "$r" -le "$hi" ]; then
+                  verdict=ok
+                else
+                  verdict=OUTSIDE-RECORDED-RANGE
+                  status=FAIL
+                fi
+                echo "  $t: restored=$r live-before-dump=$b live-after-dump=$a $verdict"
+              done
+              rv=$(rq "SELECT value FROM config WHERE key = 'version'")
+              bv=$(val before_config_version)
+              av=$(val after_config_version)
+              if [ "${rv:-none}" = "$bv" ]; then verdict=ok; else verdict=MISMATCH; status=FAIL; fi
+              echo "  config version: restored=${rv:-none} live-before-dump=$bv live-after-dump=$av $verdict"
+              rt=$(rq "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
+              ri=$(rq "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public'")
+              if [ "$rt" = "$(val public_tables)" ]; then verdict=ok; else verdict=MISMATCH; status=FAIL; fi
+              echo "  public tables: restored=$rt recorded=$(val public_tables) $verdict"
+              if [ "$ri" = "$(val public_indexes)" ]; then verdict=ok; else verdict=MISMATCH; status=FAIL; fi
+              echo "  public indexes: restored=$ri recorded=$(val public_indexes) $verdict"
+
+              section "6. result"
+              echo "dump $base restored into $RESTORE_DB on $PGHOST"
+              echo "RESULT: $status"
+              echo "gbrain-pg-dump-verify-restore: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ); database cleanup follows"
+              if [ "$status" = "PASS" ]; then exit 0; fi
+              exit 1
+          env:
+            - name: PGHOST
+              value: gbrain-pg-rehearsal-rw
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: password
+            - name: DUMP_LABEL
+              value: "trial-2026-10-06"
+            - name: KEEP_DB
+              value: "false"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: dumps
+              mountPath: /dumps
+              readOnly: true
+      volumes:
+        - name: dumps
+          persistentVolumeClaim:
+            claimName: gbrain-pg-dumps
+            readOnly: true

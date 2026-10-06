@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - manifests/ai.yaml
   - manifests/gbrain-rehearsal.yaml
+  - manifests/gbrain-pg-dump.yaml
   - manifests/crawl.yaml
   - manifests/hindsight-chart.yaml
   - manifests/big-agi.yaml
