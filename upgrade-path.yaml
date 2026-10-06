@@ -75,33 +75,46 @@ services:
         pin: "6e1e826286079c0ebc0a6a3b07ccd11475b3cf33"
         date: 2026-09-29
         expected_schema: 173
-        why: "Carries v0.51-v0.60.4 (migrations 150-173, v0.51.0.0 write-path rewrite, put_page expected_revision/force contract); first stop past the timeline-deletion bug (#5567) and the driver failure."
+        why: "Carries v0.48.3-v0.60.4 (migrations 146-173, including 149 which aborts on active minion jobs and adds the minion_queue_protocol trigger; Bun >= 1.3.11 enforcement and the security wave: OAuth consent/DCR scope gates, cwd .env quarantine; v0.51.0.0 write-path rewrite, put_page expected_revision/force contract); first stop past the safe-chunk search withholding (#5004, #5050), the timeline-deletion bug (#5567) and the driver failure."
         before:
-          - "put_page callers (calendar-collector, duxsoup-ingest, email-collector) already send expected_revision (from get_page.revision) or force: true (simplesalt/projects#658); the current pin ignores unknown params, so callers can change first."
-          - "Take a fresh pg_dump of gbrain-pg; rehearse this hop on a restored copy first."
+          - "Writers fixed first (simplesalt/projects#658): Dux Soup sends expected_revision from the same get_page (force would delete entries added between get_page and put_page), email and calendar send force or expected_revision, Dux Soup has a retry cap and a deterministic request_id: on v0.60.x a refused write still spends a permanent write ID (250,000 per principal shared by all bearer clients). The current pin ignores unknown params, so the writers can change first."
+          - "Take a fresh pg_dump of gbrain-pg."
+          - "Rehearse on a restored copy: init with our exact flags, migrations, projection drain, both repairs, canned probes."
+          - "Database config.embedding_model equals openai:text-embedding-3-small (init refuses a populated brain otherwise, from v0.56.2.0); settle on the restored copy first."
           - "gbrain sources list --json shows local_path null on every non-archived source and gbrain config get sync.repo_path is unset; if either is set, stop: on Postgres a source root without a claimed writer refuses writes with owner_unavailable."
           - "Do not run apply-migrations, sources writer claim or sources writer activate: init applies the schema, and the brain stays unmanaged with database-only writes (activation needs persistent canonical checkout and lock dirs we do not have, and refuses cycle.conversation_facts_backfill)."
-          - "Save a timeline row-count baseline to compare after the hop."
-          - "Bump both install-gbrain SHAs and the skills-sync pin to this SHA in one commit; Recreate or scale to 0."
+          - "No active minion jobs (migration 149 aborts on them)."
+          - "Env is injected via the pod spec, not a .env file in the working directory (.env quarantine)."
+          - "Bun >= 1.3.11 (satisfied by the 1.4.2 pin)."
+          - "Save the timeline baseline (total row count and get_timeline counts per page) to compare after the hop."
+          - "Bump both install-gbrain SHAs (or the one left after the Job's removal) and GBRAIN_SHA to this SHA in one commit; Recreate or scale to 0."
         validate:
-          - "gbrain --version reports v0.60.5.0."
+          - "gbrain --version reports v0.60.5.0 and the Bun >= 1.3.11 check passes at startup."
           - "Config version row equals schema 173."
           - "Config key readback: mcp.publish_advisor, search.reranker.model, facts.extraction_model, cycle.conversation_facts_backfill.enabled."
-          - "Startup log shows 'hermes-mcp bearer asserted'."
+          - "Startup log shows 'hermes-mcp bearer asserted'; bearer token still accepted."
           - "GET /health returns 200 with the version."
           - "Bearer MCP smoke: search, get_page, put_page, add_timeline_entry, put_raw_data."
+          - "Repairs: run 'gbrain repair safe-chunks' and 'gbrain repair timeline' as dry runs and record them; apply them (cost: cents of re-embedding; timeline conversion of Dux Soup and other DB-only rows was agreed by the operator on 2026-10-06) only as rehearsed on the restored copy; any other repair the doctor proposes stops the walk for operator review."
+          - "gbrain doctor --json and the gbrain repair previews are recorded; repairs follow the Repairs rule above."
+          - "SELECT count(*) FROM pages WHERE deleted_at IS NULL AND chunker_version < 4 is 0 (or doctor contextual_retrieval_coverage details.unsealed_pages 0)."
           - "Timeline row counts match the saved baseline."
-          - "Bearer search and get_page still return existing pages (not withheld as projection_pending or safe_index_pending); if withheld, run the gbrain repair safe-chunks preview and handle it per the repair rule below."
+          - "DB-only timeline rows are materialized as marked bullets (<!-- gbrain:materialized v1 ... -->) and get_timeline counts per page match the baseline."
+          - "Bearer search and get_page still return existing pages (not withheld as projection_pending or safe_index_pending); if withheld, the Repairs rule above applies."
+          - "Vectors survive: get_stats embedded_count == chunk_count and get_health missing_embeddings 0, embed_coverage 1 (at v0.60.x allow one autopilot cycle to recover a transient dip; from v0.60.11.0 counts are scoped per source, compare ratios)."
+          - "Canned bearer search and query probes on pre-walk pages return the same slugs as the baseline, with no safe_index_pending or projection_pending in degraded."
+          - "hermes-agent init log shows 'gbrain skills synced to <sha>' and 'skills: kept 20 gbrain, 5 bundled; removed N; missing 0' with no 'ERROR: allow-listed gbrain skill missing'; a rename or drop updates manifests/hermes-skills.yaml in the same commit."
+          - "Hermes' gbrain MCP tools answer a read-only call after the gbrain restart; if not, restart hermes-agent (simplesalt/projects#738)."
           - "put_page on an existing slug without revision returns isError revision_conflict; with expected_revision or force it succeeds."
-          - "gbrain doctor --json and the gbrain repair preview are recorded; the walker never runs repair --apply (it can spend on embeddings and needs operator agreement): if the preview proposes repairs, stop and report them."
           - "gbrain sources writer status --probe --json: native_lock.target linux-x64-musl with acquired true, enabled false, no worktrees or bindings, every onboarding source database_only (none claim_required), publication_concurrency >= 1."
           - "gbrain container startup log still contains 'Resolve IPC:' as it does today; if it is missing, confirm the native lock through the writer status probe above before proceeding."
           - "Smoke put_page and add_timeline_entry receipts show persistence.mode database, never owner_unavailable or write_pending; afterwards writer status blockers are empty and no '[persistence] phase=' lines appear in either container log."
           - "One email-collector and one calendar-collector CronJob run completes."
           - "Autopilot cycle completes and embed --stale succeeds."
-          - "Job gbrain-migrate-embedding-dims-2 logs 'already vector(1536)'."
-        rollback: "Past the last supported rollback point (v0.50.5.0): recovery is restoring the pg_dump taken before this stop, not an image-only revert."
+          - "If Job gbrain-migrate-embedding-dims-2 still exists, it completes; otherwise the autopilot embed phase succeeds."
+        rollback: "Restore database and binary together, never binary only (migration 149's minion_queue_protocol trigger makes older producers and workers fail): revert the install-gbrain SHA(s) and GBRAIN_SHA and restore the pg_dump taken before this stop. v0.50.5.0 was the last upstream-supported rollback point; we do not stop there."
         bisect:
+          - {version: v0.50.5.0, pin: "668b9bac302705f3bca0ae4792a49fab0a79a74e", date: 2026-09-16, use: "Restored copy only, never prod (inside the safe-chunk skip range): isolates migrations 146-149 and the Bun/security wave if the v0.60.5.0 hop fails on the copy."}
           - {version: v0.51.0.0, pin: "d13aa742fd68b71bfd6c98be3dda5813791f1d6c", date: 2026-09-17, use: "Restored copy only, never prod (inside the skip range): isolates the v0.51.0.0 write-path rewrite if this hop fails."}
       - version: v0.60.11.0
         pin: "f8d1e3936d908935ce96e18c14249aecd85fb5b2"
@@ -109,7 +122,7 @@ services:
         expected_schema: 178
         why: "Target: migrations 174-178 including one-time fact expiry; upstream master at research time."
         before:
-          - "Bump both install-gbrain SHAs and the skills-sync pin to this SHA in one commit; Recreate or scale to 0."
+          - "Bump both install-gbrain SHAs (or the one left after the Job's removal) and GBRAIN_SHA to this SHA in one commit; Recreate or scale to 0."
         validate:
           - "gbrain --version reports v0.60.11.0."
           - "Config version row equals schema 178."
@@ -117,11 +130,15 @@ services:
           - "Startup log shows 'hermes-mcp bearer asserted'."
           - "GET /health returns 200 with the version."
           - "Bearer MCP smoke: search, get_page, put_page (with expected_revision or force), add_timeline_entry, put_raw_data."
+          - "Vectors survive: get_stats embedded_count == chunk_count and get_health missing_embeddings 0, embed_coverage 1 (at v0.60.x allow one autopilot cycle to recover a transient dip; from v0.60.11.0 counts are scoped per source, compare ratios)."
+          - "Canned bearer search and query probes on pre-walk pages return the same slugs as the baseline, with no safe_index_pending or projection_pending in degraded."
+          - "hermes-agent init log shows 'gbrain skills synced to <sha>' and 'skills: kept 20 gbrain, 5 bundled; removed N; missing 0' with no 'ERROR: allow-listed gbrain skill missing'; a rename or drop updates manifests/hermes-skills.yaml in the same commit."
+          - "Hermes' gbrain MCP tools answer a read-only call after the gbrain restart; if not, restart hermes-agent (simplesalt/projects#738)."
           - "Re-run the v0.60.5.0 writer checks (writer status probe, 'Resolve IPC:' log line, database-mode receipts, empty blockers); writer status shows a single writer version 0.60.11.0."
           - "gbrain doctor shows unbound_source ok; leave persistence.unbound_write unset (it only covers put_page, not add_timeline_entry)."
           - "Timeline row counts still match the baseline; gbrain stats before and after shows facts dropped only by the one-time fact-expiry migration (174)."
           - "Autopilot cycle completes and embed --stale succeeds."
-          - "Job gbrain-migrate-embedding-dims-2 logs 'already vector(1536)'."
+          - "If Job gbrain-migrate-embedding-dims-2 still exists, it completes; otherwise the autopilot embed phase succeeds."
         rollback: "No supported rollback (past v0.50.5.0): recovery is restoring the pg_dump taken before v0.60.5.0."
 
   hermes-agent:
@@ -142,7 +159,8 @@ services:
       - "Curated release notes exist only for v2026.7.1, v2026.7.20, v2026.8.3 and v2026.8.31; v2026.9.11 has its own state.db patch-release write-up; v2026.9.7, v2026.9.14, v2026.9.21 and v2026.9.24 defer to v0.22.0 notes, which had not shipped as of 2026-09-30 (v2026.9.24 = v0.21.5). Hold full prod trust in the uncurated stops until they ship."
       - "Probes are TCP 9119 only: API (8642), webhook (8644) and gateway health are unprobed, so every stop relies on the explicit validate checks."
       - "/opt/data is a 5Gi emptyDir: all state and any lazy installs rebuild on every pod recreation."
-      - "Existing bug, not caused by the version gap: hermes writes ~/.hindsight/claude-code.json in a nested snake_case shape that does not match upstream's flat camelCase schema (bankId/recallBudget/recallMaxTokens/recallTypes); reconcile the writer separately."
+      - "The Claude Code hindsight plugin config was removed with Claude Code in 0d196b2 (simplesalt/projects#742)."
+      - "Hermes skills come from the git allow-list manifests/hermes-skills.yaml and its bundled-skill sync is skipped (.no-bundled-skills)."
     before_first_stop:
       - "Bump the digest in all three pinned_in places in the same commit at every stop."
     skip:
@@ -161,7 +179,7 @@ services:
           - "A streaming chat completion succeeds."
           - "All four MCP servers (flux, gbrain, hermes-msg, cloudflare) connect, one read-only call each; hermes-msg speaks hand-rolled MCP 2024-11-05, so check it against the MCP SDK 2.0 stateless protocol."
           - "No config, toolset or 'Disabled suspicious MCP' warnings in logs."
-          - "hindsight_recall returns bank hermes data; firecrawl search works; GITHUB_TOKEN visible to terminal."
+          - "hindsight_recall returns bank hermes data; firecrawl search works."
         rollback: "Revert the digest in all three places; /opt/data is an emptyDir, so no state persists across pod recreation."
         bisect:
           - {version: v2026.7.20, pin: sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a, date: 2026-07-20, covers: "MCP tool renames (7.7), dual-stack webhook listener and smart-approval default; curated notes exist."}
@@ -206,7 +224,7 @@ services:
           - "hindsight plugin installed at first agent init (hindsight-client >= 0.10.1 present); hindsight_recall returns bank hermes data."
           - "8642 /health, /health/detailed, /v1/models and /v1/toolsets respond directly and via hermes-proxy; a streaming chat completion succeeds."
           - "All four MCP servers connect, one read-only call each; no config, toolset or 'Disabled suspicious MCP' warnings."
-          - "Firecrawl search works; GITHUB_TOKEN visible to terminal."
+          - "Firecrawl search works."
         rollback: "Revert the digest in all three places; the hindsight server can stay at 0.10.2 (v2026.9.21 keeps the baked-in 0.6.1 client)."
 
   hindsight:
