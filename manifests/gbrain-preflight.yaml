@@ -83,8 +83,12 @@ spec:
               section "3b. pages per type (live vs soft-deleted)"
               q "SELECT CASE WHEN GROUPING(type) = 1 THEN '(all)' ELSE type END AS type, count(*) AS pages, count(*) FILTER (WHERE deleted_at IS NULL) AS live, count(*) FILTER (WHERE deleted_at IS NOT NULL) AS deleted FROM pages GROUP BY ROLLUP (type) ORDER BY pages DESC"
 
-              section "4a. embedding column types"
-              q "SELECT c.relname AS tbl, a.attname AS col, format_type(a.atttypid, a.atttypmod) AS type FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname IN ('content_chunks','takes') AND a.attname LIKE 'embedding%' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1, 2"
+              section "4a. embedding column types (every public table with a vector or halfvec column)"
+              q "SELECT c.relname AS tbl, a.attname AS col, format_type(a.atttypid, a.atttypmod) AS type FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' AND format_type(a.atttypid, a.atttypmod) ~ '^(vector|halfvec)' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1, 2"
+
+              section "4a2. row counts of tables with vector columns"
+              q "SELECT 'facts' AS tbl, count(*) AS rows FROM facts"
+              q "SELECT 'query_cache' AS tbl, count(*) AS rows FROM query_cache"
 
               section "4b. content_chunks embedding coverage by model"
               q "SELECT model, count(*) AS chunks, count(embedding) AS embedded, count(*) - count(embedding) AS unembedded FROM content_chunks GROUP BY model ORDER BY chunks DESC"
