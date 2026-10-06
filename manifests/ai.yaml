@@ -94,8 +94,10 @@ metadata:
 spec:
   replicas: 1
   strategy:
-    type: Recreate
-    rollingUpdate: null
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
   selector:
     matchLabels:
       app: gbrain
