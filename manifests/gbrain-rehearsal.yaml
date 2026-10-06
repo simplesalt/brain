@@ -573,6 +573,9 @@ spec:
               section "S4b. content_chunks embedding coverage by model"
               q "SELECT model, count(*) AS chunks, count(embedding) AS embedded, count(*) - count(embedding) AS unembedded FROM content_chunks GROUP BY model ORDER BY chunks DESC"
 
+              section "S4b2. content_chunks embedding_input_hash coverage (column exists from migration 171)"
+              q "SELECT count(*) AS chunks, count(*) FILTER (WHERE embedding_input_hash IS NULL) AS null_input_hash, count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_input_hash IS NULL) AS embedded_without_hash FROM content_chunks"
+
               section "S4c. takes embedding coverage"
               q "SELECT count(*) AS takes, count(embedding) AS embedded FROM takes"
 
@@ -622,7 +625,7 @@ spec:
             - name: RUNNER_MODE
               value: inspect
             - name: RUNNER_RUN_ID
-              value: "2"
+              value: "3"
             - name: RUNNER_REPAIR_ARGS
               value: ""
             - name: RUNNER_WAIT_FOR_SERVE
