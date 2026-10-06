@@ -1,0 +1,144 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-preflight
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-preflight
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: preflight
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=60000 -c lock_timeout=5000 -c idle_in_transaction_session_timeout=60000'
+              export PGAPPNAME=gbrain-preflight
+
+              q() {
+                case "$1" in
+                  SELECT*|SHOW*) ;;
+                  *) echo "REFUSED (read-only preflight runs SELECT/SHOW only): $1"; return 1 ;;
+                esac
+                psql -X -q -A -F ' | ' -P null='(null)' -P pager=off -v ON_ERROR_STOP=0 \
+                  -c 'BEGIN READ ONLY' -c "$1" -c 'ROLLBACK' "$DATABASE_URL" 2>&1
+                echo
+              }
+
+              section() {
+                echo
+                echo "=============================================================="
+                echo "== $1"
+                echo "=============================================================="
+              }
+
+              echo "gbrain-preflight: read-only inspection of gbrain-pg at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+              i=0
+              until pg_isready -h gbrain-pg-rw -p 5432; do
+                i=$((i + 1))
+                if [ "$i" -ge 90 ]; then echo "FATAL: gbrain-pg-rw:5432 not ready after 180s"; exit 1; fi
+                echo "waiting for gbrain-pg-rw:5432"
+                sleep 2
+              done
+
+              section "0. connection and read-only guard"
+              q "SELECT current_database() AS db, current_user AS role, current_setting('transaction_read_only') AS transaction_read_only, current_setting('default_transaction_read_only') AS default_read_only, now() AS at"
+
+              section "0b. optional columns present at this schema version"
+              q "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND ((table_name = 'pages' AND column_name IN ('chunker_version','contextual_retrieval_mode','embedding_signature','deleted_at')) OR (table_name = 'sources' AND column_name IN ('archived','chunker_version','contextual_retrieval_mode')) OR (table_name = 'timeline_entries' AND column_name = 'source')) ORDER BY 1, 2"
+
+              section "1. config rows (secret-like keys redacted, credentials in URLs redacted)"
+              q "SELECT key, CASE WHEN key ~* 'secret|key|token|password' THEN '<redacted>' ELSE regexp_replace(value, '://[^/@ ]*@', '://<redacted>@') END AS value FROM config WHERE key IN ('sync.repo_path','sync.write_through','embedding_model','embedding_dimensions','search.mode','search.reranker.model','version') OR key LIKE 'persistence%' OR key LIKE 'sync.%' OR key LIKE 'search.%' ORDER BY key"
+
+              section "2. sources"
+              q "SELECT id, name, regexp_replace(local_path, '://[^/@ ]*@', '://<redacted>@') AS local_path, regexp_replace(config->>'github_repo', '://[^/@ ]*@', '://<redacted>@') AS github_repo, config->>'federated' AS federated, archived, last_sync_at, left(last_commit, 12) AS last_commit, chunker_version, contextual_retrieval_mode, (SELECT string_agg(k, ',' ORDER BY k) FROM jsonb_object_keys(config) AS k) AS config_keys FROM sources ORDER BY id"
+
+              section "3a. pages per source (live vs soft-deleted)"
+              q "SELECT CASE WHEN GROUPING(source_id) = 1 THEN '(all)' ELSE source_id END AS source_id, count(*) AS pages, count(*) FILTER (WHERE deleted_at IS NULL) AS live, count(*) FILTER (WHERE deleted_at IS NOT NULL) AS deleted FROM pages GROUP BY ROLLUP (source_id) ORDER BY pages DESC"
+
+              section "3b. pages per type (live vs soft-deleted)"
+              q "SELECT CASE WHEN GROUPING(type) = 1 THEN '(all)' ELSE type END AS type, count(*) AS pages, count(*) FILTER (WHERE deleted_at IS NULL) AS live, count(*) FILTER (WHERE deleted_at IS NOT NULL) AS deleted FROM pages GROUP BY ROLLUP (type) ORDER BY pages DESC"
+
+              section "4a. embedding column types"
+              q "SELECT c.relname AS tbl, a.attname AS col, format_type(a.atttypid, a.atttypmod) AS type FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname IN ('content_chunks','takes') AND a.attname LIKE 'embedding%' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1, 2"
+
+              section "4b. content_chunks embedding coverage by model"
+              q "SELECT model, count(*) AS chunks, count(embedding) AS embedded, count(*) - count(embedding) AS unembedded FROM content_chunks GROUP BY model ORDER BY chunks DESC"
+
+              section "4c. takes embedding coverage"
+              q "SELECT count(*) AS takes, count(embedding) AS embedded FROM takes"
+
+              section "5a. timeline_entries total"
+              q "SELECT count(*) AS timeline_entries FROM timeline_entries"
+
+              section "5b. timeline_entries per source prefix"
+              q "SELECT split_part(source, ':', 1) AS source_prefix, count(*) AS entries FROM timeline_entries GROUP BY 1 ORDER BY 2 DESC LIMIT 100"
+
+              section "6a. pages.chunker_version distribution"
+              q "SELECT chunker_version, count(*) AS pages FROM pages GROUP BY 1 ORDER BY 1"
+
+              section "6b. pages.contextual_retrieval_mode distribution"
+              q "SELECT contextual_retrieval_mode, count(*) AS pages FROM pages GROUP BY 1 ORDER BY 2 DESC"
+
+              section "6c. pages.embedding_signature distribution"
+              q "SELECT embedding_signature, count(*) AS pages FROM pages GROUP BY 1 ORDER BY 2 DESC"
+
+              section "7a. minion_jobs by status"
+              q "SELECT status, count(*) AS jobs, min(created_at) AS oldest_created, max(updated_at) AS last_updated FROM minion_jobs GROUP BY status ORDER BY jobs DESC"
+
+              section "7b. minion_jobs by queue, name, status"
+              q "SELECT queue, name, status, count(*) AS jobs FROM minion_jobs GROUP BY 1, 2, 3 ORDER BY 1, 2, 3 LIMIT 200"
+
+              section "8. access_tokens (names only, no hashes)"
+              q "SELECT count(*) AS total, count(*) FILTER (WHERE revoked_at IS NULL) AS active, count(*) FILTER (WHERE revoked_at IS NOT NULL) AS revoked FROM access_tokens"
+              q "SELECT name, created_at, last_used_at, revoked_at IS NOT NULL AS revoked FROM access_tokens ORDER BY created_at"
+
+              section "9. schema and server version"
+              q "SELECT key, value AS gbrain_schema_version FROM config WHERE key = 'version'"
+              q "SELECT version() AS postgres"
+              q "SELECT extname, extversion FROM pg_extension ORDER BY 1"
+
+              echo
+              echo "gbrain-preflight: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              exit 0
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
