@@ -87,7 +87,7 @@ data:
     #!/usr/bin/env bun
 
     import { SQL } from 'bun';
-    import { createHmac, timingSafeEqual } from 'crypto';
+    import { createHash, createHmac, timingSafeEqual } from 'crypto';
     import { readFileSync } from 'fs';
     import { join } from 'path';
 
@@ -106,6 +106,14 @@ data:
     const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 120);
     const PROCESS_INTERVAL_MS = Number(process.env.PROCESS_INTERVAL_MS ?? 10_000);
     const PROCESS_BATCH = Number(process.env.PROCESS_BATCH ?? 20);
+    // An event that keeps failing is retried (backoff 10s, 20s ... 1h, see
+    // claimBatch) until it has failed this many times, then dead-lettered: left
+    // unprocessed in the table, never retried again, and logged once. The
+    // default rides out a gbrain upgrade outage of up to an hour.
+    const MAX_EVENT_ATTEMPTS = Math.max(1, Math.floor(Number(process.env.MAX_EVENT_ATTEMPTS ?? 12)) || 12);
+    // Tries per person-page write when it loses a revision race against another
+    // gbrain writer (re-read, re-merge, retry); then the event fails and retries later.
+    const PUT_PAGE_ATTEMPTS = Math.max(1, Math.floor(Number(process.env.PUT_PAGE_ATTEMPTS ?? 4)) || 4);
     const HEALTH_MAX_EVENT_AGE_H = Number(process.env.HEALTH_MAX_EVENT_AGE_H ?? 48);
     const HEALTH_MAX_BACKLOG_MIN = Number(process.env.HEALTH_MAX_BACKLOG_MIN ?? 15);
 
@@ -167,7 +175,7 @@ data:
       `COMMENT ON COLUMN events.event IS 'Top-level Dux Soup event name, as sent.'`,
       `COMMENT ON COLUMN events.payload IS 'Full raw webhook JSON body, verbatim.'`,
       `COMMENT ON COLUMN events.processed_at IS 'When this event was successfully applied to gbrain/profiles; NULL while still pending or retrying.'`,
-      `COMMENT ON COLUMN events.attempts IS 'Number of processing attempts so far.'`,
+      `COMMENT ON COLUMN events.attempts IS 'Number of failed processing attempts so far; an unprocessed event whose attempts reach MAX_EVENT_ATTEMPTS is dead-lettered (never retried again).'`,
       `COMMENT ON COLUMN events.last_error IS 'Error message from the most recent failed processing attempt.'`,
       `COMMENT ON COLUMN events.last_attempt_at IS 'When the most recent processing attempt ran; used to back off retries.'`,
       `COMMENT ON TABLE profiles IS 'One row per LinkedIn profile Dux Soup has visited, scanned or messaged, and the gbrain person page it is synced to.'`,
@@ -413,15 +421,19 @@ data:
       return typeof p === 'string' ? JSON.parse(p) : p;
     }
 
+    // Dead-lettered events (unprocessed, attempts at the cap) are counted apart
+    // and kept out of pending / oldest_unprocessed_at, so one of them does not
+    // hold the health check red forever.
     async function computeStats() {
       const [agg] = await sql`
         SELECT
           count(*)::int AS received_total,
           count(*) FILTER (WHERE processed_at IS NOT NULL)::int AS ingested_total,
           count(*) FILTER (WHERE processed_at IS NULL AND attempts > 0)::int AS failed_total,
-          count(*) FILTER (WHERE processed_at IS NULL)::int AS pending,
+          count(*) FILTER (WHERE processed_at IS NULL AND attempts < ${MAX_EVENT_ATTEMPTS})::int AS pending,
+          count(*) FILTER (WHERE processed_at IS NULL AND attempts >= ${MAX_EVENT_ATTEMPTS})::int AS dead_lettered_total,
           max(received_at) AS last_event_at,
-          min(received_at) FILTER (WHERE processed_at IS NULL) AS oldest_unprocessed_at
+          min(received_at) FILTER (WHERE processed_at IS NULL AND attempts < ${MAX_EVENT_ATTEMPTS}) AS oldest_unprocessed_at
         FROM events
       `;
       const [sessRow] = await sql`SELECT payload FROM events WHERE type = 'session' ORDER BY received_at DESC LIMIT 1`;
@@ -446,6 +458,7 @@ data:
         [`${ANN}/ingested-total`]: String(stats?.ingested_total ?? ''),
         [`${ANN}/failed-total`]: String(stats?.failed_total ?? ''),
         [`${ANN}/pending`]: String(stats?.pending ?? ''),
+        [`${ANN}/dead-lettered-total`]: String(stats?.dead_lettered_total ?? ''),
         [`${ANN}/last-event-at`]: stats?.last_event_at ? new Date(stats.last_event_at).toISOString() : '',
         [`${ANN}/oldest-unprocessed-at`]: stats?.oldest_unprocessed_at ? new Date(stats.oldest_unprocessed_at).toISOString() : '',
         [`${ANN}/session-state`]: JSON.stringify(stats?.sessionState ?? {}),
@@ -499,7 +512,7 @@ data:
       }
       return {
         ok: true,
-        message: `received=${ann[`${ANN}/received-total`] ?? '?'} ingested=${ann[`${ANN}/ingested-total`] ?? '?'} pending=${ann[`${ANN}/pending`] ?? '?'} last_event_age=${eventAge}`,
+        message: `received=${ann[`${ANN}/received-total`] ?? '?'} ingested=${ann[`${ANN}/ingested-total`] ?? '?'} pending=${ann[`${ANN}/pending`] ?? '?'} dead_lettered=${ann[`${ANN}/dead-lettered-total`] ?? '?'} last_event_age=${eventAge}`,
       };
     }
 
@@ -544,7 +557,9 @@ data:
     // garrytan/gbrain@492b552 src/mcp/dispatch.ts:598). On a thrown OperationError
     // the same commit's dispatch.ts:638 wraps `e.toJSON()` (which carries `error`,
     // the OperationError `code`, e.g. 'page_not_found') as isError content; we
-    // surface that as `err.code` so callers can special-case it.
+    // surface that as `err.code` so callers can special-case it. v0.60.x tool
+    // errors keep the same shape ({ error: <code>, message, suggestion }) and
+    // write refusals add { write_error, write_request: <receipt> }.
     async function gbrainCall(name, args) {
       const r = await fetch(GBRAIN_MCP_URL, {
         method: 'POST',
@@ -567,11 +582,43 @@ data:
       let parsed;
       try { parsed = JSON.parse(out); } catch { parsed = null; }
       if (msg.result?.isError) {
-        const err = new Error((parsed && parsed.message) || out.slice(0, 300) || `${name}: tool error`);
-        err.code = parsed?.error;
+        const code = typeof parsed?.error === 'string' ? parsed.error : parsed?.write_error;
+        const err = new Error(`${code ? `${code}: ` : ''}${(parsed && parsed.message) || out.slice(0, 300) || `${name}: tool error`}`);
+        err.code = code;
         throw err;
       }
       return parsed !== null ? parsed : out;
+    }
+
+    // UUID-shaped request_id derived from a namespaced key (sha256, version 5,
+    // variant 10xx). gbrain v0.60+ journals writes by request_id: an identical
+    // replay returns the original outcome without spending a new write, and
+    // the same id with different arguments is refused (idempotency_conflict).
+    // v0.48 ignores the argument.
+    function deterministicUuid(key) {
+      const h = createHash('sha256').update(`duxsoup-ingest:${key}`).digest('hex').slice(0, 32).split('');
+      h[12] = '5';
+      h[16] = ((parseInt(h[16], 16) & 0x3) | 0x8).toString(16);
+      const s = h.join('');
+      return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20)}`;
+    }
+
+    function sha256Hex(s) {
+      return createHash('sha256').update(String(s ?? '')).digest('hex');
+    }
+
+    // v0.60+ answers a write with a receipt { request_id, state, retry_after_ms,
+    // ... }; only state 'committed' means it landed. Another state (e.g. a replay
+    // that is still in flight) throws so the event retries, and the retry replays
+    // the same request_id. No `state` (v0.48) means success.
+    function requireCommitted(op, slug, res) {
+      const state = res && typeof res === 'object' ? res.state : undefined;
+      if (state !== undefined && state !== 'committed') {
+        const err = new Error(`${op} ${slug}: write not committed (state=${state}, retry_after_ms=${res.retry_after_ms ?? 'n/a'})`);
+        err.code = 'write_not_committed';
+        throw err;
+      }
+      return res;
     }
 
     // get_page params: { slug, fuzzy, include_content, include_deleted, source_id }
@@ -589,9 +636,20 @@ data:
 
     // put_page params: { slug, content, allow_empty, source_kind, source_uri,
     // ingested_via } — content is the FULL markdown (frontmatter + body); it
-    // replaces the page wholesale (pages.ts:359-375).
-    async function gbrainPutPage(slug, content) {
-      return gbrainCall('put_page', { slug, content });
+    // replaces the page wholesale (pages.ts:359-375). On v0.60+ an existing page
+    // is only written against the revision it was read at (expected_revision, from
+    // the same get_page the content was merged into; a stale one is refused with
+    // revision_conflict). Never force: a forced put deletes every timeline entry
+    // added since the page was read. No expectedRevision = create-only. requestId
+    // makes a retry of the same write a replay.
+    async function gbrainPutPage(slug, content, { expectedRevision, requestId } = {}) {
+      const res = await gbrainCall('put_page', {
+        slug,
+        content,
+        ...(expectedRevision ? { expected_revision: expectedRevision } : {}),
+        ...(requestId ? { request_id: requestId } : {}),
+      });
+      return requireCommitted('put_page', slug, res);
     }
 
     // search params: { query, limit, offset, mode, types, snippet_chars,
@@ -603,8 +661,12 @@ data:
 
     // add_timeline_entry params: { slug, date, summary, detail, source }
     // (timeline.ts: add_timeline_entry). date must be strict YYYY-MM-DD.
-    async function gbrainAddTimelineEntry({ slug, date, summary, detail, source }) {
-      return gbrainCall('add_timeline_entry', { slug, date, summary, detail, source });
+    async function gbrainAddTimelineEntry({ slug, date, summary, detail, source, requestId }) {
+      const res = await gbrainCall('add_timeline_entry', {
+        slug, date, summary, detail, source,
+        ...(requestId ? { request_id: requestId } : {}),
+      });
+      return requireCommitted('add_timeline_entry', slug, res);
     }
 
     // put_raw_data params: { slug, source, data } (raw-data.ts: put_raw_data).
@@ -679,7 +741,8 @@ data:
     // Used by action/message handlers, which may reference a profile visit/scan
     // has never seen yet. Creates a minimal stub row (and, via syncPersonPage,
     // a minimal gbrain page) so the timeline entry always has somewhere to land.
-    async function resolvePerson({ dux_id, profile_url, first_name, last_name }) {
+    // eventId keys the page write's request_id, so a retry of the event replays it.
+    async function resolvePerson({ dux_id, profile_url, first_name, last_name }, eventId) {
       const id = dux_id != null ? String(dux_id) : null;
       let profile = (id && (await findProfileByDuxId(id))) || (profile_url && (await findProfileByUrl(profile_url)));
       if (!profile) {
@@ -691,7 +754,7 @@ data:
         });
       }
       if (!profile.gbrain_slug) {
-        await syncPersonPage(profile, null);
+        await syncPersonPage(profile, null, eventId);
         profile = await findProfileByDuxId(profile.dux_id);
       }
       return profile;
@@ -766,12 +829,34 @@ data:
       return null;
     }
 
+    // True when every field Dux Soup would set is already on the page, so a
+    // write would change nothing it owns. Compared field by field, not by
+    // content: gbrain re-serializes pages as YAML, so the JSON frontmatter written
+    // here never matches byte for byte. type and title may live on the page object
+    // instead of in frontmatter (v0.60+), so both places are checked.
+    function personPageUpToDate(existing, updates, aliasAdds) {
+      const fm = existing.frontmatter ?? {};
+      for (const [k, v] of Object.entries(updates)) {
+        const cur = fm[k] !== undefined ? fm[k] : (k === 'type' || k === 'title' ? existing[k] : undefined);
+        if (cur == null || String(cur) !== String(v)) return false;
+      }
+      const aliases = Array.isArray(fm.aliases) ? fm.aliases.map(String) : [];
+      return aliasAdds.every((a) => aliases.includes(a));
+    }
+
     // Creates or updates the gbrain person page for a profiles row: resolves the
     // slug (existing gbrain_slug, else a matching page found by search, else a
     // freshly derived one), merges the duxsoup-sourced fields into frontmatter
     // while preserving the rest of the page, writes it, and (when rawPayload is
     // given) attaches the raw webhook payload via put_raw_data for provenance.
-    async function syncPersonPage(profileRow, rawPayload) {
+    // The merge is written against the revision of the get_page it was merged
+    // into (never forced) and skipped when nothing Dux Soup sets would change. A
+    // revision_conflict (another gbrain write landed in between, e.g. a timeline
+    // entry) re-reads, re-merges and retries up to PUT_PAGE_ATTEMPTS times, then
+    // throws so the event retries later. Each put_page carries a request_id
+    // derived from the event, slug, revision and content, so a retried event
+    // replays its write instead of spending a new one.
+    async function syncPersonPage(profileRow, rawPayload, eventId) {
       const fullName = [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim();
       let slug = profileRow.gbrain_slug || deriveSlug(profileRow);
       let existing = await gbrainGetPage(slug, { includeContent: true });
@@ -794,20 +879,39 @@ data:
       };
       const aliasAdds = uniqueList([profileRow.profile_url, `dux:${profileRow.dux_id}`]);
 
-      let content;
-      if (existing) {
-        const merged = { ...existing.frontmatter, ...updates };
-        merged.aliases = uniqueList([
-          ...(Array.isArray(existing.frontmatter?.aliases) ? existing.frontmatter.aliases : []),
-          ...aliasAdds,
-        ]);
-        content = replaceFrontmatterBlock(existing.content, merged);
-      } else {
-        const fm = { ...updates, title: updates.title || fullName || profileRow.dux_id, aliases: aliasAdds };
-        content = `---\n${JSON.stringify(fm, null, 2)}\n---\n\n# ${fm.title}\n`;
-      }
+      for (let attempt = 1; ; attempt++) {
+        let content;
+        if (existing) {
+          const merged = { ...existing.frontmatter, ...updates };
+          merged.aliases = uniqueList([
+            ...(Array.isArray(existing.frontmatter?.aliases) ? existing.frontmatter.aliases : []),
+            ...aliasAdds,
+          ]);
+          // v0.60+ get_page keeps title and tags on the page object, not in
+          // frontmatter; carry them over or this rewrite would drop them.
+          if (merged.title == null && existing.title) merged.title = existing.title;
+          if (merged.tags == null && Array.isArray(existing.tags) && existing.tags.length) merged.tags = existing.tags;
+          content = replaceFrontmatterBlock(existing.content, merged);
+          if (content === existing.content || personPageUpToDate(existing, updates, aliasAdds)) break;
+        } else {
+          const fm = { ...updates, title: updates.title || fullName || profileRow.dux_id, aliases: aliasAdds };
+          content = `---\n${JSON.stringify(fm, null, 2)}\n---\n\n# ${fm.title}\n`;
+        }
 
-      await gbrainPutPage(slug, content);
+        try {
+          await gbrainPutPage(slug, content, {
+            expectedRevision: existing?.revision,
+            requestId: eventId != null
+              ? deterministicUuid(`put_page:${eventId}:${slug}:${existing?.revision ?? 'create'}:${sha256Hex(content)}`)
+              : undefined,
+          });
+          break;
+        } catch (e) {
+          if ((e.code !== 'revision_conflict' && e.code !== 'revision_required') || attempt >= PUT_PAGE_ATTEMPTS) throw e;
+          console.error(`syncPersonPage: ${slug} ${e.code} (try ${attempt}/${PUT_PAGE_ATTEMPTS}); re-reading and re-merging`);
+          existing = await gbrainGetPage(slug, { includeContent: true });
+        }
+      }
       if (rawPayload) await gbrainPutRawData(slug, 'duxsoup', rawPayload);
       await setProfileGbrainSlug(profileRow.dux_id, slug);
       return slug;
@@ -838,6 +942,39 @@ data:
       return typeof v === 'string' ? v : JSON.stringify(v);
     }
 
+    // Timeline detail is stored as indented lines under the entry's bullet, and
+    // gbrain (v0.60+) reads any line shaped like a dated bullet (`**YYYY-MM-DD** | x`,
+    // with or without a leading `- `, separated by | - – or —, at any indent) as an
+    // entry of its own, cutting the real detail short. Message text can contain
+    // such a line, so the bold markers are dropped from the date: the text is
+    // kept and no phantom timeline row appears.
+    const TIMELINE_BULLET_LINE_RE = /^(\s*(?:-\s*)?)\*\*(\d{4}-\d{2}-\d{2})\*\*(?=\s*[|\-–—])/;
+
+    function neutralizeTimelineDetail(detail) {
+      return String(detail ?? '')
+        .split(/\r\n|\r|\n/)
+        .map((line) => line.replace(TIMELINE_BULLET_LINE_RE, '$1$2'))
+        .join('\n');
+    }
+
+    // Writes one event's timeline entry with a request_id derived from the event
+    // and the entry, so a retried event replays it instead of spending a new
+    // write. gbrain refusing the entry with invalid_params (e.g. it will not
+    // round-trip as a page bullet on v0.60+) is permanent: log it and move on, so
+    // the event counts as processed instead of retrying to its cap.
+    async function addTimelineEntryForEvent(row, { slug, date, summary, detail, source }) {
+      const entry = { slug, date, summary, detail: neutralizeTimelineDetail(detail), source };
+      try {
+        await gbrainAddTimelineEntry({
+          ...entry,
+          requestId: deterministicUuid(`add_timeline_entry:${row.id}:${slug}:${sha256Hex(JSON.stringify([date, summary, entry.detail, source]))}`),
+        });
+      } catch (e) {
+        if (e.code !== 'invalid_params') throw e;
+        console.error(`process: event ${row.id} (${row.type}) timeline entry for ${slug} refused by gbrain, skipping: ${e.message}`);
+      }
+    }
+
     async function processVisit(row) {
       const d = row.payload?.data ?? {};
       const profileRow = await upsertProfile({
@@ -852,7 +989,7 @@ data:
         visited_at: parseDuxTime(d.VisitTime ?? row.payload?.time),
       });
       if (!profileRow) throw new Error('visit event missing data.id');
-      await syncPersonPage(profileRow, row.payload);
+      await syncPersonPage(profileRow, row.payload, row.id);
     }
 
     async function processScan(row) {
@@ -865,7 +1002,7 @@ data:
         visited_at: parseDuxTime(d.ScanTime ?? row.payload?.time),
       });
       if (!profileRow) throw new Error('scan event missing data.id');
-      await syncPersonPage(profileRow, row.payload);
+      await syncPersonPage(profileRow, row.payload, row.id);
     }
 
     async function processAction(row) {
@@ -873,12 +1010,14 @@ data:
       const profileRow = await resolvePerson({
         dux_id: d.profileid != null ? String(d.profileid) : null,
         profile_url: d.targeturl ?? null,
-      });
-      const slug = profileRow.gbrain_slug || (await syncPersonPage(profileRow, null));
+      }, row.id);
+      const slug = profileRow.gbrain_slug || (await syncPersonPage(profileRow, null, row.id));
       const success = truthy(d.successflag);
-      await gbrainAddTimelineEntry({
+      await addTimelineEntryForEvent(row, {
         slug,
-        date: ymd(parseDuxTime(row.payload?.time)),
+        // received_at, not now, when the payload has no time: the date must be
+        // the same on every retry of the event.
+        date: ymd(parseDuxTime(row.payload?.time ?? row.received_at)),
         summary: `LinkedIn ${d.name ?? 'action'}: ${success ? 'success' : 'failed'}`,
         detail: stringifyDetail(d.returnvalue),
         source: `duxsoup:action:${row.id}`,
@@ -894,11 +1033,11 @@ data:
         profile_url: d.url ?? null,
         first_name: isReceived ? d.fromFirstName : d.toFirstName,
         last_name: isReceived ? d.fromLastName : d.toLastName,
-      });
-      const slug = profileRow.gbrain_slug || (await syncPersonPage(profileRow, null));
-      await gbrainAddTimelineEntry({
+      }, row.id);
+      const slug = profileRow.gbrain_slug || (await syncPersonPage(profileRow, null, row.id));
+      await addTimelineEntryForEvent(row, {
         slug,
-        date: ymd(parseDuxTime(row.payload?.time)),
+        date: ymd(parseDuxTime(row.payload?.time ?? row.received_at)),
         summary: `LinkedIn message ${isReceived ? 'received' : 'sent'}`,
         detail: stringifyDetail(d.text ?? ''),
         source: `duxsoup:message:${row.id}`,
@@ -923,18 +1062,31 @@ data:
       }
     }
 
+    // Retries back off 10s, 20s, 40s ... up to 1h; events at MAX_EVENT_ATTEMPTS
+    // attempts are dead-lettered and never claimed again.
     async function claimBatch() {
       return sql`
         SELECT * FROM events
         WHERE processed_at IS NULL
+          AND attempts < ${MAX_EVENT_ATTEMPTS}
           AND (
             attempts = 0
             OR last_attempt_at IS NULL
-            OR last_attempt_at <= now() - (LEAST(POWER(2, attempts) * 5, 300) || ' seconds')::interval
+            OR last_attempt_at <= now() - (LEAST(POWER(2, attempts) * 5, 3600) || ' seconds')::interval
           )
         ORDER BY received_at ASC
         LIMIT ${PROCESS_BATCH}
       `;
+    }
+
+    // Events already at the attempt cap when the process starts (dead-lettered
+    // by an earlier run, or left over after MAX_EVENT_ATTEMPTS was lowered):
+    // reported once here, since claimBatch never logs them again.
+    async function reportDeadLetters() {
+      const [{ n }] = await sql`SELECT count(*)::int AS n FROM events WHERE processed_at IS NULL AND attempts >= ${MAX_EVENT_ATTEMPTS}`;
+      if (!n) return;
+      const ids = await sql`SELECT id FROM events WHERE processed_at IS NULL AND attempts >= ${MAX_EVENT_ATTEMPTS} ORDER BY id LIMIT 50`;
+      console.error(`dead-letter: ${n} event(s) at or over ${MAX_EVENT_ATTEMPTS} attempts at startup, not retried: ids ${ids.map((r) => r.id).join(', ')}${n > ids.length ? ', ...' : ''}`);
     }
 
     let processing = false;
@@ -953,7 +1105,11 @@ data:
             const msg = String(e?.message ?? e).slice(0, 800);
             console.error(`processBatch: event ${row.id} (${row.type}) failed (attempt ${row.attempts + 1}): ${msg}`);
             try {
-              await sql`UPDATE events SET attempts = attempts + 1, last_attempt_at = now(), last_error = ${msg} WHERE id = ${row.id}`;
+              const [upd] = await sql`UPDATE events SET attempts = attempts + 1, last_attempt_at = now(), last_error = ${msg} WHERE id = ${row.id} RETURNING attempts`;
+              // Logged once: from here on claimBatch skips the event.
+              if (upd && upd.attempts >= MAX_EVENT_ATTEMPTS) {
+                console.error(`dead-letter: event ${row.id} (${row.type}) gave up after ${upd.attempts} attempts: ${msg.replace(/\s+/g, ' ')}`);
+              }
             } catch (e2) {
               console.error(`processBatch: could not record failure for event ${row.id}: ${e2.message}`);
             }
@@ -1058,6 +1214,7 @@ data:
 
     async function main() {
       await migrateWithRetry();
+      await reportDeadLetters().catch((e) => console.error(`startup: dead-letter report failed: ${e.message}`));
 
       const tick = async () => {
         await processBatch().catch((e) => console.error(`tick: processBatch failed: ${e.message}`));
@@ -1113,7 +1270,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "2"
+        simplesalt.company/restart-epoch: "3"
     spec:
       serviceAccountName: duxsoup-ingest
       containers:
