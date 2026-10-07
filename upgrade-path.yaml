@@ -15,7 +15,7 @@ order:
   - "Move gbrain skills sync (hermes-agent install-cli-tools) to the same SHA as the gbrain server in the same commit as every gbrain stop; never move it with a hermes stop."
   - "hindsight server must reach 0.10.2 before hermes-agent moves to v2026.9.24 (its hindsight plugin needs hindsight-client >= 0.10.1)."
   - "hermes-agent stops 1-3 keep the baked-in hindsight client 0.6.1; it works against today's 0.8.2, and each hindsight stop's validate (hindsight_recall and a Hermes reflect) is what proves it against 0.8.6-0.10.2."
-  - "put_page callers (calendar-collector, duxsoup-ingest, email-collector) must send expected_revision or force before gbrain v0.60.5.0 (simplesalt/projects#658)."
+  - "put_page callers (calendar-collector, duxsoup-ingest, email-collector) must send expected_revision or force before gbrain v0.60.5.0 (simplesalt/projects#658; done in simplesalt/brain c895be7, ff07a3a)."
 
 services:
   gbrain:
@@ -54,7 +54,7 @@ services:
         expected_schema: 173
         why: "Carries v0.48.3-v0.60.4 (migrations 146-173, including 149 which aborts on active minion jobs and adds the minion_queue_protocol trigger; Bun >= 1.3.11 enforcement and the security wave: OAuth consent/DCR scope gates, cwd .env quarantine; v0.51.0.0 write-path rewrite, put_page expected_revision/force contract); first stop past the safe-chunk search withholding (#5004, #5050), the timeline-deletion bug (#5567) and the driver failure."
         before:
-          - "Writers fixed first (simplesalt/projects#658): Dux Soup sends expected_revision from the same get_page (force would delete entries added between get_page and put_page), email and calendar send force or expected_revision, Dux Soup has a retry cap and a deterministic request_id: on v0.60.x a refused write still spends a permanent write ID (250,000 per principal shared by all bearer clients). The current pin ignores unknown params, so the writers can change first."
+          - "DONE (simplesalt/brain c895be7, ff07a3a; simplesalt/projects#658): writers fixed first. Dux Soup sends expected_revision from the same get_page (force would delete entries added between get_page and put_page), re-reads on revision_conflict, skips unchanged pages, neutralises bullet-shaped detail lines, skips invalid_params timeline entries, and dead-letters an event after MAX_EVENT_ATTEMPTS (12); email and calendar send force; every page and timeline write carries a deterministic UUID request_id, because on v0.60.x a refused write still spends a permanent write ID (250,000 per principal shared by all bearer clients). The current pin ignores unknown params, so the writers changed first."
           - "Take a fresh pg_dump of gbrain-pg."
           - "Rehearse on a restored copy: init with our exact flags, migrations, projection drain, both repairs, canned probes."
           - "Database config.embedding_model equals openai:text-embedding-3-small (init refuses a populated brain otherwise, from v0.56.2.0); settle on the restored copy first."
