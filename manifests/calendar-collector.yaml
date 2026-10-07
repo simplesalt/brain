@@ -413,6 +413,15 @@ data:
       try { return JSON.parse(text); } catch { return null; }
     }
 
+    // Pages under calendar/ belong wholly to this collector, so every write deliberately overwrites (force).
+    // The request_id is a UUID derived from slug+content: a replay of the same write reuses gbrain's
+    // original receipt instead of spending a new write, and changed content gets a fresh id.
+    function putRequestId(slug, content) {
+      const h = createHash('sha256').update(`calendar-collector:put_page:${slug}:${content}`).digest('hex');
+      const variant = ((parseInt(h[16], 16) & 0x3) | 0x8).toString(16);
+      return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+    }
+
     async function gbrainPutPage(slug, content) {
       const r = await fetch(GBRAIN_MCP_URL, {
         method: 'POST',
@@ -423,7 +432,7 @@ data:
         },
         body: JSON.stringify({
           jsonrpc: '2.0', id: 1, method: 'tools/call',
-          params: { name: 'put_page', arguments: { slug, content } },
+          params: { name: 'put_page', arguments: { slug, content, force: true, request_id: putRequestId(slug, content) } },
         }),
       });
       const text = await r.text();
@@ -434,6 +443,12 @@ data:
       if (msg.result?.isError) {
         const t = (msg.result.content ?? []).map(c => c.text ?? '').join(' ');
         throw new Error(`tool: ${t.slice(0, 160)}`);
+      }
+      // Only a committed receipt means the write landed; older gbrain replies carry no state, which counts as success.
+      let receipt = null;
+      try { receipt = JSON.parse((msg.result?.content ?? []).map(c => c.text ?? '').join('')); } catch { /* legacy reply without a receipt */ }
+      if (receipt?.state && receipt.state !== 'committed') {
+        throw new Error(`write not committed: state=${receipt.state} request_id=${receipt.request_id}`);
       }
       return msg.result;
     }
