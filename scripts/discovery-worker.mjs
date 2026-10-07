@@ -53,7 +53,6 @@ const GOOGLE_JOBS_SEEDS = {
   terry: ["enterprise security architect remote", "principal security architect remote"],
   dwayne: ["business information security officer remote", "BISO remote"],
   chad: ["GRC manager remote", "governance risk and compliance manager remote"],
-  mario: ["security developer advocate remote", "security evangelist remote"],
 };
 const PAGE_TEXT_MAX_CHARS = 8000;
 
@@ -106,7 +105,7 @@ if (!EXA_API_KEY) throw new Error("EXA_API_KEY is required");
 const sql = new SQL(DATABASE_URL);
 
 // Bump this to overwrite the seed searches' definitions on the next run. Every cycle already
-// requests every search, so it no longer controls whether a search runs.
+// requests every search that is not retired, so it no longer controls whether a search runs.
 const SEED_VERSION = 5;
 
 const SEEDS = [
@@ -161,19 +160,10 @@ const SEEDS = [
       "Job posting for a Governance, Risk, and Compliance (GRC) Manager at a large enterprise, driving delivery of GRC programs and compliance initiatives",
     ],
   },
-  {
-    name: "mario",
-    role: "Security / Developer Evangelist",
-    company_type: "software company",
-    responsibilities: "Evangelizes security practices to developers; represents security externally.",
-    flavor:
-      "Best fit is a hybrid dev-facing + security role (advocacy, conference talks, content); plain product-marketing or pure AppSec-engineer roles are weaker matches.",
-    serper_queries: [],
-    exa_queries: [
-      "Job posting for a security developer evangelist or developer advocate role at a software company, engaging developers on security best practices",
-    ],
-  },
 ];
+
+// Searches no longer wanted: seeding retires them (retired_at), keeping the rows their history references.
+const RETIRED_SEEDS = ["mario"];
 
 // Applied once per cycle: CNPG may create the crawl_read role after the previous cycle ended.
 const READ_ROLE_GRANTS = `DO $$ BEGIN
@@ -306,6 +296,7 @@ const DDL_STATEMENTS = [
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS is_job_posting boolean`,
   `ALTER TABLE searches ADD COLUMN IF NOT EXISTS google_jobs_queries text[] NOT NULL DEFAULT '{}'::text[]`,
   `ALTER TABLE searches ADD COLUMN IF NOT EXISTS google_jobs_run_at timestamptz`,
+  `ALTER TABLE searches ADD COLUMN IF NOT EXISTS retired_at timestamptz`,
   `ALTER TABLE search_runs ADD COLUMN IF NOT EXISTS google_jobs_results int`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS live_status text`,
   `ALTER TABLE candidates ADD COLUMN IF NOT EXISTS live_checked_at timestamptz`,
@@ -475,6 +466,7 @@ const DDL_STATEMENTS = [
   `COMMENT ON COLUMN candidates.found_via IS 'For postings discovered by following a link, the candidate whose page linked to it.'`,
   `COMMENT ON COLUMN searches.google_jobs_queries IS 'Queries run against Google for Jobs (via SerpApi) for this profile; one page of about 10 jobs each.'`,
   `COMMENT ON COLUMN searches.google_jobs_run_at IS 'When this search last ran its Google Jobs queries.'`,
+  `COMMENT ON COLUMN searches.retired_at IS 'When this search was retired; null while it is active. A retired search is never requested or run again, and its row stays for the runs and sightings that reference it.'`,
   `COMMENT ON COLUMN candidates.live_status IS 'live, closed (page gone or says the job is closed/filled) or unknown (site blocked the check); from a plain page fetch, rechecked daily.'`,
   `COMMENT ON TABLE excluded_employers IS 'Employers whose roles are excluded from discovery results, such as consulting firms. Edit freely; the worker re-applies it every cycle.'`,
   `COMMENT ON COLUMN excluded_employers.domains IS 'The employer''s own web domains; Exa searches skip these and postings on them are flagged.'`,
@@ -539,6 +531,9 @@ async function seed() {
         updated_at = now()
       WHERE searches.seed_version IS DISTINCT FROM EXCLUDED.seed_version
     `;
+  }
+  for (const name of RETIRED_SEEDS) {
+    await sql`UPDATE searches SET retired_at = now() WHERE name = ${name} AND retired_at IS NULL`;
   }
 }
 
@@ -1695,7 +1690,8 @@ async function claimSearch() {
         to_jsonb(exa_queries) AS exa_queries,
         to_jsonb(google_jobs_queries) AS google_jobs_queries
       FROM searches
-      WHERE run_requested_at IS NOT NULL
+      WHERE retired_at IS NULL
+        AND run_requested_at IS NOT NULL
         AND (last_run_started_at IS NULL OR run_requested_at > last_run_started_at)
       ORDER BY run_requested_at
       FOR UPDATE SKIP LOCKED
@@ -1841,10 +1837,10 @@ async function runCycle() {
   // The cycle's start by the database's clock, which first_seen_at and detail_tried_at also use.
   const [{ t: cycleStart }] = await sql`SELECT now()::text AS t`;
 
-  // Request every search, then claim and run them until none are left. Google Jobs runs inside
-  // runSearch, so it reruns every cycle too.
+  // Request every search that is not retired, then claim and run them until none are left. Google
+  // Jobs runs inside runSearch, so it reruns every cycle too.
   try {
-    await sql`UPDATE searches SET run_requested_at = now()`;
+    await sql`UPDATE searches SET run_requested_at = now() WHERE retired_at IS NULL`;
     for (let i = 0; !shuttingDown; i++) {
       if (i >= MAX_LOOP_ITERATIONS) {
         loopCapHit("search");
