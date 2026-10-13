@@ -796,6 +796,24 @@ data:
       return out;
     }
 
+    // Appends a bullet block to the markdown timeline section: after the first
+    // `<!-- timeline -->` sentinel's content (gbrain's splitBody splits at the
+    // first one), or under a new sentinel when the page has none. Everything
+    // else in the page is left untouched. A page that already carries the
+    // block's marker is returned unchanged.
+    function appendTimelineBullet(content, { marker, block }) {
+      const text = String(content ?? '');
+      if (text.includes(marker)) return text;
+      const hasSentinel = text.split('\n').some((l) => {
+        const t = l.trim();
+        return t === '<!-- timeline -->' || t === '<!--timeline-->';
+      });
+      const head = text.replace(/\s+$/, '');
+      return hasSentinel
+        ? `${head}\n${block}\n`
+        : `${head}\n\n<!-- timeline -->\n\n${block}\n`;
+    }
+
     function replaceFrontmatterBlock(content, merged) {
       const block = `---\n${JSON.stringify(merged, null, 2)}\n---\n`;
       const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n/.exec(content ?? '');
@@ -856,7 +874,13 @@ data:
     // throws so the event retries later. Each put_page carries a request_id
     // derived from the event, slug, revision and content, so a retried event
     // replays its write instead of spending a new one.
-    async function syncPersonPage(profileRow, rawPayload, eventId) {
+    //
+    // timelineBullet ({ marker, block }) appends one bullet to the page's markdown
+    // timeline section (the part after the `<!-- timeline -->` sentinel), which
+    // gbrain chunks for search; add_timeline_entry only writes the timeline_entries
+    // table, which search never indexes. The marker makes it idempotent: a page
+    // that already carries it is not rewritten.
+    async function syncPersonPage(profileRow, rawPayload, eventId, timelineBullet = null) {
       const fullName = [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim();
       let slug = profileRow.gbrain_slug || deriveSlug(profileRow);
       let existing = await gbrainGetPage(slug, { includeContent: true });
@@ -891,11 +915,15 @@ data:
           // frontmatter; carry them over or this rewrite would drop them.
           if (merged.title == null && existing.title) merged.title = existing.title;
           if (merged.tags == null && Array.isArray(existing.tags) && existing.tags.length) merged.tags = existing.tags;
-          content = replaceFrontmatterBlock(existing.content, merged);
-          if (content === existing.content || personPageUpToDate(existing, updates, aliasAdds)) break;
+          const needsBullet = !!timelineBullet && !String(existing.content ?? '').includes(timelineBullet.marker);
+          const upToDate = personPageUpToDate(existing, updates, aliasAdds);
+          content = upToDate ? existing.content : replaceFrontmatterBlock(existing.content, merged);
+          if (needsBullet) content = appendTimelineBullet(content, timelineBullet);
+          if (content === existing.content || (upToDate && !needsBullet)) break;
         } else {
           const fm = { ...updates, title: updates.title || fullName || profileRow.dux_id, aliases: aliasAdds };
           content = `---\n${JSON.stringify(fm, null, 2)}\n---\n\n# ${fm.title}\n`;
+          if (timelineBullet) content = appendTimelineBullet(content, timelineBullet);
         }
 
         try {
@@ -1024,7 +1052,26 @@ data:
       });
     }
 
-    async function processMessage(row) {
+    // The bullet a message event adds to the person page's markdown timeline:
+    //   - **YYYY-MM-DD** | LinkedIn message received from Name <!-- duxsoup:message:ID -->
+    //     message text, every line indented under the bullet
+    // The trailing comment is the idempotency marker. Text is neutralized so it
+    // cannot fake a dated bullet, a timeline sentinel or another event's marker.
+    function buildMessageBullet(row, { isReceived, date, senderName, text }) {
+      const marker = `<!-- duxsoup:message:${row.id} -->`;
+      const safeText = neutralizeTimelineDetail(String(text ?? '').replaceAll('<!--', '< !--'))
+        .split('\n')
+        .map((l) => `  ${l}`.replace(/\s+$/, ''))
+        .join('\n')
+        .replace(/\s+$/, '');
+      const who = String(senderName ?? '').replace(/\s+/g, ' ').trim() || (isReceived ? 'unknown sender' : 'me');
+      const head = `- **${date}** | LinkedIn message ${isReceived ? 'received from' : 'sent by'} ${who.replaceAll('<!--', '< !--')} ${marker}`;
+      return { marker, block: safeText ? `${head}\n${safeText}` : head };
+    }
+
+    // Resolves the person page for a message event, appends the event's bullet
+    // to its markdown timeline (idempotent) and returns the slug.
+    async function writeMessageToPage(row) {
       const d = row.payload?.data ?? {};
       const ev = String(row.event ?? row.payload?.event ?? '').toLowerCase();
       const isReceived = ev ? ev === 'received' : (d.fromId != null || d.from != null);
@@ -1034,14 +1081,43 @@ data:
         first_name: isReceived ? d.fromFirstName : d.toFirstName,
         last_name: isReceived ? d.fromLastName : d.toLastName,
       }, row.id);
-      const slug = profileRow.gbrain_slug || (await syncPersonPage(profileRow, null, row.id));
+      const date = ymd(parseDuxTime(row.payload?.time ?? row.received_at));
+      const senderName = [d.fromFirstName, d.fromLastName].filter(Boolean).join(' ').trim()
+        || (typeof d.from === 'string' ? d.from : '')
+        || (isReceived ? [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim() : '');
+      const bullet = buildMessageBullet(row, { isReceived, date, senderName, text: stringifyDetail(d.text ?? '') });
+      const slug = await syncPersonPage(profileRow, null, row.id, bullet);
+      return { slug, date, isReceived, text: stringifyDetail(d.text ?? '') };
+    }
+
+    async function processMessage(row) {
+      const { slug, date, isReceived, text } = await writeMessageToPage(row);
       await addTimelineEntryForEvent(row, {
         slug,
-        date: ymd(parseDuxTime(row.payload?.time ?? row.received_at)),
+        date,
         summary: `LinkedIn message ${isReceived ? 'received' : 'sent'}`,
-        detail: stringifyDetail(d.text ?? ''),
+        detail: text,
         source: `duxsoup:message:${row.id}`,
       });
+    }
+
+    // One-time (per process start) pass over stored message events so messages
+    // ingested before the markdown timeline write become searchable. Idempotent:
+    // a page already carrying an event's marker is not written. Sequential and
+    // best effort; a failing event is logged and skipped, the next start retries.
+    async function backfillMessageTimelines() {
+      const rows = await sql`SELECT * FROM events WHERE type = 'message' AND processed_at IS NOT NULL ORDER BY id`;
+      let ok = 0, failed = 0;
+      for (const raw of rows) {
+        try {
+          await writeMessageToPage({ ...raw, payload: normalizePayload(raw.payload) });
+          ok++;
+        } catch (e) {
+          failed++;
+          console.error(`backfill: message event ${raw.id} failed: ${String(e?.message ?? e).slice(0, 300)}`);
+        }
+      }
+      console.log(`backfill: message timelines checked=${rows.length} ok=${ok} failed=${failed}`);
     }
 
     // rccommand and session events are kept in the events table only (no gbrain
@@ -1222,6 +1298,8 @@ data:
       };
       tick();
       setInterval(tick, PROCESS_INTERVAL_MS);
+      backfillMessageTimelines()
+        .catch((e) => console.error(`startup: message timeline backfill failed: ${e.message}`));
 
       const settingsPoll = () => pollDuxSoupSettings()
         .catch((e) => console.error(`duxsoup-settings-poll: unexpected failure: ${stripSecrets(e?.message ?? e).slice(0, 300)}`));
@@ -1270,7 +1348,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "3"
+        simplesalt.company/restart-epoch: "4"
     spec:
       serviceAccountName: duxsoup-ingest
       containers:
