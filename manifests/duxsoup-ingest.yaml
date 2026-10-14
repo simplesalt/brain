@@ -919,6 +919,52 @@ data:
     }
 
     // ---------------------------------------------------------------------------
+    // The LinkedIn layer: the full latest LinkedIn record, kept apart from the
+    // layered top-level fields as `linkedin_profile`. Replaced wholesale by a newer
+    // visit/scan, never merged with local values, never replaced by an older event.
+    // ---------------------------------------------------------------------------
+
+    const PERSON_LAYER_KEYS = [
+      'name', 'linkedin', 'linkedin_id', 'linkedin_sales_id', 'emails', 'phones', 'twitter', 'website',
+      'location', 'industry', 'headline', 'role', 'company', 'company_linkedin', 'company_linkedin_id',
+      'company_website', 'linkedin_degree', 'picture',
+    ];
+
+    // ISO time of the event itself, never "now": the same on every retry and
+    // backfill of the event. null when the event carries no usable time.
+    function eventIsoTime(row, primary) {
+      for (const v of [primary, row.payload?.time, row.received_at]) {
+        if (v == null) continue;
+        const d = typeof v === 'number' ? new Date(v > 1e12 ? v : v * 1000) : new Date(v);
+        if (!Number.isNaN(d.getTime())) return d.toISOString();
+      }
+      return null;
+    }
+
+    function buildLayer(source, keys, fetchedAt) {
+      const layer = {};
+      for (const k of keys) if (!isEmptyVal(source[k])) layer[k] = source[k];
+      if (fetchedAt) layer.fetched_at = fetchedAt;
+      return layer;
+    }
+
+    const layerTime = (l) => {
+      const t = l && typeof l === 'object' && l.fetched_at != null ? new Date(l.fetched_at).getTime() : NaN;
+      return Number.isNaN(t) ? null : t;
+    };
+
+    // Sets merged.linkedin_profile to `layer`, unless the page already holds a
+    // layer fetched later than this event's.
+    function applyLayer(merged, existingFm, layer) {
+      if (!layer || isEmptyVal(Object.keys(layer))) return;
+      const cur = existingFm?.linkedin_profile;
+      const curT = layerTime(cur);
+      const newT = layerTime(layer);
+      if (cur && typeof cur === 'object' && curT != null && (newT == null || curT > newT)) return;
+      merged.linkedin_profile = layer;
+    }
+
+    // ---------------------------------------------------------------------------
     // Frontmatter ownership. Dux Soup fills empty fields and updates the values it
     // wrote itself (listed in `duxsoup_fields`); it never overwrites a value another
     // source or a person wrote. Lists (emails, phones, aliases) only ever grow.
@@ -972,7 +1018,7 @@ data:
 
     function mergeLinkedinFrontmatter(existingFm, existingPage, details) {
       const wanted = { ...details, title: details.name };
-      return mergeFrontmatter(existingFm, existingPage, {
+      const merged = mergeFrontmatter(existingFm, existingPage, {
         type: 'person',
         scalars: PERSON_SCALAR_KEYS,
         wanted,
@@ -983,10 +1029,12 @@ data:
         },
         aliases: details.aliases ?? [],
       });
+      applyLayer(merged, existingFm, details.linkedin_profile);
+      return merged;
     }
 
     function mergeCompanyFrontmatter(existingFm, existingPage, details) {
-      return mergeFrontmatter(existingFm, existingPage, {
+      const merged = mergeFrontmatter(existingFm, existingPage, {
         type: 'company',
         scalars: COMPANY_SCALAR_KEYS,
         wanted: details,
@@ -994,6 +1042,8 @@ data:
         lists: {},
         aliases: details.aliases ?? [],
       });
+      applyLayer(merged, existingFm, details.linkedin_profile);
+      return merged;
     }
 
     // True when every managed key of `merged` is already on the page. Compared key
@@ -1003,7 +1053,12 @@ data:
     // in frontmatter (v0.60+), so both places are checked.
     function frontmatterUpToDate(existing, merged, keys) {
       const fm = existing?.frontmatter ?? {};
-      const str = (v) => (typeof v === 'object' ? JSON.stringify(v) : String(v));
+      // Objects (linkedin_profile) compare by content, whatever the key order:
+      // gbrain re-serializes frontmatter as YAML.
+      const canon = (v) => (Array.isArray(v) ? v.map(canon)
+        : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])]))
+        : v);
+      const str = (v) => (typeof v === 'object' ? JSON.stringify(canon(v)) : String(v));
       for (const k of keys) {
         const v = merged[k];
         if (v === undefined) continue;
@@ -1018,8 +1073,8 @@ data:
       return true;
     }
 
-    const PERSON_MANAGED_KEYS = ['type', 'source', ...PERSON_SCALAR_KEYS, ...PERSON_LIST_KEYS];
-    const COMPANY_MANAGED_KEYS = ['type', 'source', ...COMPANY_SCALAR_KEYS, 'aliases', 'duxsoup_fields'];
+    const PERSON_MANAGED_KEYS = ['type', 'source', ...PERSON_SCALAR_KEYS, ...PERSON_LIST_KEYS, 'linkedin_profile'];
+    const COMPANY_MANAGED_KEYS = ['type', 'source', ...COMPANY_SCALAR_KEYS, 'aliases', 'duxsoup_fields', 'linkedin_profile'];
 
     // ---------------------------------------------------------------------------
     // Contact block: a managed section of the person page body, written from the
@@ -1252,6 +1307,11 @@ data:
           det.company_linkedin,
           det.company_linkedin_id ? `linkedin-company:${det.company_linkedin_id}` : null,
         ]),
+        linkedin_profile: buildLayer(
+          { name: det.company, linkedin: det.company_linkedin, linkedin_id: det.company_linkedin_id, website: det.company_website },
+          ['name', 'linkedin', 'linkedin_id', 'website'],
+          det.linkedin_profile?.fetched_at,
+        ),
       };
       await writePageWithRetry('syncCompanyPage', slug, existing, eventId, (ex) => {
         if (ex) {
@@ -1360,6 +1420,7 @@ data:
       const d = row.payload?.data ?? {};
       if (!opts.backfill) logPayloadKeys(row, 'visit', d);
       const details = extractLinkedinDetails(d);
+      details.linkedin_profile = buildLayer(details, PERSON_LAYER_KEYS, eventIsoTime(row, d.VisitTime));
       const profileRow = await upsertProfile({
         dux_id: d.id != null ? String(d.id) : null,
         profile_url: d.Profile ?? details.linkedin ?? null,
@@ -1379,6 +1440,7 @@ data:
       const d = row.payload?.data ?? {};
       if (!opts.backfill) logPayloadKeys(row, 'scan', d);
       const details = extractLinkedinDetails(d);
+      details.linkedin_profile = buildLayer(details, PERSON_LAYER_KEYS, eventIsoTime(row, d.ScanTime));
       const profileRow = await upsertProfile({
         dux_id: d.id != null ? String(d.id) : null,
         profile_url: d.Profile ?? details.linkedin ?? null,
@@ -1729,7 +1791,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "5"
+        simplesalt.company/restart-epoch: "6"
     spec:
       serviceAccountName: duxsoup-ingest
       containers:
