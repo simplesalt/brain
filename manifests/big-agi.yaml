@@ -1,4 +1,112 @@
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: big-agi-gate-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  gate.py: |
+    #!/usr/bin/env python3
+    # Sits between the Cloudflare tunnel and big-AGI. big-AGI never forwards
+    # browser headers upstream, so the Access JWT is copied into the OpenAI
+    # access config's oaiOrg field, which big-AGI sends to hermes-proxy as
+    # OpenAI-Organization. hermes-proxy verifies it; this gate trusts nothing.
+    import json, os, http.client, http.server
+    from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
+
+    UPSTREAM_HOST = os.environ.get('UPSTREAM_HOST', '127.0.0.1')
+    UPSTREAM_PORT = int(os.environ.get('UPSTREAM_PORT', '3000'))
+    PORT = int(os.environ.get('PORT', '3080'))
+    JWT_HEADER = 'Cf-Access-Jwt-Assertion'
+
+    _SKIP_REQ = {'transfer-encoding', 'connection', 'content-length'}
+    _SKIP_RESP = {'transfer-encoding', 'connection'}
+
+    def stamp(node, jwt):
+        n = 0
+        if isinstance(node, dict):
+            if node.get('dialect') == 'openai' and 'oaiKey' in node:
+                node['oaiOrg'] = jwt
+                n += 1
+            for v in node.values():
+                n += stamp(v, jwt)
+        elif isinstance(node, list):
+            for v in node:
+                n += stamp(v, jwt)
+        return n
+
+    def stamp_json(raw, jwt):
+        try:
+            doc = json.loads(raw)
+        except Exception:
+            return None
+        return json.dumps(doc, separators=(',', ':')) if stamp(doc, jwt) else None
+
+    class Gate(http.server.BaseHTTPRequestHandler):
+        timeout = 600
+        def do_GET(self): self._proxy()
+        def do_HEAD(self): self._proxy()
+        def do_POST(self): self._proxy()
+        def do_PUT(self): self._proxy()
+        def do_PATCH(self): self._proxy()
+        def do_DELETE(self): self._proxy()
+        def do_OPTIONS(self): self._proxy()
+        def log_message(self, *a): pass
+
+        def _proxy(self):
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            body = self.rfile.read(n) if n else b''
+            jwt = self.headers.get(JWT_HEADER, '')
+            path = self.path
+            if path.startswith('/api/'):
+                ctype = self.headers.get('Content-Type', '')
+                if body and 'json' in ctype:
+                    out = stamp_json(body, jwt)
+                    if out is not None:
+                        body = out.encode()
+                parts = urlsplit(path)
+                if parts.query and 'input=' in parts.query:
+                    q = parse_qsl(parts.query, keep_blank_values=True)
+                    q2 = [(k, (stamp_json(v, jwt) or v) if k == 'input' else v) for k, v in q]
+                    if q2 != q:
+                        path = urlunsplit(('', '', parts.path, urlencode(q2), parts.fragment))
+            fwd = {k: v for k, v in self.headers.items() if k.lower() not in _SKIP_REQ}
+            if body or self.command in ('POST', 'PUT', 'PATCH'):
+                fwd['Content-Length'] = str(len(body))
+            conn = None
+            try:
+                conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=600)
+                conn.request(self.command, path, body=body or None, headers=fwd)
+                r = conn.getresponse()
+                self.send_response_only(r.status, r.reason)
+                for k, v in r.getheaders():
+                    if k.lower() not in _SKIP_RESP:
+                        self.send_header(k, v)
+                self.end_headers()
+                if self.command != 'HEAD':
+                    while True:
+                        chunk = r.read1(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+            except Exception as e:
+                try: self.send_error(502, str(e))
+                except Exception: pass
+            finally:
+                if conn is not None:
+                    try: conn.close()
+                    except Exception: pass
+
+    if __name__ == '__main__':
+        srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Gate)
+        print(f'big-agi-gate :{PORT} → {UPSTREAM_HOST}:{UPSTREAM_PORT}', flush=True)
+        srv.serve_forever()
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,7 +134,7 @@ spec:
           image: ghcr.io/enricoros/big-agi:latest
           imagePullPolicy: Always
           ports:
-            - name: http
+            - name: app
               containerPort: 3000
           env:
             - name: OPENAI_API_KEY
@@ -48,6 +156,41 @@ spec:
               port: 3000
             initialDelaySeconds: 30
             periodSeconds: 15
+        - name: gate
+          image: python:3.12-alpine
+          command: ["python", "/scripts/gate.py"]
+          ports:
+            - name: http
+              containerPort: 3080
+          env:
+            - name: UPSTREAM_PORT
+              value: "3000"
+            - name: PORT
+              value: "3080"
+          volumeMounts:
+            - name: gate-script
+              mountPath: /scripts
+          readinessProbe:
+            tcpSocket:
+              port: 3080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 3080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: gate-script
+          configMap:
+            name: big-agi-gate-script
 ---
 apiVersion: v1
 kind: Service
@@ -64,4 +207,4 @@ spec:
   ports:
     - name: http
       port: 3000
-      targetPort: 3000
+      targetPort: 3080

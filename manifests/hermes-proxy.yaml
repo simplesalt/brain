@@ -11,7 +11,7 @@ metadata:
 data:
   proxy.py: |
     #!/usr/bin/env python3
-    import json, os, http.client, http.server
+    import base64, hashlib, hmac, json, os, threading, time, http.client, http.server, urllib.request
     from urllib.parse import urlparse
 
     HERMES_URL = os.environ.get('HERMES_URL', 'http://hermes-agent-web:8642')
@@ -20,8 +20,105 @@ data:
     _HOST = _u.hostname
     _PORT = _u.port or (443 if _u.scheme == 'https' else 80)
 
-    _SKIP_REQ = {'host', 'transfer-encoding', 'connection'}
+    ACCESS_TEAM = os.environ.get('ACCESS_TEAM_DOMAIN', '').rstrip('/')
+    ACCESS_AUD = os.environ.get('ACCESS_AUD', '')
+    ROSTER_PATH = os.environ.get('ROSTER_PATH', '/secrets/team-roster/roster.json')
+    ID_HEADER = 'openai-organization'
+
+    _SKIP_REQ = {'host', 'transfer-encoding', 'connection', 'content-length', ID_HEADER}
     _SKIP_RESP_BASE = {'transfer-encoding', 'connection'}
+
+    _SHA256_PREFIX = bytes.fromhex('3031300d060960864801650304020105000420')
+    _keys, _keys_at, _keys_lock = {}, 0.0, threading.Lock()
+
+    def _b64(s):
+        return base64.urlsafe_b64decode(s + '=' * (-len(s) % 4))
+
+    def _jwks(force=False):
+        global _keys, _keys_at
+        with _keys_lock:
+            age = time.time() - _keys_at
+            if age < 60 or (_keys and age < 3600 and not force):
+                return _keys
+            try:
+                with urllib.request.urlopen(ACCESS_TEAM + '/cdn-cgi/access/certs', timeout=10) as r:
+                    doc = json.load(r)
+                _keys = {k['kid']: (int.from_bytes(_b64(k['n']), 'big'), int.from_bytes(_b64(k['e']), 'big'))
+                         for k in doc.get('keys', []) if k.get('kty') == 'RSA'}
+                _keys_at = time.time()
+            except Exception as e:
+                _keys_at = time.time()
+                print(f'hermes-proxy: Access certs fetch failed: {e}', flush=True)
+            return _keys
+
+    def _rs256_ok(key, signed, sig):
+        n, e = key
+        k = (n.bit_length() + 7) // 8
+        if len(sig) != k:
+            return False
+        em = pow(int.from_bytes(sig, 'big'), e, n).to_bytes(k, 'big')
+        t = _SHA256_PREFIX + hashlib.sha256(signed).digest()
+        want = b'\x00\x01' + b'\xff' * (k - len(t) - 3) + b'\x00' + t
+        return hmac.compare_digest(em, want)
+
+    def verify_access_jwt(token):
+        """Return the verified email from a Cloudflare Access JWT, else None."""
+        if not (token and ACCESS_TEAM and ACCESS_AUD) or token.count('.') != 2:
+            return None
+        try:
+            h64, p64, s64 = token.split('.')
+            head, claims = json.loads(_b64(h64)), json.loads(_b64(p64))
+            if head.get('alg') != 'RS256':
+                return None
+            key = _jwks().get(head.get('kid')) or _jwks(force=True).get(head.get('kid'))
+            if not key or not _rs256_ok(key, (h64 + '.' + p64).encode(), _b64(s64)):
+                return None
+            now = time.time()
+            aud = claims.get('aud')
+            aud = aud if isinstance(aud, list) else [aud]
+            if claims.get('iss') != ACCESS_TEAM or ACCESS_AUD not in aud:
+                return None
+            if claims.get('exp', 0) < now - 30 or claims.get('nbf', 0) > now + 30:
+                return None
+            email = claims.get('email')
+            return email if isinstance(email, str) and '@' in email else None
+        except Exception:
+            return None
+
+    def display_name(email):
+        try:
+            with open(ROSTER_PATH) as f:
+                roster = json.load(f)
+            for entry in roster if isinstance(roster, list) else []:
+                if isinstance(entry, dict) and any(
+                        isinstance(v, str) and v.strip().lower() == email.lower() for v in entry.values()):
+                    return entry.get('display_name') or None
+        except Exception:
+            pass
+        return None
+
+    def identity_note(email):
+        name = display_name(email)
+        who = f'{name} <{email}>' if name else email
+        return (f'The person sending this request is {who}, as verified by Simple Salt single sign-on. '
+                'Treat this as the identity of who you are talking to.')
+
+    def with_identity(path, body, email):
+        """Add the verified requester to a chat request body; unchanged if it is not one."""
+        try:
+            doc = json.loads(body)
+        except Exception:
+            return body
+        note = identity_note(email)
+        p = path.split('?', 1)[0]
+        if p.endswith('/chat/completions') and isinstance(doc.get('messages'), list):
+            doc['messages'].insert(0, {'role': 'system', 'content': note})
+        elif p.endswith('/responses') and isinstance(doc, dict):
+            prev = doc.get('instructions')
+            doc['instructions'] = note + ('\n\n' + prev if isinstance(prev, str) and prev else '')
+        else:
+            return body
+        return json.dumps(doc).encode()
 
     class ProxyHandler(http.server.BaseHTTPRequestHandler):
         timeout = 300
@@ -40,7 +137,12 @@ data:
                     is_stream = bool(json.loads(body).get('stream'))
             except Exception:
                 pass
+            email = verify_access_jwt(self.headers.get(ID_HEADER, ''))
+            if email and body:
+                body = with_identity(self.path, body, email)
             fwd = {k: v for k, v in self.headers.items() if k.lower() not in _SKIP_REQ}
+            if body or self.command in ('POST', 'PUT'):
+                fwd['Content-Length'] = str(len(body))
             try:
                 conn = http.client.HTTPConnection(_HOST, _PORT, timeout=300)
                 conn.request(self.command, self.path, body=body, headers=fwd)
@@ -136,9 +238,16 @@ spec:
               value: "http://hermes-agent-web:8642"
             - name: PORT
               value: "8000"
+            - name: ACCESS_TEAM_DOMAIN
+              value: "https://fqurzlaaagt.cloudflareaccess.com"
+            - name: ACCESS_AUD
+              value: "afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c"
           volumeMounts:
             - name: script
               mountPath: /scripts
+            - name: team-roster
+              mountPath: /secrets/team-roster
+              readOnly: true
           readinessProbe:
             tcpSocket:
               port: 8000
@@ -160,6 +269,10 @@ spec:
         - name: script
           configMap:
             name: hermes-proxy-script
+        - name: team-roster
+          secret:
+            secretName: team-roster
+            optional: true
 ---
 apiVersion: v1
 kind: Service
