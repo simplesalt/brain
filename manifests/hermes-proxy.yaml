@@ -24,8 +24,10 @@ data:
     ACCESS_AUD = os.environ.get('ACCESS_AUD', '')
     ROSTER_PATH = os.environ.get('ROSTER_PATH', '/secrets/team-roster/roster.json')
     ID_HEADER = 'openai-organization'
+    SESSION_KEY_HEADER = 'X-Hermes-Session-Key'
 
-    _SKIP_REQ = {'host', 'transfer-encoding', 'connection', 'content-length', ID_HEADER}
+    _SKIP_REQ = {'host', 'transfer-encoding', 'connection', 'content-length', ID_HEADER,
+                 SESSION_KEY_HEADER.lower()}
     _SKIP_RESP_BASE = {'transfer-encoding', 'connection'}
 
     _SHA256_PREFIX = bytes.fromhex('3031300d060960864801650304020105000420')
@@ -62,7 +64,7 @@ data:
         return hmac.compare_digest(em, want)
 
     def verify_access_jwt(token):
-        """Return the verified email from a Cloudflare Access JWT, else None."""
+        """Return the claims of a verified Cloudflare Access JWT that names an email, else None."""
         if not (token and ACCESS_TEAM and ACCESS_AUD) or token.count('.') != 2:
             return None
         try:
@@ -81,7 +83,7 @@ data:
             if claims.get('exp', 0) < now - 30 or claims.get('nbf', 0) > now + 30:
                 return None
             email = claims.get('email')
-            return email if isinstance(email, str) and '@' in email else None
+            return claims if isinstance(email, str) and '@' in email else None
         except Exception:
             return None
 
@@ -97,19 +99,30 @@ data:
             pass
         return None
 
-    def identity_note(email):
+    def oidc_profile(claims):
+        """OpenID Connect standard claims for the verified requester."""
+        email = claims['email'].strip().lower()
+        profile = {'sub': claims.get('sub') or email, 'email': email, 'email_verified': True}
         name = display_name(email)
-        who = f'{name} <{email}>' if name else email
-        return (f'The person sending this request is {who}, as verified by Simple Salt single sign-on. '
-                'Treat this as the identity of who you are talking to.')
+        if name:
+            profile['name'] = name
+        return profile
 
-    def with_identity(path, body, email):
+    def session_key(profile):
+        return 'agent:main:webui:dm:' + profile['email']
+
+    def identity_note(profile):
+        return ('The requester of this conversation, verified by Simple Salt single sign-on, '
+                'is described by these OpenID Connect claims. Treat them as who you are talking to.\n'
+                '```json\n' + json.dumps(profile, indent=2) + '\n```')
+
+    def with_identity(path, body, profile):
         """Add the verified requester to a chat request body; unchanged if it is not one."""
         try:
             doc = json.loads(body)
         except Exception:
             return body
-        note = identity_note(email)
+        note = identity_note(profile)
         p = path.split('?', 1)[0]
         if p.endswith('/chat/completions') and isinstance(doc.get('messages'), list):
             doc['messages'].insert(0, {'role': 'system', 'content': note})
@@ -137,10 +150,14 @@ data:
                     is_stream = bool(json.loads(body).get('stream'))
             except Exception:
                 pass
-            email = verify_access_jwt(self.headers.get(ID_HEADER, ''))
-            if email and body:
-                body = with_identity(self.path, body, email)
+            claims = verify_access_jwt(self.headers.get(ID_HEADER, ''))
+            profile = oidc_profile(claims) if claims else None
+            if profile and body:
+                body = with_identity(self.path, body, profile)
             fwd = {k: v for k, v in self.headers.items() if k.lower() not in _SKIP_REQ}
+            # Chat Completions only: on Responses/Runs a session key also merges conversations.
+            if profile and self.path.split('?', 1)[0].endswith('/chat/completions'):
+                fwd[SESSION_KEY_HEADER] = session_key(profile)
             if body or self.command in ('POST', 'PUT'):
                 fwd['Content-Length'] = str(len(body))
             try:
