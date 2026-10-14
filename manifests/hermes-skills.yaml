@@ -25,3 +25,5 @@ bundled:
   - youtube-content
   - arxiv
   - maps
+local:
+  - outbound-email

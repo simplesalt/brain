@@ -427,15 +427,23 @@ spec:
                       allow = yaml.safe_load(f)
                   gbrain = allow["gbrain"]
                   bundled = allow["bundled"]
-                  for names in (gbrain, bundled):
+                  local = allow.get("local") or []
+                  for names in (gbrain, bundled, local):
                       if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
-                          raise ValueError("gbrain and bundled must be lists of skill names")
+                          raise ValueError("gbrain, bundled and local must be lists of skill names")
               except Exception as e:
                   print("ERROR: cannot read allow-list %s (%s); removing all skills" % (seed_path, e))
-                  gbrain, bundled = [], []
-              allowed = set(gbrain) | set(bundled)
+                  gbrain, bundled, local = [], [], []
+              allowed = set(gbrain) | set(bundled) | set(local)
 
               os.makedirs(skills_root, exist_ok=True)
+              for name in local:
+                  src = os.path.join("/seed", "skill-%s.md" % name)
+                  dest = os.path.join(skills_root, "simplesalt", name)
+                  if os.path.isfile(src):
+                      shutil.rmtree(dest, ignore_errors=True)
+                      os.makedirs(dest)
+                      shutil.copyfile(src, os.path.join(dest, "SKILL.md"))
               for src in skill_dirs(bundled_root):
                   if src != bundled_root and skill_name(src) in bundled:
                       dest = os.path.join(skills_root, os.path.relpath(src, bundled_root))
@@ -453,19 +461,19 @@ spec:
 
               open(marker_path, "w").close()
 
-              kept = {"gbrain": set(), "bundled": set()}
+              kept = {"gbrain": set(), "bundled": set(), "local": set()}
               for d in skill_dirs(skills_root):
                   name = skill_name(d)
-                  kept["gbrain" if name in gbrain else "bundled"].add(name)
+                  kept["gbrain" if name in gbrain else "local" if name in local else "bundled"].add(name)
               missing = 0
-              for kind, names in (("gbrain", gbrain), ("bundled", bundled)):
+              for kind, names in (("gbrain", gbrain), ("bundled", bundled), ("local", local)):
                   for name in names:
                       if name in kept[kind]:
                           print("kept %s skill: %s" % (kind, name))
                       else:
                           missing += 1
                           print("ERROR: allow-listed %s skill missing: %s" % (kind, name))
-              print("skills: kept %d gbrain, %d bundled; removed %d; missing %d" % (len(kept["gbrain"]), len(kept["bundled"]), removed, missing))
+              print("skills: kept %d gbrain, %d bundled, %d local; removed %d; missing %d" % (len(kept["gbrain"]), len(kept["bundled"]), len(kept["local"]), removed, missing))
 
               chown_tree(skills_root)
               os.lchown(marker_path, owner, owner)

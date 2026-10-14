@@ -29,6 +29,11 @@ persistence, and storage.
 Hindsight is your trusted record for decisions, conventions, and project status.
 Save them there. gbrain holds project knowledge.
 
+# Email
+
+- Sending or replying to email: use the `outbound-email` skill. Only
+  dylan@simple-salt.com and russell@simple-salt.com can send.
+
 # LinkedIn
 
 - Actions go through hermes-msg MCP: `send_message` (channel linkedin),
