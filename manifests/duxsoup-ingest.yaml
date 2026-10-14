@@ -821,16 +821,274 @@ data:
       return block + '\n' + (content ?? '');
     }
 
-    // Searches gbrain for an existing person page matching this profile's
-    // LinkedIn URL or exact full name, so re-discovering someone Dux Soup has
-    // already crossed paths with (via another source) doesn't fork a duplicate
-    // page. Only adopted on a clear match (URL equality or exact-name equality).
-    async function findMatchingPersonSlug(profileRow, fullName) {
-      const queries = uniqueList([profileRow.profile_url, fullName]);
+    // ---------------------------------------------------------------------------
+    // LinkedIn details: what a visit/scan payload says about the person and their
+    // employer. Pure, so it can be exercised offline. Key names follow the Dux Soup
+    // visit/scan webhook docs; every field is optional and an empty or blank value
+    // counts as absent.
+    // ---------------------------------------------------------------------------
+
+    function cleanStr(v) {
+      if (typeof v === 'number' && Number.isFinite(v)) v = String(v);
+      if (typeof v !== 'string') return null;
+      const t = v.replace(/\s+/g, ' ').trim();
+      return t || null;
+    }
+
+    // Email/Phone may hold several values separated by commas, semicolons or newlines.
+    function splitMulti(v) {
+      if (Array.isArray(v)) return v.flatMap(splitMulti);
+      if (typeof v !== 'string') return [];
+      return v.split(/[,;\r\n]+/).map((s) => s.trim()).filter(Boolean);
+    }
+
+    function dedupeBy(list, keyFn) {
+      const seen = new Set();
+      const out = [];
+      for (const v of list) {
+        const k = keyFn(v);
+        if (!k || seen.has(k)) continue;
+        seen.add(k);
+        out.push(v);
+      }
+      return out;
+    }
+
+    const emailKey = (e) => String(e).trim().toLowerCase();
+    const phoneKey = (p) => String(p).replace(/\D/g, '') || String(p).trim();
+
+    function asList(v) {
+      if (Array.isArray(v)) return v.map((x) => String(x)).filter((x) => x.trim());
+      if (typeof v === 'string' && v.trim()) return [v];
+      return [];
+    }
+
+    // Only a linkedin.com URL whose path starts /<kind>/ ('in' or 'company');
+    // a /messaging/ or any other URL is never taken as a profile.
+    function linkedinUrlWithPath(v, kind) {
+      const s = cleanStr(v);
+      if (!s) return null;
+      try {
+        const url = new URL(/^https?:\/\//i.test(s) ? s : `https://${s}`);
+        if (!/(^|\.)linkedin\.com$/i.test(url.hostname)) return null;
+        return new RegExp(`^/${kind}/[^/]+`, 'i').test(url.pathname) ? (/^https?:\/\//i.test(s) ? s : url.href) : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function companySegment(url) {
+      const m = /\/company\/([^/?#]+)/i.exec(String(url ?? ''));
+      if (!m) return null;
+      try { return decodeURIComponent(m[1]); } catch { return m[1]; }
+    }
+
+    function extractLinkedinDetails(data) {
+      const d = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+      const ext = d.extended && typeof d.extended === 'object' ? d.extended : null;
+      const positions = Array.isArray(ext?.positions) ? ext.positions.filter((p) => p && typeof p === 'object') : [];
+      const current = positions.find((p) => truthy(p.isCurrent)) ?? null;
+
+      const idMatch = /^(?:id\.)?(\d+)$/.exec(cleanStr(d.id) ?? '');
+      const salesMatch = /\/sales\/(?:lead|people)\/([^,/?#\s]+)/i.exec(String(d.SalesProfile ?? ''));
+      const companyLinkedin = linkedinUrlWithPath(d.CompanyProfile, 'company');
+      const companyIdFromUrl = companyLinkedin ? /\/company\/(\d+)(?:[/?#]|$)/i.exec(companyLinkedin) : null;
+      const title = cleanStr(d.Title);
+
+      return {
+        name: [cleanStr(d['First Name']), cleanStr(d['Last Name'])].filter(Boolean).join(' ') || null,
+        linkedin: [d.Profile, d['Profile URL'], d.PublicProfile].map((v) => linkedinUrlWithPath(v, 'in')).find(Boolean) ?? null,
+        linkedin_id: idMatch ? idMatch[1] : null,
+        linkedin_sales_id: salesMatch ? salesMatch[1] : null,
+        emails: dedupeBy(splitMulti(d.Email).filter((e) => e.includes('@')), emailKey),
+        phones: dedupeBy(splitMulti(d.Phone), phoneKey),
+        twitter: cleanStr(d.Twitter),
+        website: cleanStr(d.PersonalWebsite),
+        location: cleanStr(d.Location),
+        industry: cleanStr(d.Industry),
+        headline: title,
+        role: title ?? cleanStr(current?.title),
+        company: cleanStr(d.Company) ?? cleanStr(current?.companyName),
+        company_linkedin: companyLinkedin,
+        company_linkedin_id: [cleanStr(d.CompanyID), companyIdFromUrl?.[1], cleanStr(current?.companyId)]
+          .find((v) => v && /^\d+$/.test(v)) ?? null,
+        company_website: cleanStr(d.CompanyWebsite),
+        linkedin_degree: cleanStr(d.Degree) ?? cleanStr(d['Connection Degree']),
+        picture: cleanStr(d.Picture) ?? cleanStr(d.Thumbnail),
+      };
+    }
+
+    // ---------------------------------------------------------------------------
+    // Frontmatter ownership. Dux Soup fills empty fields and updates the values it
+    // wrote itself (listed in `duxsoup_fields`); it never overwrites a value another
+    // source or a person wrote. Lists (emails, phones, aliases) only ever grow.
+    // ---------------------------------------------------------------------------
+
+    const isEmptyVal = (v) => v == null || (typeof v === 'string' && v.trim() === '') || (Array.isArray(v) && v.length === 0);
+
+    // Pages written before `duxsoup_fields` existed: a `source: duxsoup` page owns
+    // the keys the old code wrote.
+    const LEGACY_OWNED_KEYS = ['title', 'linkedin', 'company', 'role', 'linkedin_degree'];
+    const PERSON_SCALAR_KEYS = [
+      'title', 'linkedin', 'linkedin_id', 'linkedin_sales_id', 'location', 'industry',
+      'twitter', 'website', 'company', 'role', 'linkedin_degree',
+    ];
+    const PERSON_LIST_KEYS = ['emails', 'phones', 'aliases', 'duxsoup_fields'];
+    const COMPANY_SCALAR_KEYS = ['title', 'linkedin', 'linkedin_id', 'website'];
+
+    // existingPage is the get_page object (null for a page being created); its
+    // title/type stand in for frontmatter that v0.60+ keeps on the page object.
+    function mergeFrontmatter(existingFm, existingPage, { type, scalars, wanted, legacy, lists, aliases }) {
+      const isNew = !existingPage;
+      const fm = existingFm && typeof existingFm === 'object' ? existingFm : {};
+      const merged = isNew ? { type, source: 'duxsoup' } : { ...fm };
+      // v0.60+ get_page keeps title and tags on the page object, not in
+      // frontmatter; carry them over or a rewrite would drop them.
+      if (merged.title == null && existingPage?.title) merged.title = existingPage.title;
+      if (merged.tags == null && Array.isArray(existingPage?.tags) && existingPage.tags.length) merged.tags = existingPage.tags;
+      if (isEmptyVal(merged.type) && isEmptyVal(existingPage?.type)) merged.type = type;
+
+      const owned = Array.isArray(fm.duxsoup_fields)
+        ? new Set(fm.duxsoup_fields.map(String))
+        : new Set(fm.source === 'duxsoup' ? legacy : []);
+      for (const k of scalars) {
+        const v = wanted[k];
+        if (isEmptyVal(v)) continue;
+        if (isNew || isEmptyVal(merged[k]) || owned.has(k)) {
+          merged[k] = v;
+          owned.add(k);
+        }
+      }
+      const ownedList = [...owned].filter((k) => !isEmptyVal(merged[k]));
+      if (ownedList.length || fm.duxsoup_fields !== undefined) merged.duxsoup_fields = ownedList;
+
+      for (const [k, { add, keyFn }] of Object.entries(lists ?? {})) {
+        const union = dedupeBy([...asList(fm[k]), ...add], keyFn);
+        if (union.length) merged[k] = union;
+      }
+      merged.aliases = uniqueList([...asList(fm.aliases), ...aliases]);
+      return merged;
+    }
+
+    function mergeLinkedinFrontmatter(existingFm, existingPage, details) {
+      const wanted = { ...details, title: details.name };
+      return mergeFrontmatter(existingFm, existingPage, {
+        type: 'person',
+        scalars: PERSON_SCALAR_KEYS,
+        wanted,
+        legacy: LEGACY_OWNED_KEYS,
+        lists: {
+          emails: { add: details.emails ?? [], keyFn: emailKey },
+          phones: { add: details.phones ?? [], keyFn: phoneKey },
+        },
+        aliases: details.aliases ?? [],
+      });
+    }
+
+    function mergeCompanyFrontmatter(existingFm, existingPage, details) {
+      return mergeFrontmatter(existingFm, existingPage, {
+        type: 'company',
+        scalars: COMPANY_SCALAR_KEYS,
+        wanted: details,
+        legacy: [],
+        lists: {},
+        aliases: details.aliases ?? [],
+      });
+    }
+
+    // True when every managed key of `merged` is already on the page. Compared key
+    // by key, not by content: gbrain re-serializes pages as YAML, so the JSON
+    // frontmatter written here never matches byte for byte. Lists only grow, so
+    // containment is enough. type and title may live on the page object instead of
+    // in frontmatter (v0.60+), so both places are checked.
+    function frontmatterUpToDate(existing, merged, keys) {
+      const fm = existing?.frontmatter ?? {};
+      const str = (v) => (typeof v === 'object' ? JSON.stringify(v) : String(v));
+      for (const k of keys) {
+        const v = merged[k];
+        if (v === undefined) continue;
+        const cur = fm[k] !== undefined ? fm[k] : (k === 'type' || k === 'title' ? existing?.[k] : undefined);
+        if (Array.isArray(v)) {
+          const have = new Set(asList(cur));
+          if (!v.every((x) => have.has(String(x)))) return false;
+        } else if (cur == null || str(cur) !== str(v)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    const PERSON_MANAGED_KEYS = ['type', 'source', ...PERSON_SCALAR_KEYS, ...PERSON_LIST_KEYS];
+    const COMPANY_MANAGED_KEYS = ['type', 'source', ...COMPANY_SCALAR_KEYS, 'aliases', 'duxsoup_fields'];
+
+    // ---------------------------------------------------------------------------
+    // Contact block: a managed section of the person page body, written from the
+    // merged frontmatter (so it shows whatever the page holds, whoever wrote it).
+    // Only the text between the two markers is ever replaced.
+    // ---------------------------------------------------------------------------
+
+    const CONTACT_START = '<!-- duxsoup:contact -->';
+    const CONTACT_END = '<!-- /duxsoup:contact -->';
+
+    function contactInline(v) {
+      return String(v ?? '').replace(/\s+/g, ' ').trim().replaceAll('<!--', '< !--');
+    }
+
+    function buildContactBlock(fm) {
+      const bullets = [];
+      const emails = asList(fm.emails).map(contactInline).filter(Boolean);
+      if (emails.length) bullets.push(`- Email${emails.length > 1 ? 's' : ''}: ${emails.join(', ')}`);
+      const phones = asList(fm.phones).map(contactInline).filter(Boolean);
+      if (phones.length) bullets.push(`- Phone${phones.length > 1 ? 's' : ''}: ${phones.join(', ')}`);
+      for (const [label, key] of [['LinkedIn', 'linkedin'], ['Location', 'location'], ['Twitter', 'twitter'], ['Website', 'website']]) {
+        const v = contactInline(fm[key]);
+        if (v) bullets.push(`- ${label}: ${v}`);
+      }
+      const role = contactInline(fm.role);
+      const company = contactInline(fm.company);
+      const works = role && company ? `${role} at ${company}` : (role || company);
+      if (works) bullets.push(`- Works at: ${works}`);
+      if (!bullets.length) return null;
+      return [CONTACT_START, '## Contact', '', ...bullets, '', CONTACT_END].join('\n');
+    }
+
+    // Replaces the block in place; otherwise inserts it before the first
+    // `<!-- timeline -->` sentinel line, or at the end of the body when there is
+    // none. Anything outside the block is left untouched.
+    function upsertContactBlock(content, fm) {
+      const block = buildContactBlock(fm);
+      const text = String(content ?? '');
+      const s = text.indexOf(CONTACT_START);
+      if (s !== -1) {
+        const e = text.indexOf(CONTACT_END, s);
+        // An unterminated block is not ours to repair; leave the page alone.
+        if (e === -1 || !block) return text;
+        return text.slice(0, s) + block + text.slice(e + CONTACT_END.length);
+      }
+      if (!block) return text;
+      const fmMatch = /^---\r?\n[\s\S]*?\r?\n---\r?\n/.exec(text);
+      const bodyStart = fmMatch ? fmMatch[0].length : 0;
+      let off = bodyStart;
+      let sentinelAt = -1;
+      for (const line of text.slice(bodyStart).split('\n')) {
+        const t = line.trim();
+        if (t === '<!-- timeline -->' || t === '<!--timeline-->') { sentinelAt = off; break; }
+        off += line.length + 1;
+      }
+      if (sentinelAt === -1) return `${text.replace(/\s+$/, '')}\n\n${block}\n`;
+      return `${text.slice(0, sentinelAt).replace(/\s+$/, '')}\n\n${block}\n\n${text.slice(sentinelAt)}`;
+    }
+
+    // Searches gbrain for an existing page of `type` matching a LinkedIn URL or an
+    // exact title, so re-discovering someone (or a company) another source already
+    // knows doesn't fork a duplicate page. Only adopted on a clear match (URL
+    // equality or exact-title equality).
+    async function findMatchingPageSlug(type, { url, name }) {
+      const queries = uniqueList([url, name]);
       const seen = new Set();
       for (const q of queries) {
         let results;
-        try { results = await gbrainSearch(q, { limit: 5, types: ['person'] }); }
+        try { results = await gbrainSearch(q, { limit: 5, types: [type] }); }
         catch { continue; }
         for (const r of results ?? []) {
           if (!r?.slug || seen.has(r.slug)) continue;
@@ -838,49 +1096,87 @@ data:
           const page = await gbrainGetPage(r.slug).catch(() => null);
           if (!page) continue;
           const fm = page.frontmatter ?? {};
-          const urlMatch = profileRow.profile_url && fm.linkedin
-            && canonicalizeProfileUrl(String(fm.linkedin)) === canonicalizeProfileUrl(profileRow.profile_url);
-          const nameMatch = fullName && String(page.title ?? '').trim().toLowerCase() === fullName.toLowerCase();
+          const urlMatch = url && fm.linkedin
+            && canonicalizeProfileUrl(String(fm.linkedin)) === canonicalizeProfileUrl(url);
+          const nameMatch = name && String(page.title ?? '').trim().toLowerCase() === name.toLowerCase();
           if (urlMatch || nameMatch) return r.slug;
         }
       }
       return null;
     }
 
-    // True when every field Dux Soup would set is already on the page, so a
-    // write would change nothing it owns. Compared field by field, not by
-    // content: gbrain re-serializes pages as YAML, so the JSON frontmatter written
-    // here never matches byte for byte. type and title may live on the page object
-    // instead of in frontmatter (v0.60+), so both places are checked.
-    function personPageUpToDate(existing, updates, aliasAdds) {
-      const fm = existing.frontmatter ?? {};
-      for (const [k, v] of Object.entries(updates)) {
-        const cur = fm[k] !== undefined ? fm[k] : (k === 'type' || k === 'title' ? existing[k] : undefined);
-        if (cur == null || String(cur) !== String(v)) return false;
+    async function findMatchingPersonSlug(profileRow, fullName) {
+      return findMatchingPageSlug('person', { url: profileRow.profile_url, name: fullName });
+    }
+
+    // Writes a page against the revision it was read at (never forced) and skips
+    // the write when build(existing) returns null (nothing to change). A
+    // revision_conflict (another gbrain write landed in between, e.g. a timeline
+    // entry) re-reads, re-builds and retries up to PUT_PAGE_ATTEMPTS times, then
+    // throws so the event retries later. Each put_page carries a request_id
+    // derived from the event, slug, revision and content, so a retried event
+    // replays its write instead of spending a new one.
+    async function writePageWithRetry(label, slug, existing, eventId, build) {
+      for (let attempt = 1; ; attempt++) {
+        const content = build(existing);
+        if (content == null) return false;
+        try {
+          await gbrainPutPage(slug, content, {
+            expectedRevision: existing?.revision,
+            requestId: eventId != null
+              ? deterministicUuid(`put_page:${eventId}:${slug}:${existing?.revision ?? 'create'}:${sha256Hex(content)}`)
+              : undefined,
+          });
+          return true;
+        } catch (e) {
+          if ((e.code !== 'revision_conflict' && e.code !== 'revision_required') || attempt >= PUT_PAGE_ATTEMPTS) throw e;
+          console.error(`${label}: ${slug} ${e.code} (try ${attempt}/${PUT_PAGE_ATTEMPTS}); re-reading and re-merging`);
+          existing = await gbrainGetPage(slug, { includeContent: true });
+        }
       }
-      const aliases = Array.isArray(fm.aliases) ? fm.aliases.map(String) : [];
-      return aliasAdds.every((a) => aliases.includes(a));
+    }
+
+    // What Dux Soup knows about the person: the payload's details over whatever the
+    // profiles row holds (the only source for message/action events).
+    function personDetailsFor(profileRow, fullName, details) {
+      const det = {
+        name: fullName || null,
+        linkedin: linkedinUrlWithPath(profileRow.profile_url, 'in'),
+        company: profileRow.company ?? null,
+        role: profileRow.title ?? null,
+        linkedin_degree: profileRow.degree ?? null,
+        emails: [],
+        phones: [],
+      };
+      for (const [k, v] of Object.entries(details ?? {})) {
+        if (!isEmptyVal(v)) det[k] = v;
+      }
+      det.aliases = uniqueList([
+        profileRow.profile_url,
+        det.linkedin,
+        `dux:${profileRow.dux_id}`,
+        ...det.emails,
+        det.linkedin_id ? `linkedin-id:${det.linkedin_id}` : null,
+        det.linkedin_sales_id ? `linkedin-sales:${det.linkedin_sales_id}` : null,
+      ]);
+      return det;
     }
 
     // Creates or updates the gbrain person page for a profiles row: resolves the
     // slug (existing gbrain_slug, else a matching page found by search, else a
-    // freshly derived one), merges the duxsoup-sourced fields into frontmatter
-    // while preserving the rest of the page, writes it, and (when rawPayload is
-    // given) attaches the raw webhook payload via put_raw_data for provenance.
-    // The merge is written against the revision of the get_page it was merged
-    // into (never forced) and skipped when nothing Dux Soup sets would change. A
-    // revision_conflict (another gbrain write landed in between, e.g. a timeline
-    // entry) re-reads, re-merges and retries up to PUT_PAGE_ATTEMPTS times, then
-    // throws so the event retries later. Each put_page carries a request_id
-    // derived from the event, slug, revision and content, so a retried event
-    // replays its write instead of spending a new one.
+    // freshly derived one), merges the Dux Soup details into frontmatter under the
+    // ownership rule while preserving the rest of the page, refreshes the managed
+    // contact block, writes it, and (when rawPayload is given) attaches the raw
+    // webhook payload via put_raw_data for provenance. `details` (from a visit or
+    // scan) additionally syncs the employer's company page and links to it.
+    // Skipped when nothing Dux Soup sets would change.
     //
     // timelineBullet ({ marker, block }) appends one bullet to the page's markdown
     // timeline section (the part after the `<!-- timeline -->` sentinel), which
     // gbrain chunks for search; add_timeline_entry only writes the timeline_entries
     // table, which search never indexes. The marker makes it idempotent: a page
     // that already carries it is not rewritten.
-    async function syncPersonPage(profileRow, rawPayload, eventId, timelineBullet = null) {
+    async function syncPersonPage(profileRow, rawPayload, eventId, timelineBullet = null, details = null) {
       const fullName = [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim();
       let slug = profileRow.gbrain_slug || deriveSlug(profileRow);
       let existing = await gbrainGetPage(slug, { includeContent: true });
@@ -892,57 +1188,106 @@ data:
         }
       }
 
-      const updates = {
-        type: 'person',
-        source: 'duxsoup',
-        ...(fullName ? { title: fullName } : {}),
-        ...(profileRow.profile_url ? { linkedin: profileRow.profile_url } : {}),
-        ...(profileRow.company ? { company: profileRow.company } : {}),
-        ...(profileRow.title ? { role: profileRow.title } : {}),
-        ...(profileRow.degree ? { linkedin_degree: profileRow.degree } : {}),
-      };
-      const aliasAdds = uniqueList([profileRow.profile_url, `dux:${profileRow.dux_id}`]);
-
-      for (let attempt = 1; ; attempt++) {
-        let content;
-        if (existing) {
-          const merged = { ...existing.frontmatter, ...updates };
-          merged.aliases = uniqueList([
-            ...(Array.isArray(existing.frontmatter?.aliases) ? existing.frontmatter.aliases : []),
-            ...aliasAdds,
-          ]);
-          // v0.60+ get_page keeps title and tags on the page object, not in
-          // frontmatter; carry them over or this rewrite would drop them.
-          if (merged.title == null && existing.title) merged.title = existing.title;
-          if (merged.tags == null && Array.isArray(existing.tags) && existing.tags.length) merged.tags = existing.tags;
-          const needsBullet = !!timelineBullet && !String(existing.content ?? '').includes(timelineBullet.marker);
-          const upToDate = personPageUpToDate(existing, updates, aliasAdds);
-          content = upToDate ? existing.content : replaceFrontmatterBlock(existing.content, merged);
-          if (needsBullet) content = appendTimelineBullet(content, timelineBullet);
-          if (content === existing.content || (upToDate && !needsBullet)) break;
-        } else {
-          const fm = { ...updates, title: updates.title || fullName || profileRow.dux_id, aliases: aliasAdds };
-          content = `---\n${JSON.stringify(fm, null, 2)}\n---\n\n# ${fm.title}\n`;
-          if (timelineBullet) content = appendTimelineBullet(content, timelineBullet);
+      const det = personDetailsFor(profileRow, fullName, details);
+      await writePageWithRetry('syncPersonPage', slug, existing, eventId, (ex) => {
+        if (ex) {
+          const merged = mergeLinkedinFrontmatter(ex.frontmatter, ex, det);
+          const fmUpToDate = frontmatterUpToDate(ex, merged, PERSON_MANAGED_KEYS);
+          let content = fmUpToDate ? ex.content : replaceFrontmatterBlock(ex.content, merged);
+          content = upsertContactBlock(content, merged);
+          if (timelineBullet && !String(ex.content ?? '').includes(timelineBullet.marker)) {
+            content = appendTimelineBullet(content, timelineBullet);
+          }
+          return content === ex.content ? null : content;
         }
-
-        try {
-          await gbrainPutPage(slug, content, {
-            expectedRevision: existing?.revision,
-            requestId: eventId != null
-              ? deterministicUuid(`put_page:${eventId}:${slug}:${existing?.revision ?? 'create'}:${sha256Hex(content)}`)
-              : undefined,
-          });
-          break;
-        } catch (e) {
-          if ((e.code !== 'revision_conflict' && e.code !== 'revision_required') || attempt >= PUT_PAGE_ATTEMPTS) throw e;
-          console.error(`syncPersonPage: ${slug} ${e.code} (try ${attempt}/${PUT_PAGE_ATTEMPTS}); re-reading and re-merging`);
-          existing = await gbrainGetPage(slug, { includeContent: true });
-        }
-      }
+        const merged = mergeLinkedinFrontmatter(null, null, { ...det, name: det.name || String(profileRow.dux_id) });
+        let content = `---\n${JSON.stringify(merged, null, 2)}\n---\n\n# ${merged.title}\n`;
+        content = upsertContactBlock(content, merged);
+        if (timelineBullet) content = appendTimelineBullet(content, timelineBullet);
+        return content;
+      });
       if (rawPayload) await gbrainPutRawData(slug, 'duxsoup', rawPayload);
       await setProfileGbrainSlug(profileRow.dux_id, slug);
+      if (details && det.company) await syncEmployer(slug, det, eventId);
       return slug;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Employer company page and the works_at link
+    // ---------------------------------------------------------------------------
+
+    const companySlugCache = new Map();
+
+    // Cached for the life of the process, by LinkedIn URL when there is one, else
+    // by name (two companies can share a name; a URL tells them apart).
+    async function resolveCompanySlug(det) {
+      const name = det.company;
+      const urlKey = det.company_linkedin ? `url:${canonicalizeProfileUrl(det.company_linkedin).toLowerCase()}` : null;
+      const nameKey = `name:${name.toLowerCase()}`;
+      const cached = companySlugCache.get(urlKey ?? nameKey);
+      if (cached) return cached;
+
+      // A numeric /company/<id> segment says nothing readable; the name does.
+      const seg = companySegment(det.company_linkedin);
+      const derived = `companies/${sanitizeSlugPart(seg && !/^\d+$/.test(seg) ? seg : name)}`;
+      let slug = derived;
+      const atDerived = await gbrainGetPage(derived, { includeContent: true });
+      if (!atDerived) {
+        slug = (await findMatchingPageSlug('company', { url: det.company_linkedin, name })) ?? derived;
+      }
+      if (urlKey) companySlugCache.set(urlKey, slug);
+      companySlugCache.set(nameKey, slug);
+      return slug;
+    }
+
+    async function syncCompanyPage(det, eventId) {
+      const slug = await resolveCompanySlug(det);
+      const existing = await gbrainGetPage(slug, { includeContent: true });
+      const wanted = {
+        title: det.company,
+        linkedin: det.company_linkedin,
+        linkedin_id: det.company_linkedin_id,
+        website: det.company_website,
+        aliases: uniqueList([
+          det.company_linkedin,
+          det.company_linkedin_id ? `linkedin-company:${det.company_linkedin_id}` : null,
+        ]),
+      };
+      await writePageWithRetry('syncCompanyPage', slug, existing, eventId, (ex) => {
+        if (ex) {
+          const merged = mergeCompanyFrontmatter(ex.frontmatter, ex, wanted);
+          if (frontmatterUpToDate(ex, merged, COMPANY_MANAGED_KEYS)) return null;
+          return replaceFrontmatterBlock(ex.content, merged);
+        }
+        const merged = mergeCompanyFrontmatter(null, null, wanted);
+        return `---\n${JSON.stringify(merged, null, 2)}\n---\n\n# ${merged.title}\n`;
+      });
+      return slug;
+    }
+
+    // add_link is an upsert on (from, to, type, source), so repeating it is safe.
+    // A gbrain schema that does not declare works_at refuses the typed link with
+    // invalid_params; fall back to an untyped one (logged once). Anything else
+    // throws so the event retries.
+    let worksAtRefusalLogged = false;
+    async function linkWorksAt(personSlug, companySlug, role) {
+      const args = { from: personSlug, to: companySlug, link_source: 'duxsoup', ...(role ? { context: role } : {}) };
+      try {
+        await gbrainCall('add_link', { ...args, link_type: 'works_at' });
+      } catch (e) {
+        if (e.code !== 'invalid_params') throw e;
+        if (!worksAtRefusalLogged) {
+          worksAtRefusalLogged = true;
+          console.error(`syncEmployer: gbrain refused link_type works_at (${String(e.message).slice(0, 200)}); linking untyped`);
+        }
+        await gbrainCall('add_link', args);
+      }
+    }
+
+    async function syncEmployer(personSlug, det, eventId) {
+      const companySlug = await syncCompanyPage(det, eventId);
+      await linkWorksAt(personSlug, companySlug, det.role);
+      return companySlug;
     }
 
     // ---------------------------------------------------------------------------
@@ -1003,11 +1348,21 @@ data:
       }
     }
 
-    async function processVisit(row) {
+    // Key names only, never values: shows which fields Dux Soup really sends.
+    function logPayloadKeys(row, kind, d) {
+      const keys = (o) => `[${Object.keys(o).sort().join(',')}]`;
+      const ext = d.extended && typeof d.extended === 'object' ? ` extended=${keys(d.extended)}` : '';
+      console.log(`duxsoup-keys: event ${row.id} ${kind} data=${keys(d)}${ext}`);
+    }
+
+    // opts.backfill re-applies a stored event: no raw data re-attached, no key log.
+    async function processVisit(row, opts = {}) {
       const d = row.payload?.data ?? {};
+      if (!opts.backfill) logPayloadKeys(row, 'visit', d);
+      const details = extractLinkedinDetails(d);
       const profileRow = await upsertProfile({
         dux_id: d.id != null ? String(d.id) : null,
-        profile_url: d.Profile ?? null,
+        profile_url: d.Profile ?? details.linkedin ?? null,
         first_name: d['First Name'] ?? null,
         last_name: d['Last Name'] ?? null,
         title: d.Title ?? null,
@@ -1017,20 +1372,22 @@ data:
         visited_at: parseDuxTime(d.VisitTime ?? row.payload?.time),
       });
       if (!profileRow) throw new Error('visit event missing data.id');
-      await syncPersonPage(profileRow, row.payload, row.id);
+      await syncPersonPage(profileRow, opts.backfill ? null : row.payload, row.id, null, details);
     }
 
-    async function processScan(row) {
+    async function processScan(row, opts = {}) {
       const d = row.payload?.data ?? {};
+      if (!opts.backfill) logPayloadKeys(row, 'scan', d);
+      const details = extractLinkedinDetails(d);
       const profileRow = await upsertProfile({
         dux_id: d.id != null ? String(d.id) : null,
-        profile_url: d.Profile ?? null,
+        profile_url: d.Profile ?? details.linkedin ?? null,
         first_name: d['First Name'] ?? null,
         last_name: d['Last Name'] ?? null,
         visited_at: parseDuxTime(d.ScanTime ?? row.payload?.time),
       });
       if (!profileRow) throw new Error('scan event missing data.id');
-      await syncPersonPage(profileRow, row.payload, row.id);
+      await syncPersonPage(profileRow, opts.backfill ? null : row.payload, row.id, null, details);
     }
 
     async function processAction(row) {
@@ -1118,6 +1475,28 @@ data:
         }
       }
       console.log(`backfill: message timelines checked=${rows.length} ok=${ok} failed=${failed}`);
+    }
+
+    // Same idea for stored visit and scan events: re-applies each through the
+    // visit/scan path (without re-attaching raw data) so profiles ingested before
+    // the contact details, ownership rule and employer pages existed get them.
+    // Idempotent: an up-to-date page is not written. Sequential and best effort; a
+    // failing event is logged and skipped, the next start retries.
+    async function backfillProfiles() {
+      const rows = await sql`SELECT * FROM events WHERE type IN ('visit', 'scan') AND processed_at IS NOT NULL ORDER BY id`;
+      let ok = 0, failed = 0;
+      for (const raw of rows) {
+        try {
+          const row = { ...raw, payload: normalizePayload(raw.payload) };
+          if (String(raw.type).toLowerCase() === 'scan') await processScan(row, { backfill: true });
+          else await processVisit(row, { backfill: true });
+          ok++;
+        } catch (e) {
+          failed++;
+          console.error(`backfill: profile event ${raw.id} failed: ${String(e?.message ?? e).slice(0, 300)}`);
+        }
+      }
+      console.log(`backfill: profiles checked=${rows.length} ok=${ok} failed=${failed}`);
     }
 
     // rccommand and session events are kept in the events table only (no gbrain
@@ -1299,7 +1678,9 @@ data:
       tick();
       setInterval(tick, PROCESS_INTERVAL_MS);
       backfillMessageTimelines()
-        .catch((e) => console.error(`startup: message timeline backfill failed: ${e.message}`));
+        .catch((e) => console.error(`startup: message timeline backfill failed: ${e.message}`))
+        .then(() => backfillProfiles())
+        .catch((e) => console.error(`startup: profile backfill failed: ${e.message}`));
 
       const settingsPoll = () => pollDuxSoupSettings()
         .catch((e) => console.error(`duxsoup-settings-poll: unexpected failure: ${stripSecrets(e?.message ?? e).slice(0, 300)}`));
@@ -1348,7 +1729,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "4"
+        simplesalt.company/restart-epoch: "5"
     spec:
       serviceAccountName: duxsoup-ingest
       containers:
