@@ -50,3 +50,9 @@ Save them there. gbrain holds project knowledge.
   at 300 characters). InMail only if asked.
 - Dux Soup ingests all captures (profiles, actions, messages) into gbrain
   automatically — check person pages/timelines for LinkedIn history.
+- Fill missing profiles unprompted: when a conversation shows Dylan knows
+  someone, or a non-cold email arrives from someone, and their gbrain person
+  page has no `linkedin:` link, look them up the same way (search, judge the
+  match) and `linkedin_action` visit the match — the visit lands their profile
+  in gbrain. Skip cold outreach, newsletters and automated senders. A lookup
+  never connects or messages; no clear match — leave it and mention it.
