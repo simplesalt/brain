@@ -1,0 +1,174 @@
+# Notion and HubSpot MCP servers for Hermes. Each waits for its token in hermes-secrets
+# (NOTION_TOKEN, HUBSPOT_PRIVATE_APP_TOKEN), so it starts on its own once the key is added.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notion-mcp
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notion-mcp
+  template:
+    metadata:
+      labels:
+        app: notion-mcp
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      containers:
+        - name: notion-mcp
+          image: node:22-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until [ -s /secrets/token ]; do echo "waiting for NOTION_TOKEN in hermes-secrets"; sleep 30; done
+              export NOTION_TOKEN="$(cat /secrets/token)"
+              exec npx -y @notionhq/notion-mcp-server@2.5.2 --transport http --port 3000 --auth-token notion-mcp
+          env:
+            - name: npm_config_cache
+              value: /tmp/npm
+          ports:
+            - name: http
+              containerPort: 3000
+          volumeMounts:
+            - name: token
+              mountPath: /secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            tcpSocket:
+              port: 3000
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+      volumes:
+        - name: token
+          secret:
+            secretName: hermes-secrets
+            optional: true
+            items:
+              - key: NOTION_TOKEN
+                path: token
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notion-mcp
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  selector:
+    app: notion-mcp
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hubspot-mcp
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hubspot-mcp
+  template:
+    metadata:
+      labels:
+        app: hubspot-mcp
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      containers:
+        - name: hubspot-mcp
+          image: node:22-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until [ -s /secrets/token ]; do echo "waiting for HUBSPOT_PRIVATE_APP_TOKEN in hermes-secrets"; sleep 30; done
+              export PRIVATE_APP_ACCESS_TOKEN="$(cat /secrets/token)"
+              npm install -g --silent @hubspot/mcp-server@0.4.0
+              exec npx -y supergateway@4.1.0 --stdio "mcp-hubspot" --outputTransport streamableHttp --stateful --port 3000
+          env:
+            - name: npm_config_cache
+              value: /tmp/npm
+            - name: npm_config_prefix
+              value: /tmp/npm-global
+            - name: PATH
+              value: /tmp/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          ports:
+            - name: http
+              containerPort: 3000
+          volumeMounts:
+            - name: token
+              mountPath: /secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            tcpSocket:
+              port: 3000
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+      volumes:
+        - name: token
+          secret:
+            secretName: hermes-secrets
+            optional: true
+            items:
+              - key: HUBSPOT_PRIVATE_APP_TOKEN
+                path: token
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hubspot-mcp
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  selector:
+    app: hubspot-mcp
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000

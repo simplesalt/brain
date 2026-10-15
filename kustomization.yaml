@@ -7,6 +7,7 @@ resources:
   - manifests/hindsight-chart.yaml
   - manifests/big-agi.yaml
   - manifests/hermes-proxy.yaml
+  - manifests/hermes-connectors.yaml
   - manifests/gbrain-embedding-secret.yaml
   - manifests/gbrain-reranker-secret.yaml
   - manifests/email-collector.yaml

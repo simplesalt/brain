@@ -119,3 +119,15 @@ mcp_servers:
     headers:
       Authorization: "Bearer ${CLOUDFLARE_API_TOKEN}"
     timeout: 180
+
+  notion:
+    enabled: true
+    url: http://notion-mcp:3000/mcp
+    headers:
+      Authorization: "Bearer notion-mcp"
+    timeout: 60
+
+  hubspot:
+    enabled: true
+    url: http://hubspot-mcp:3000/mcp
+    timeout: 60
