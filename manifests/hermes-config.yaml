@@ -7,6 +7,12 @@ fallback_providers:
   - provider: openrouter
     model: openai/gpt-oss-120b
 
+# Groq mis-parses MiniMax tool calls (named "tool_call", arguments flattened) and then
+# rejects them, so tool calls such as sending email never run.
+provider_routing:
+  ignore:
+    - groq
+
 agent:
   environment_hint: |-
     When calling Cloudflare MCP tools that accept an account_id parameter, use
