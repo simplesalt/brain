@@ -233,6 +233,9 @@ spec:
         - podSelector:
             matchLabels:
               app: hermes-agent
+        - podSelector:
+            matchLabels:
+              mcp-proxy-client: "true"
       ports:
         - port: 3001
         - port: 3002

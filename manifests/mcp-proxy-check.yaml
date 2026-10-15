@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-proxy-check-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  check.mjs: |
+    const BASE = 'http://mcp-proxy';
+    async function rpc(port, sid, id, method, params) {
+      const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
+      if (sid) headers['mcp-session-id'] = sid;
+      const body = id == null ? { jsonrpc: '2.0', method, params } : { jsonrpc: '2.0', id, method, params };
+      const r = await fetch(`${BASE}:${port}/mcp`, { method: 'POST', headers, body: JSON.stringify(body) });
+      const text = await r.text();
+      const line = text.split('\n').filter(l => l.startsWith('data:')).pop();
+      return { sid: r.headers.get('mcp-session-id') || sid, status: r.status, msg: line ? JSON.parse(line.slice(5)) : (text ? JSON.parse(text) : null) };
+    }
+    async function session(port) {
+      const init = await rpc(port, null, 1, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'check', version: '1' } });
+      await rpc(port, init.sid, null, 'notifications/initialized', {});
+      return init.sid;
+    }
+    function summarize(m) {
+      if (!m) return 'no response';
+      if (m.error) return 'ERROR ' + JSON.stringify(m.error).slice(0, 300);
+      const r = m.result || {};
+      const t = (r.content || []).map(c => c.text || '').join(' ');
+      return (r.isError ? 'TOOL ERROR ' : 'OK ') + t.length + ' chars: ' + t.slice(0, 160).replace(/\s+/g, ' ');
+    }
+    const R = { owner: 'simplesalt', repo: 'projects' };
+    const checks = [
+      { name: 'github', port: 3003, tool: 'get_me', args: {} },
+      { name: 'github', port: 3003, tool: 'list_issues', args: { ...R, perPage: 2 } },
+      { name: 'github', port: 3003, tool: 'search_issues', args: { query: 'repo:simplesalt/projects hubspot', perPage: 2 } },
+      { name: 'github', port: 3003, tool: 'issue_read', args: { ...R, method: 'get_comments', issue_number: 760 } },
+      { name: 'github', port: 3003, tool: 'get_file_contents', args: { ...R, path: '/' } },
+    ];
+    for (const c of checks) {
+      try {
+        const sid = await session(c.port);
+        const list = await rpc(c.port, sid, 2, 'tools/list', {});
+        const tools = (list.msg?.result?.tools || []).map(t => t.name);
+        const call = await rpc(c.port, sid, 3, 'tools/call', { name: c.tool, arguments: c.args });
+        console.log(`${c.name}: ${tools.length} tools; ${c.tool} -> ${summarize(call.msg)}`);
+        if (c.tool === 'get_me') console.log('github tools: ' + tools.join(','));
+      } catch (e) {
+        console.log(`${c.name}: FAILED ${e.message}`);
+      }
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mcp-proxy-check-3
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        mcp-proxy-client: "true"
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: check
+          image: node:22-alpine
+          command: ["node", "/scripts/check.mjs"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: script
+          configMap:
+            name: mcp-proxy-check-script
