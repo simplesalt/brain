@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mcp-proxy-check-4
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        mcp-proxy-client: "true"
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: check
+          image: python:3.12-alpine
+          command:
+            - sh
+            - -c
+            - |
+              S=/seed/skill-github-projects--gh_projects.py
+              for c in "list --limit 2" "search hubspot --limit 2" "read 760" "comments 760" "file issues/760.json"; do
+                out=$(python3 $S $c 2>&1); echo "$c -> exit $? $(echo "$out" | head -c 160 | tr '\n' ' ')"
+              done
+              out=$(python3 $S update 760 2>&1); echo "update without fields -> exit $? $(echo "$out" | tail -c 120)"
+          volumeMounts:
+            - name: seed
+              mountPath: /seed
+      volumes:
+        - name: seed
+          configMap:
+            name: hermes-config

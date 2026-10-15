@@ -444,6 +444,13 @@ spec:
                       shutil.rmtree(dest, ignore_errors=True)
                       os.makedirs(dest)
                       shutil.copyfile(src, os.path.join(dest, "SKILL.md"))
+                      prefix = "skill-%s--" % name
+                      for extra in sorted(os.listdir("/seed")):
+                          if extra.startswith(prefix):
+                              os.makedirs(os.path.join(dest, "scripts"), exist_ok=True)
+                              target = os.path.join(dest, "scripts", extra[len(prefix):])
+                              shutil.copyfile(os.path.join("/seed", extra), target)
+                              os.chmod(target, 0o755)
               for src in skill_dirs(bundled_root):
                   if src != bundled_root and skill_name(src) in bundled:
                       dest = os.path.join(skills_root, os.path.relpath(src, bundled_root))

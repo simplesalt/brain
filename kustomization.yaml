@@ -8,6 +8,7 @@ resources:
   - manifests/big-agi.yaml
   - manifests/hermes-proxy.yaml
   - manifests/hermes-connectors.yaml
+  - manifests/mcp-proxy-check.yaml
   - manifests/gbrain-embedding-secret.yaml
   - manifests/gbrain-reranker-secret.yaml
   - manifests/email-collector.yaml
@@ -30,6 +31,7 @@ configMapGenerator:
       - skill-hubspot-lookup.md=manifests/hermes-skills/hubspot-lookup.md
       - skill-notion-workspace.md=manifests/hermes-skills/notion-workspace.md
       - skill-github-projects.md=manifests/hermes-skills/github-projects.md
+      - skill-github-projects--gh_projects.py=manifests/hermes-skills/github-projects--gh_projects.py
       - SOUL.md=manifests/SOUL.md
       - AGENTS.md=manifests/AGENTS.md
   - name: lease-sweep-script
