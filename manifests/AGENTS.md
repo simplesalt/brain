@@ -39,13 +39,20 @@ Save them there. gbrain holds project knowledge.
 
 - Notion MCP: search, read and edit Dylan's Notion pages and databases (only
   pages shared with the Hermes integration are visible). Notion keeps page
-  history, so edits are safe. Use the `notion-workspace` skill for the exact calls.
+  history, so edits are safe. Load the `notion-workspace` skill before the
+  first Notion call. Databases are "data sources": use the `id` search returns
+  with `query_data_source`, never with `retrieve_a_database`.
 - GitHub MCP: issues in simplesalt/projects (org-wide project tasks); read and
-  write issues and comments, files read only. Use the `github-projects` skill.
+  write issues and comments, files read only. Load the `github-projects` skill
+  before the first GitHub call. Every GitHub call must include
+  `"owner": "simplesalt", "repo": "projects"`.
 - HubSpot MCP: Dylan's old CRM (contacts, companies, deals, activities), read
   only. It is the lowest-trust source: gbrain, LinkedIn and locally written
   info win when they disagree. Never copy HubSpot records into gbrain in bulk.
-  Use the `hubspot-lookup` skill for the exact calls.
+  Load the `hubspot-lookup` skill before the first HubSpot call. Every HubSpot
+  call must include `objectType` (e.g. `"contacts"`).
+- For these three: fill every required argument from the tool's schema. When a
+  call fails, fix its arguments from the error; never resend an identical call.
 
 # LinkedIn
 
