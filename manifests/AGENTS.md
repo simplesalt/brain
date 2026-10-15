@@ -44,6 +44,7 @@ Save them there. gbrain holds project knowledge.
 - HubSpot MCP: Dylan's old CRM (contacts, companies, deals, activities), read
   only. It is the lowest-trust source: gbrain, LinkedIn and locally written
   info win when they disagree. Never copy HubSpot records into gbrain in bulk.
+  Use the `hubspot-lookup` skill for the exact calls.
 
 # LinkedIn
 

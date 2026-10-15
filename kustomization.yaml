@@ -27,6 +27,7 @@ configMapGenerator:
       - config.yaml=manifests/hermes-config.yaml
       - skills.yaml=manifests/hermes-skills.yaml
       - skill-outbound-email.md=manifests/hermes-skills/outbound-email.md
+      - skill-hubspot-lookup.md=manifests/hermes-skills/hubspot-lookup.md
       - SOUL.md=manifests/SOUL.md
       - AGENTS.md=manifests/AGENTS.md
   - name: lease-sweep-script

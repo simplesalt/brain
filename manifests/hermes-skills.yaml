@@ -27,3 +27,4 @@ bundled:
   - maps
 local:
   - outbound-email
+  - hubspot-lookup
