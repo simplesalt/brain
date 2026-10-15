@@ -26,6 +26,10 @@ metadata:
     capability: ai
 data:
   config.yaml: |
+    frontendPolicies:
+      accessLog:
+        add:
+          mcp.argument_keys: 'mcp.tool.arguments.map(k, k)'
     binds:
     - port: 3001
       listeners:
