@@ -68,7 +68,7 @@ data:
                   cmd: sh
                   args:
                   - -c
-                  - '[ -s /keys/github ] || { echo "GITHUB_TOKEN missing" >&2; exit 1; }; GITHUB_PERSONAL_ACCESS_TOKEN="$(cat /keys/github)" exec /tools/github-mcp-server stdio'
+                  - '[ -s /keys/github ] || { echo "GITHUB_TOKEN missing" >&2; exit 1; }; SSL_CERT_FILE=/tools/ca-certificates.crt GITHUB_PERSONAL_ACCESS_TOKEN="$(cat /keys/github)" exec /tools/github-mcp-server stdio'
               prefixMode: never
 ---
 apiVersion: apps/v1
@@ -109,6 +109,7 @@ spec:
               tar -xzf gh.tgz github-mcp-server
               rm gh.tgz
               chmod +x agentgateway github-mcp-server
+              cp /etc/ssl/certs/ca-certificates.crt /tools/ca-certificates.crt
           volumeMounts:
             - name: tools
               mountPath: /tools
