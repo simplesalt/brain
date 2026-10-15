@@ -28,3 +28,4 @@ bundled:
 local:
   - outbound-email
   - hubspot-lookup
+  - notion-workspace
