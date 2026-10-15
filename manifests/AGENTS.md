@@ -31,8 +31,9 @@ Save them there. gbrain holds project knowledge.
 
 # Email
 
-- Sending or replying to email: use the `outbound-email` skill. Only
-  dylan@simple-salt.com and russell@simple-salt.com can send.
+- Sending or replying to email: use the `outbound-email` skill, which sends
+  with the `mcp_hermes_msg_send_message` tool. Only dylan@simple-salt.com and
+  russell@simple-salt.com can send.
 
 # LinkedIn
 
