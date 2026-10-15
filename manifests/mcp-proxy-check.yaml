@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mcp-proxy-check-4
+  name: mcp-proxy-check-5
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -28,7 +28,7 @@ spec:
             - -c
             - |
               S=/seed/skill-github-projects--gh_projects.py
-              for c in "list --limit 2" "search hubspot --limit 2" "read 760" "comments 760" "file issues/760.json"; do
+              for c in "file issues/760.json" "file"; do
                 out=$(python3 $S $c 2>&1); echo "$c -> exit $? $(echo "$out" | head -c 160 | tr '\n' ' ')"
               done
               out=$(python3 $S update 760 2>&1); echo "update without fields -> exit $? $(echo "$out" | tail -c 120)"

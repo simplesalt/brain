@@ -54,7 +54,13 @@ class Session:
     def call(self, tool, **args):
         args = {k: v for k, v in args.items() if v is not None}
         result = self._post("tools/call", {"name": tool, "arguments": args}) or {}
-        text = "\n".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+        parts = []
+        for c in result.get("content", []):
+            if c.get("type") == "text":
+                parts.append(c.get("text", ""))
+            elif c.get("type") == "resource" and "text" in c.get("resource", {}):
+                parts.append(c["resource"]["text"])
+        text = "\n".join(parts)
         if result.get("isError"):
             raise McpError(text or "the GitHub tool reported an error")
         return text
