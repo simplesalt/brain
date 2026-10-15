@@ -155,7 +155,7 @@ data:
     const CURSOR_LOST_FLAG = join(DATA_DIR, '.cursor-lost');
     const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain:3131/mcp';
     const GBRAIN_TOKEN   = process.env.GBRAIN_REMOTE_TOKEN ?? '';
-    const SOURCE_VERSION = '0.9.0';
+    const SOURCE_VERSION = '0.10.0';
     const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 900);
 
 
@@ -302,8 +302,7 @@ data:
 
     async function gmailGet(token, id) {
       const r = await fetch(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}` +
-        `?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`,
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
         { headers: { Authorization: `Bearer ${token}` } },
       );
       if (!r.ok) throw new Error(`gmail.get ${id} ${r.status}: ${await r.text()}`);
@@ -312,6 +311,54 @@ data:
 
     const hdr = (msg, name) =>
       msg.payload?.headers?.find(h => h.name.toLowerCase() === name.toLowerCase())?.value ?? '';
+
+    // Bump when the page content changes shape: ids ingested under an older version are pushed again.
+    const CONTENT_VERSION = 2;
+    const BODY_MAX_CHARS  = 20_000;
+
+    function htmlToText(html) {
+      return html
+        .replace(/<(style|script|head)[^>]*>[\s\S]*?<\/\1>/gi, '')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/(p|div|tr|li|h[1-6]|table|blockquote)>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+    }
+
+    // Plain-text body (or the HTML part as text) plus attachment names, from a format=full message.
+    function messageContent(msg) {
+      let plain = '', html = '';
+      const attachments = [];
+      const walk = part => {
+        if (!part) return;
+        const mime = part.mimeType ?? '';
+        if (part.filename) attachments.push(part.filename);
+        else if (part.body?.data && mime === 'text/plain' && !plain) plain = Buffer.from(part.body.data, 'base64url').toString('utf8');
+        else if (part.body?.data && mime === 'text/html' && !html) html = Buffer.from(part.body.data, 'base64url').toString('utf8');
+        for (const p of part.parts ?? []) walk(p);
+      };
+      walk(msg.payload);
+      let body = (plain || htmlToText(html)).replace(/\r\n/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+      if (body.length > BODY_MAX_CHARS) body = `${body.slice(0, BODY_MAX_CHARS)}\n\n[… truncated]`;
+      return { body, attachments };
+    }
+
+    function messageRecord(ref, msg, sentThreads) {
+      const from = hdr(msg, 'From'), subj = hdr(msg, 'Subject'), date = hdr(msg, 'Date');
+      const { body, attachments } = messageContent(msg);
+      return {
+        id: ref.id, threadId: ref.threadId,
+        from, to: hdr(msg, 'To'), cc: hdr(msg, 'Cc'), subject: subj, date,
+        snippet: (msg.snippet ?? '').slice(0, 200),
+        body, attachments,
+        is_noise: isNoise(from),
+        is_signature: isSig(from, subj),
+        is_replied: sentThreads.has(ref.threadId),
+        gmail_link: gmailLink(ref.id, WORK_EMAIL),
+        account: WORK_EMAIL,
+      };
+    }
 
 
     async function collect() {
@@ -345,10 +392,14 @@ data:
         console.error(`ALERT: ${msg}`);
         try { writeFileSync(CURSOR_LOST_FLAG, msg); } catch { /* best-effort advisory only */ }
       }
+      // Always look back across the ingested cache's window and skip what it already holds at the current
+      // CONTENT_VERSION, so a content change re-pushes recent mail and a missed push is retried.
+      const cacheH = Math.floor(INGESTED_TTL_MS / 3_600_000) - 1;
       const sinceH = cursor.lastCollect
-        ? Math.ceil((Date.now() - new Date(cursor.lastCollect).getTime()) / 3_600_000) + 1
-        : 25;
+        ? Math.max(Math.ceil((Date.now() - new Date(cursor.lastCollect).getTime()) / 3_600_000) + 1, cacheH)
+        : Math.max(25, cacheH);
       const q = `newer_than:${sinceH}h`;
+      const ingested = await loadIngested();
 
       const [inbox, sent] = await Promise.all([
         gmailList(token, `in:inbox ${q}`),
@@ -370,18 +421,9 @@ data:
       let added = 0;
       for (const ref of inbox) {
         if (knownIds[ref.id]) continue;
+        if (ingested[ref.id]?.v === CONTENT_VERSION) continue;
         const msg = await gmailGet(token, ref.id);
-        const from = hdr(msg, 'From'), subj = hdr(msg, 'Subject'), date = hdr(msg, 'Date');
-        const rec = {
-          id: ref.id, threadId: ref.threadId,
-          from, subject: subj, date,
-          snippet: (msg.snippet ?? '').slice(0, 200),
-          is_noise: isNoise(from),
-          is_signature: isSig(from, subj),
-          is_replied: sentThreads.has(ref.threadId),
-          gmail_link: gmailLink(ref.id, WORK_EMAIL),
-          account: WORK_EMAIL,
-        };
+        const rec = messageRecord(ref, msg, sentThreads);
         knownIds[ref.id] = { collected: today };
         if (!seenIds.has(ref.id)) { existing.push(rec); seenIds.add(ref.id); added++; }
         await new Promise(r => setTimeout(r, 50));
@@ -454,19 +496,9 @@ data:
 
       for (const ref of inbox) {
         const msg = await gmailGet(token, ref.id);
-        const from_ = hdr(msg, 'From'), subj = hdr(msg, 'Subject'), date = hdr(msg, 'Date');
-        const day = dayOf(msg, date);
+        const day = dayOf(msg, hdr(msg, 'Date'));
         if (!day) { undated++; continue; }
-        const rec = {
-          id: ref.id, threadId: ref.threadId,
-          from: from_, subject: subj, date,
-          snippet: (msg.snippet ?? '').slice(0, 200),
-          is_noise: isNoise(from_),
-          is_signature: isSig(from_, subj),
-          is_replied: sentThreads.has(ref.threadId),
-          gmail_link: gmailLink(ref.id, WORK_EMAIL),
-          account: WORK_EMAIL,
-        };
+        const rec = messageRecord(ref, msg, sentThreads);
         if (!byDay.has(day)) byDay.set(day, []);
         byDay.get(day).push(rec);
         await new Promise(r => setTimeout(r, 50));
@@ -669,10 +701,13 @@ data:
         `# ${subj}`,
         '',
         `**From:** ${m.from}`,
+        ...(m.to ? [`**To:** ${m.to}`] : []),
+        ...(m.cc ? [`**Cc:** ${m.cc}`] : []),
         `**Date:** ${m.date}`,
         `**Account:** ${m.account}`,
+        ...(m.attachments?.length ? [`**Attachments:** ${m.attachments.join(', ')}`] : []),
         '',
-        m.snippet || '',
+        m.body || m.snippet || '',
         '',
         `[Open in Gmail](${m.gmail_link})`,
         '',
@@ -694,13 +729,16 @@ data:
         }
         const byId = new Map(all.filter(m => m && m.id).map(m => [m.id, m]));
         const ingested = await loadIngested();
-        const pending = [...byId.values()].filter(m => !m.is_noise && !ingested[m.id]);
+        const fresh = [...byId.values()].filter(m => ingested[m.id]?.v !== CONTENT_VERSION);
+        // Noise is never pushed; recording it keeps collect from re-fetching it every run.
+        for (const m of fresh.filter(m => m.is_noise)) ingested[m.id] = { at: new Date().toISOString(), v: CONTENT_VERSION, skipped: true };
+        const pending = fresh.filter(m => !m.is_noise);
 
         let pushed = 0; const errors = [];
         for (const m of pending) {
           try {
             await gbrainPutPage(`email/${m.id}`, emailToMarkdown(m));
-            ingested[m.id] = { at: new Date().toISOString() };
+            ingested[m.id] = { at: new Date().toISOString(), v: CONTENT_VERSION };
             pushed++;
           } catch (e) {
             errors.push(`${m.id}: ${e.message}`);
