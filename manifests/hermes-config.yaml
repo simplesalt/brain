@@ -122,12 +122,15 @@ mcp_servers:
 
   notion:
     enabled: true
-    url: http://notion-mcp:3000/mcp
-    headers:
-      Authorization: "Bearer notion-mcp"
+    url: http://mcp-proxy:3001/mcp
     timeout: 60
 
   hubspot:
     enabled: true
-    url: http://hubspot-mcp:3000/mcp
+    url: http://mcp-proxy:3002/mcp
+    timeout: 60
+
+  github:
+    enabled: true
+    url: http://mcp-proxy:3003/mcp
     timeout: 60

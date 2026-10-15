@@ -1,9 +1,80 @@
-# Notion and HubSpot MCP servers for Hermes. Each waits for its token in hermes-secrets
-# (NOTION_TOKEN, HUBSPOT_PRIVATE_APP_TOKEN), so it starts on its own once the key is added.
+# MCP proxy for Hermes: agentgateway holds the Notion, HubSpot and GitHub keys and serves
+# each as an unauthenticated in-cluster MCP endpoint. Tool access is decided by CEL rules.
+# Keys live in mcp-proxy-secrets (NOTION_TOKEN, HUBSPOT_PRIVATE_APP_TOKEN, GITHUB_TOKEN);
+# each server reads its key when a session starts, so a missing key only disables that server.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-proxy-secrets
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-proxy-config
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  config.yaml: |
+    binds:
+    - port: 3001
+      listeners:
+      - routes:
+        - backends:
+          - mcp:
+              targets:
+              - name: notion
+                stdio:
+                  cmd: sh
+                  args:
+                  - -c
+                  - '[ -s /keys/notion ] || { echo "NOTION_TOKEN missing" >&2; exit 1; }; NOTION_TOKEN="$(cat /keys/notion)" exec /tools/node_modules/.bin/notion-mcp-server'
+              prefixMode: never
+    - port: 3002
+      listeners:
+      - routes:
+        - policies:
+            mcpAuthorization:
+              rules:
+              - allow: 'mcp.tool.name.matches("^hubspot-(get|list|search|batch-read)-")'
+          backends:
+          - mcp:
+              targets:
+              - name: hubspot
+                stdio:
+                  cmd: sh
+                  args:
+                  - -c
+                  - '[ -s /keys/hubspot ] || { echo "HUBSPOT_PRIVATE_APP_TOKEN missing" >&2; exit 1; }; PRIVATE_APP_ACCESS_TOKEN="$(cat /keys/hubspot)" exec /tools/node_modules/.bin/mcp-hubspot'
+              prefixMode: never
+    - port: 3003
+      listeners:
+      - routes:
+        - backends:
+          - mcp:
+              targets:
+              - name: github
+                stdio:
+                  cmd: sh
+                  args:
+                  - -c
+                  - '[ -s /keys/github ] || { echo "GITHUB_TOKEN missing" >&2; exit 1; }; GITHUB_PERSONAL_ACCESS_TOKEN="$(cat /keys/github)" exec /tools/github-mcp-server stdio'
+              prefixMode: never
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: notion-mcp
+  name: mcp-proxy
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -13,153 +84,115 @@ spec:
   replicas: 1
   selector:
     matchLabels:
-      app: notion-mcp
+      app: mcp-proxy
   template:
     metadata:
       labels:
-        app: notion-mcp
+        app: mcp-proxy
         entity: ssint
         env: main
         capability: ai
     spec:
-      containers:
-        - name: notion-mcp
-          image: node:22-alpine
+      automountServiceAccountToken: false
+      initContainers:
+        - name: fetch-binaries
+          image: alpine:3.22
           command:
             - sh
-            - -c
+            - -ec
             - |
-              until [ -s /secrets/token ]; do echo "waiting for NOTION_TOKEN in hermes-secrets"; sleep 30; done
-              export NOTION_TOKEN="$(cat /secrets/token)"
-              exec npx -y @notionhq/notion-mcp-server@2.5.2 --transport http --port 3000 --auth-token notion-mcp
+              cd /tools
+              wget -q -O agentgateway https://github.com/agentgateway/agentgateway/releases/download/v1.5.0/agentgateway-linux-amd64
+              echo "daca5cda76e8c5ab0c1a75912fecf2d6365095403f810db72029c49d14a37e7b  agentgateway" | sha256sum -c -
+              wget -q -O gh.tgz https://github.com/github/github-mcp-server/releases/download/v2.0.2/github-mcp-server_Linux_x86_64.tar.gz
+              echo "815e27d931c796af0c97f24fd211e14f8a4607d4528377719a5ad2352086b0b0  gh.tgz" | sha256sum -c -
+              tar -xzf gh.tgz github-mcp-server
+              rm gh.tgz
+              chmod +x agentgateway github-mcp-server
+          volumeMounts:
+            - name: tools
+              mountPath: /tools
+        - name: install-node-servers
+          image: node:22-trixie-slim
+          command:
+            - npm
+            - install
+            - --prefix
+            - /tools
+            - --no-audit
+            - --no-fund
+            - "@notionhq/notion-mcp-server@2.5.2"
+            - "@hubspot/mcp-server@0.4.0"
           env:
             - name: npm_config_cache
               value: /tmp/npm
-          ports:
-            - name: http
-              containerPort: 3000
           volumeMounts:
-            - name: token
-              mountPath: /secrets
+            - name: tools
+              mountPath: /tools
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: agentgateway
+          image: node:22-trixie-slim
+          command: ["/tools/agentgateway", "-f", "/etc/agentgateway/config.yaml"]
+          ports:
+            - name: notion
+              containerPort: 3001
+            - name: hubspot
+              containerPort: 3002
+            - name: github
+              containerPort: 3003
+            - name: readiness
+              containerPort: 15021
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: readiness
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/agentgateway
+            - name: tools
+              mountPath: /tools
+            - name: keys
+              mountPath: /keys
               readOnly: true
             - name: tmp
               mountPath: /tmp
-          readinessProbe:
-            tcpSocket:
-              port: 3000
-            periodSeconds: 10
           resources:
             requests:
-              cpu: 10m
-              memory: 96Mi
+              cpu: 20m
+              memory: 128Mi
             limits:
-              cpu: 500m
-              memory: 384Mi
+              cpu: "1"
+              memory: 768Mi
       volumes:
-        - name: token
+        - name: config
+          configMap:
+            name: mcp-proxy-config
+        - name: tools
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+        - name: keys
           secret:
-            secretName: hermes-secrets
+            secretName: mcp-proxy-secrets
             optional: true
             items:
               - key: NOTION_TOKEN
-                path: token
-        - name: tmp
-          emptyDir:
-            sizeLimit: 512Mi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: notion-mcp
-  namespace: ssint-main-ai
-  labels:
-    entity: ssint
-    env: main
-    capability: ai
-spec:
-  selector:
-    app: notion-mcp
-  ports:
-    - name: http
-      port: 3000
-      targetPort: 3000
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: hubspot-mcp
-  namespace: ssint-main-ai
-  labels:
-    entity: ssint
-    env: main
-    capability: ai
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: hubspot-mcp
-  template:
-    metadata:
-      labels:
-        app: hubspot-mcp
-        entity: ssint
-        env: main
-        capability: ai
-    spec:
-      containers:
-        - name: hubspot-mcp
-          image: node:22-alpine
-          command:
-            - sh
-            - -c
-            - |
-              until [ -s /secrets/token ]; do echo "waiting for HUBSPOT_PRIVATE_APP_TOKEN in hermes-secrets"; sleep 30; done
-              export PRIVATE_APP_ACCESS_TOKEN="$(cat /secrets/token)"
-              npm install -g --silent @hubspot/mcp-server@0.4.0
-              exec npx -y supergateway@4.1.0 --stdio "mcp-hubspot" --outputTransport streamableHttp --stateful --port 3000
-          env:
-            - name: npm_config_cache
-              value: /tmp/npm
-            - name: npm_config_prefix
-              value: /tmp/npm-global
-            - name: PATH
-              value: /tmp/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-          ports:
-            - name: http
-              containerPort: 3000
-          volumeMounts:
-            - name: token
-              mountPath: /secrets
-              readOnly: true
-            - name: tmp
-              mountPath: /tmp
-          readinessProbe:
-            tcpSocket:
-              port: 3000
-            periodSeconds: 10
-          resources:
-            requests:
-              cpu: 10m
-              memory: 96Mi
-            limits:
-              cpu: 500m
-              memory: 384Mi
-      volumes:
-        - name: token
-          secret:
-            secretName: hermes-secrets
-            optional: true
-            items:
+                path: notion
               - key: HUBSPOT_PRIVATE_APP_TOKEN
-                path: token
-        - name: tmp
-          emptyDir:
-            sizeLimit: 512Mi
+                path: hubspot
+              - key: GITHUB_TOKEN
+                path: github
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: hubspot-mcp
+  name: mcp-proxy
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -167,8 +200,39 @@ metadata:
     capability: ai
 spec:
   selector:
-    app: hubspot-mcp
+    app: mcp-proxy
   ports:
-    - name: http
-      port: 3000
-      targetPort: 3000
+    - name: notion
+      port: 3001
+      targetPort: notion
+    - name: hubspot
+      port: 3002
+      targetPort: hubspot
+    - name: github
+      port: 3003
+      targetPort: github
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-proxy-allow-hermes
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  podSelector:
+    matchLabels:
+      app: mcp-proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: hermes-agent
+      ports:
+        - port: 3001
+        - port: 3002
+        - port: 3003

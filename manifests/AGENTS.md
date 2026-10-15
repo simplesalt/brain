@@ -35,10 +35,12 @@ Save them there. gbrain holds project knowledge.
   with the `mcp_hermes_msg_send_message` tool. Only dylan@simple-salt.com and
   russell@simple-salt.com can send.
 
-# Notion and HubSpot
+# Notion, HubSpot and GitHub
 
-- Notion MCP: search and read Dylan's Notion pages and databases (only pages
-  shared with the Hermes integration are visible).
+- Notion MCP: search, read and edit Dylan's Notion pages and databases (only
+  pages shared with the Hermes integration are visible). Notion keeps page
+  history, so edits are safe.
+- GitHub MCP: repositories, issues and pull requests the Hermes token can reach.
 - HubSpot MCP: Dylan's old CRM (contacts, companies, deals, activities), read
   only. It is the lowest-trust source: gbrain, LinkedIn and locally written
   info win when they disagree. Never copy HubSpot records into gbrain in bulk.
