@@ -54,7 +54,7 @@ data:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mcp-proxy-check-1
+  name: mcp-proxy-check-2
   namespace: ssint-main-ai
   labels:
     entity: ssint

@@ -331,7 +331,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        simplesalt.company/restart-epoch: "7"
+        simplesalt.company/restart-epoch: "8"
     spec:
       securityContext:
         fsGroup: 10000
