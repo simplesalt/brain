@@ -40,7 +40,8 @@ Save them there. gbrain holds project knowledge.
 - Notion MCP: search, read and edit Dylan's Notion pages and databases (only
   pages shared with the Hermes integration are visible). Notion keeps page
   history, so edits are safe. Use the `notion-workspace` skill for the exact calls.
-- GitHub MCP: repositories, issues and pull requests the Hermes token can reach.
+- GitHub MCP: issues in simplesalt/projects (org-wide project tasks); read and
+  write issues and comments, files read only. Use the `github-projects` skill.
 - HubSpot MCP: Dylan's old CRM (contacts, companies, deals, activities), read
   only. It is the lowest-trust source: gbrain, LinkedIn and locally written
   info win when they disagree. Never copy HubSpot records into gbrain in bulk.

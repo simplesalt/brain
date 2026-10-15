@@ -60,7 +60,11 @@ data:
     - port: 3003
       listeners:
       - routes:
-        - backends:
+        - policies:
+            mcpAuthorization:
+              rules:
+              - allow: 'mcp.tool.name in ["get_me", "search_issues", "list_issues", "issue_read", "issue_write", "sub_issue_write", "add_issue_comment", "update_issue_comment", "list_issue_types", "list_issue_fields", "get_label", "get_file_contents", "list_commits", "get_commit"]'
+          backends:
           - mcp:
               targets:
               - name: github
@@ -233,9 +237,6 @@ spec:
         - podSelector:
             matchLabels:
               app: hermes-agent
-        - podSelector:
-            matchLabels:
-              mcp-proxy-client: "true"
       ports:
         - port: 3001
         - port: 3002

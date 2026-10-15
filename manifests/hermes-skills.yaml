@@ -29,3 +29,4 @@ local:
   - outbound-email
   - hubspot-lookup
   - notion-workspace
+  - github-projects
