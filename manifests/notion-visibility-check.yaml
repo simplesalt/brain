@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notion-visibility-check-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  check.mjs: |
+    const URL = 'http://mcp-proxy:3001/mcp';
+    async function rpc(sid, id, method, params) {
+      const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
+      if (sid) headers['mcp-session-id'] = sid;
+      const body = id == null ? { jsonrpc: '2.0', method, params } : { jsonrpc: '2.0', id, method, params };
+      const r = await fetch(URL, { method: 'POST', headers, body: JSON.stringify(body) });
+      const text = await r.text();
+      const line = text.split('\n').filter(l => l.startsWith('data:')).pop();
+      return { sid: r.headers.get('mcp-session-id') || sid, msg: line ? JSON.parse(line.slice(5)) : (text ? JSON.parse(text) : null) };
+    }
+    const init = await rpc(null, 1, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'check', version: '1' } });
+    const sid = init.sid;
+    await rpc(sid, null, 'notifications/initialized', {});
+    let n = 10;
+    async function call(tool, args) {
+      const m = (await rpc(sid, n++, 'tools/call', { name: tool, arguments: args })).msg;
+      const t = (m?.result?.content || []).map(c => c.text || '').join(' ');
+      try { return { err: m?.error || m?.result?.isError, json: JSON.parse(t), text: t }; } catch { return { err: m?.error || m?.result?.isError, text: t }; }
+    }
+    function title(o) {
+      const p = o.properties || {};
+      for (const v of Object.values(p)) if (v?.type === 'title') return (v.title || []).map(x => x.plain_text).join('');
+      return (o.title || []).map(x => x.plain_text).join('');
+    }
+    function show(label, r) {
+      if (r.err || !r.json) { console.log(`${label}: ERROR ${String(r.text).slice(0, 300)}`); return; }
+      const res = r.json.results || [r.json];
+      console.log(`${label}: ${res.length} result(s)${r.json.has_more ? ' (more)' : ''}`);
+      for (const o of res) console.log(`  ${o.object} ${o.id} "${title(o)}" parent=${JSON.stringify(o.parent)}`);
+    }
+    show('search "Cloudflare Connect"', await call('API-post-search', { query: 'Cloudflare Connect', page_size: 20 }));
+    show('search "Connect Prep Tasks"', await call('API-post-search', { query: 'Connect Prep Tasks', page_size: 20 }));
+    show('page Cloudflare Connect 2026', await call('API-retrieve-a-page', { page_id: '3c8e6a5b977980d8a232ccb63cc3a1a2' }));
+    show('data source Connect Prep Tasks', await call('API-retrieve-a-data-source', { data_source_id: '6f5ebffa-24c5-46ae-9dd6-1b5996ea8809' }));
+    show('data source Events', await call('API-retrieve-a-data-source', { data_source_id: '360e6a5b-9779-8056-b0d5-000b85f86432' }));
+    let cursor, total = 0;
+    const roots = new Map();
+    do {
+      const r = await call('API-post-search', cursor ? { query: '', page_size: 100, start_cursor: cursor } : { query: '', page_size: 100 });
+      if (!r.json) { console.log('full listing: ERROR ' + String(r.text).slice(0, 300)); break; }
+      for (const o of r.json.results) {
+        total++;
+        if (o.parent?.type === 'workspace' || o.parent?.workspace) roots.set(o.id, `${o.object} "${title(o)}"`);
+      }
+      cursor = r.json.has_more ? r.json.next_cursor : null;
+    } while (cursor && total < 2000);
+    console.log(`everything visible: ${total} objects; top-level: ${[...roots.values()].join(', ')}`);
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: notion-visibility-check-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        mcp-proxy-client: "true"
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: check
+          image: node:22-alpine
+          command: ["node", "/scripts/check.mjs"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: script
+          configMap:
+            name: notion-visibility-check-script
