@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-upgrade-check-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  check.py: |
+    import json, os, time, urllib.request
+
+    BASE = 'http://hermes-agent-web:8642'
+    KEY = os.environ['API_SERVER_KEY']
+
+    def call(path, body=None, timeout=60, stream=False):
+        req = urllib.request.Request(BASE + path, method='POST' if body is not None else 'GET')
+        req.add_header('Authorization', 'Bearer ' + KEY)
+        if body is not None:
+            req.add_header('Content-Type', 'application/json')
+            req.data = json.dumps(body).encode()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if stream:
+                    return r.status, [l.decode(errors='replace').rstrip() for l in r]
+                return r.status, r.read().decode(errors='replace')
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(errors='replace')
+        except Exception as e:
+            return 0, repr(e)
+
+    for p in ['/health', '/health/detailed', '/v1/models', '/v1/toolsets']:
+        s, b = call(p)
+        print(f'== GET {p} -> {s}')
+        print(b[:3000])
+
+    s, b = call('/v1/models')
+    try:
+        model = json.loads(b)['data'][0]['id']
+    except Exception:
+        model = 'hermes-agent'
+    print(f'== model: {model}')
+
+    prompt = (
+        'Upgrade health check. Make exactly these read-only tool calls, one each, and then reply with one line per call '
+        'in the form "<tool>: OK" or "<tool>: FAILED <reason>": '
+        '1) hindsight recall for "gbrain upgrade"; '
+        '2) the gbrain MCP search tool for "Dux Soup"; '
+        '3) the flux MCP tool that lists Flux Kustomizations (or Kubernetes namespaces); '
+        '4) the hermes-msg MCP tool that lists channels or recent messages; '
+        '5) the Notion MCP search for "Cloudflare"; '
+        '6) the HubSpot MCP tool that returns user details; '
+        '7) the GitHub MCP tool that returns the authenticated user. '
+        'Do not write, send or change anything.'
+    )
+    t0 = time.time()
+    s, lines = call('/v1/chat/completions', {
+        'model': model, 'stream': True,
+        'messages': [{'role': 'user', 'content': prompt}],
+    }, timeout=600, stream=True)
+    print(f'== POST /v1/chat/completions (stream) -> {s} in {time.time() - t0:.0f}s')
+    text = []
+    events = 0
+    if isinstance(lines, list):
+        for l in lines:
+            if not l.startswith('data:'):
+                continue
+            events += 1
+            d = l[5:].strip()
+            if d == '[DONE]':
+                break
+            try:
+                for c in json.loads(d).get('choices', []):
+                    text.append((c.get('delta') or {}).get('content') or '')
+            except Exception:
+                pass
+        print(f'stream events: {events}')
+        print(''.join(text)[-4000:])
+    else:
+        print(lines[:3000])
+    print('== hermes-upgrade-check done')
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hermes-upgrade-check
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: hermes-upgrade-check
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: check
+          image: python:3.12-alpine
+          command: ["python3", "/check/check.py"]
+          env:
+            - name: CHECK_STOP
+              value: "v2026.8.27"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: HERMES_BEARER_TOKEN
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: script
+              mountPath: /check
+      volumes:
+        - name: script
+          configMap:
+            name: hermes-upgrade-check-script
