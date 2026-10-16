@@ -1,0 +1,327 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hindsight-pg-dumps
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hindsight-pg-dump
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 604800
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: hindsight-pg-dump
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dump
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PGOPTIONS='-c default_transaction_read_only=on'
+              export PGAPPNAME=hindsight-pg-dump
+              DUMP_DIR=/dumps
+              partial=""
+
+              fail() {
+                echo "FATAL: $*"
+                if [ -n "$partial" ]; then rm -f "$partial"; fi
+                exit 1
+              }
+
+              q() {
+                PGOPTIONS="$PGOPTIONS -c statement_timeout=120000 -c lock_timeout=5000" \
+                  psql -X -q -A -t -v ON_ERROR_STOP=1 -c "$1" "$DATABASE_URL"
+              }
+
+              snapshot() {
+                for t in $(q "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"); do
+                  n=$(q "SELECT count(*) FROM public.\"$t\"") || return 1
+                  echo "${1}_${t}=${n}"
+                done
+                v=$(q "SELECT coalesce(string_agg(version_num, ','), 'none') FROM alembic_version") || v=unavailable
+                echo "${1}_alembic_version=${v}"
+              }
+
+              case "$DUMP_LABEL" in
+                ""|*[!A-Za-z0-9._-]*) fail "DUMP_LABEL must be non-empty and use only letters, digits, dot, underscore and hyphen" ;;
+              esac
+              case "$DATABASE_URL" in
+                *@hindsight-pg-rw[.:/]*) ;;
+                *) fail "DATABASE_URL does not target hindsight-pg-rw; refusing to dump" ;;
+              esac
+              [ -d "$DUMP_DIR" ] && [ -w "$DUMP_DIR" ] || fail "$DUMP_DIR is not writable"
+
+              echo "hindsight-pg-dump: label=$DUMP_LABEL started $(date -u +%Y-%m-%dT%H:%M:%SZ); read-only session"
+              i=0
+              until pg_isready -h hindsight-pg-rw -p 5432; do
+                i=$((i + 1)); [ "$i" -ge 90 ] && fail "hindsight-pg-rw not ready after 180s"; sleep 2
+              done
+
+              [ "$(q "SELECT current_database()")" = "hindsight" ] || fail "connected database is not hindsight"
+              [ "$(q "SHOW default_transaction_read_only")" = "on" ] || fail "session is not read-only"
+              [ "$(q "SELECT pg_is_in_recovery()")" = "f" ] || fail "hindsight-pg-rw is not the primary"
+
+              db_bytes=$(q "SELECT pg_database_size(current_database())") || fail "cannot read database size"
+              avail_kb=$(df -Pk "$DUMP_DIR" | tail -n 1 | tr -s ' ' | cut -d ' ' -f 4)
+              echo "database size: $db_bytes bytes; free: $avail_kb KiB"
+              [ "$((avail_kb * 1024))" -ge "$db_bytes" ] || fail "not enough free space"
+              db_locale=$(q "SELECT pg_encoding_to_char(encoding) || ' ' || datcollate || ' ' || datctype FROM pg_database WHERE datname = current_database()")
+              extensions=$(q "SELECT string_agg(extname || ' ' || extversion, ', ' ORDER BY extname) FROM pg_extension")
+              public_tables=$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
+              public_indexes=$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public'")
+              echo "locale: $db_locale; extensions: $extensions; tables: $public_tables; indexes: $public_indexes"
+
+              BEFORE=$(snapshot before) || fail "could not read row counts"
+              echo "$BEFORE"
+
+              TS=$(date -u +%Y%m%dT%H%M%SZ)
+              base="hindsight-${DUMP_LABEL}-${TS}.dump"
+              final="$DUMP_DIR/$base"
+              partial="$final.partial"
+              pg_dump --format=custom --compress=gzip:6 --lock-wait-timeout=60s \
+                --file="$partial" --dbname="$DATABASE_URL" || fail "pg_dump failed"
+              AFTER=$(snapshot after) || AFTER="after_counts=unavailable"
+              echo "$AFTER"
+
+              [ -s "$partial" ] || fail "dump file is empty"
+              size=$(wc -c < "$partial")
+              pg_restore --list "$partial" > /dev/null || fail "pg_restore --list failed"
+              pg_restore --file=/dev/null "$partial" || fail "full read of the dump failed"
+              mv "$partial" "$final" || fail "rename failed"
+              partial=""
+              {
+                echo "dump_file=$base"
+                echo "created_utc=$TS"
+                echo "database_encoding_collate_ctype=$db_locale"
+                echo "extensions=$extensions"
+                echo "public_tables=$public_tables"
+                echo "public_indexes=$public_indexes"
+                echo "$BEFORE"
+                echo "$AFTER"
+              } > "$final.info" || fail "could not write .info"
+              (cd "$DUMP_DIR" && sha256sum "$base" > "$base.sha256" && sha256sum -c "$base.sha256") || fail "checksum failed"
+              sync
+              ls -l "$DUMP_DIR"
+              echo "dump: $final size: $size sha256: $(cut -d ' ' -f 1 "$final.sha256")"
+              echo "hindsight-pg-dump: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          env:
+            - name: DUMP_LABEL
+              value: "pre-0.8.6"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hindsight-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: dumps
+              mountPath: /dumps
+      volumes:
+        - name: dumps
+          persistentVolumeClaim:
+            claimName: hindsight-pg-dumps
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hindsight-pg-dump-verify-restore
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 604800
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: hindsight-pg-dump-verify-restore
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: verify-restore
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PGAPPNAME=hindsight-pg-dump-verify-restore
+              DUMP_DIR=/dumps
+              TARGET_HOST=gbrain-pg-rehearsal-rw
+              RESTORE_DB=hindsight_restore_check
+              created=""
+              status=PASS
+
+              cleanup() {
+                if [ "$created" = "yes" ]; then
+                  psql -X -q -h "$PGHOST" -d postgres -c "DROP DATABASE IF EXISTS $RESTORE_DB WITH (FORCE)" \
+                    || echo "WARN: could not drop $RESTORE_DB on $PGHOST"
+                  echo "dropped $RESTORE_DB"
+                fi
+              }
+              trap cleanup EXIT
+              trap 'exit 143' TERM INT
+
+              fail() { echo "FATAL: $*"; echo "RESULT: FAIL"; exit 1; }
+              adm() { psql -X -q -A -t -v ON_ERROR_STOP=1 -h "$PGHOST" -d postgres -c "$1"; }
+              rq() { psql -X -q -A -t -v ON_ERROR_STOP=1 -h "$PGHOST" -d "$RESTORE_DB" -c "$1"; }
+
+              [ "$PGHOST" = "$TARGET_HOST" ] || fail "this job restores only into $TARGET_HOST"
+              if [ -n "${PGHOSTADDR:-}" ] || [ -n "${PGSERVICE:-}" ] || [ -n "${DATABASE_URL:-}" ]; then
+                fail "PGHOSTADDR, PGSERVICE and DATABASE_URL must be unset"
+              fi
+              case "$DUMP_LABEL" in
+                ""|*[!A-Za-z0-9._-]*) fail "bad DUMP_LABEL" ;;
+              esac
+
+              i=0
+              until pg_isready -h "$PGHOST" -p 5432; do
+                i=$((i + 1)); [ "$i" -ge 90 ] && fail "$PGHOST not ready after 180s"; sleep 2
+              done
+              [ "$(adm "SELECT rolsuper FROM pg_roles WHERE rolname = current_user")" = "t" ] || fail "role on $PGHOST is not a superuser"
+
+              file=""
+              i=0
+              while [ -z "$file" ]; do
+                for f in $(ls -1t "$DUMP_DIR"/hindsight-${DUMP_LABEL}-*.dump 2>/dev/null); do
+                  if [ -f "$f.sha256" ] && [ -f "$f.info" ]; then file="$f"; break; fi
+                done
+                [ -n "$file" ] && break
+                i=$((i + 1)); [ "$i" -ge 120 ] && fail "no finished dump after 600s"
+                echo "waiting for a finished dump ($i)"; sleep 5
+              done
+              base=$(basename "$file")
+              info="$file.info"
+              echo "dump: $file"
+              (cd "$DUMP_DIR" && sha256sum -c "$base.sha256") || fail "checksum mismatch"
+
+              adm "DROP DATABASE IF EXISTS $RESTORE_DB WITH (FORCE)" || fail "could not clear $RESTORE_DB"
+              adm "CREATE DATABASE $RESTORE_DB TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'" || fail "could not create $RESTORE_DB"
+              created=yes
+              pg_restore --host="$PGHOST" --dbname="$RESTORE_DB" --no-owner --no-privileges --exit-on-error --single-transaction --no-password "$file" \
+                || fail "pg_restore failed"
+
+              for line in $(grep '^before_' "$info" | grep -v '^before_alembic_version='); do
+                t=${line#before_}; t=${t%%=*}
+                b=${line#*=}
+                a=$(grep "^after_${t}=" "$info" | cut -d= -f2-)
+                r=$(rq "SELECT count(*) FROM public.\"$t\"") || { echo "  $t: count failed"; status=FAIL; continue; }
+                lo=$b; hi=${a:-$b}
+                [ "$lo" -gt "$hi" ] && { lo=$hi; hi=$b; }
+                if [ "$r" -ge "$lo" ] && [ "$r" -le "$hi" ]; then v=ok; else v=MISMATCH; status=FAIL; fi
+                echo "  $t: restored=$r live=$b..$a $v"
+              done
+              rv=$(rq "SELECT coalesce(string_agg(version_num, ','), 'none') FROM alembic_version")
+              bv=$(grep '^before_alembic_version=' "$info" | cut -d= -f2-)
+              if [ "$rv" = "$bv" ]; then v=ok; else v=MISMATCH; status=FAIL; fi
+              echo "  alembic_version: restored=$rv live=$bv $v"
+              rt=$(rq "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
+              ri=$(rq "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public'")
+              et=$(grep '^public_tables=' "$info" | cut -d= -f2-)
+              ei=$(grep '^public_indexes=' "$info" | cut -d= -f2-)
+              [ "$rt" = "$et" ] || status=FAIL
+              [ "$ri" = "$ei" ] || status=FAIL
+              echo "  tables: restored=$rt recorded=$et; indexes: restored=$ri recorded=$ei"
+              echo "RESULT: $status"
+              [ "$status" = "PASS" ]
+          env:
+            - name: PGHOST
+              value: gbrain-pg-rehearsal-rw
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: password
+            - name: DUMP_LABEL
+              value: "pre-0.8.6"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: dumps
+              mountPath: /dumps
+              readOnly: true
+      volumes:
+        - name: dumps
+          persistentVolumeClaim:
+            claimName: hindsight-pg-dumps
+            readOnly: true

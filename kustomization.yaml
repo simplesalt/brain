@@ -5,6 +5,7 @@ resources:
   - manifests/gbrain-rehearsal.yaml
   - manifests/crawl.yaml
   - manifests/hindsight-chart.yaml
+  - manifests/hindsight-pg-dump.yaml
   - manifests/big-agi.yaml
   - manifests/hermes-proxy.yaml
   - manifests/hermes-connectors.yaml
