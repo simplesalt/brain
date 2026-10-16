@@ -631,6 +631,8 @@ spec:
                   live = {}
 
               merged = deep_merge(live, seed)
+              # Git owns the MCP server list: a server dropped from the seed leaves the live config too.
+              merged["mcp_servers"] = seed.get("mcp_servers", {})
 
               with open(live_path, "w") as f:
                   yaml.dump(merged, f, default_flow_style=False, indent=2, allow_unicode=True)
@@ -747,16 +749,6 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: FIRECRAWL_API_KEY
-            - name: CLOUDFLARE_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-secrets
-                  key: CLOUDFLARE_API_TOKEN
-            - name: CLOUDFLARE_ACCOUNT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-secrets
-                  key: CLOUDFLARE_ACCOUNT_ID
             - name: HERMES_DASHBOARD
               value: "1"
             - name: HERMES_DASHBOARD_HOST

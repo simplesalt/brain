@@ -9,9 +9,6 @@ fallback_providers:
 
 agent:
   environment_hint: |-
-    When calling Cloudflare MCP tools that accept an account_id parameter, use
-    account_id "${CLOUDFLARE_ACCOUNT_ID}".
-
     At the start of every session, call hindsight_recall before giving your
     first response. Use it to retrieve context about ongoing work, recent
     decisions, and open tasks. Use hindsight_recall (not gbrain) for personal
@@ -112,13 +109,6 @@ mcp_servers:
     enabled: true
     url: http://hermes-msg.ssint-main-msg:8080/mcp
     timeout: 60
-
-  cloudflare:
-    enabled: true
-    url: https://mcp.cloudflare.com/mcp
-    headers:
-      Authorization: "Bearer ${CLOUDFLARE_API_TOKEN}"
-    timeout: 180
 
   notion:
     enabled: true
