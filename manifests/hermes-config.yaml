@@ -105,6 +105,16 @@ mcp_servers:
       Authorization: "Bearer ${GBRAIN_REMOTE_TOKEN}"
     timeout: 60
 
+  gbrain-mail:
+    enabled: true
+    url: http://gbrain:3131/mcp
+    headers:
+      Authorization: "Bearer ${GBRAIN_MAIL_TOKEN}"
+    timeout: 60
+    tools:
+      include:
+        - loops_close
+
   hermes-msg:
     enabled: true
     url: http://hermes-msg.ssint-main-msg:8080/mcp

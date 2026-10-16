@@ -30,3 +30,5 @@ local:
   - hubspot-lookup
   - notion-workspace
   - github-projects
+  - note-capture
+  - catch-up
