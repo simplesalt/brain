@@ -241,6 +241,9 @@ spec:
         - podSelector:
             matchLabels:
               app: hermes-agent
+        - podSelector:
+            matchLabels:
+              app: hermes-canary
       ports:
         - port: 3001
         - port: 3002

@@ -11,7 +11,7 @@ data:
   check.py: |
     import json, os, time, urllib.request
 
-    BASE = 'http://hermes-agent-web:8642'
+    BASE = os.environ.get('HERMES_URL', 'http://hermes-agent-web:8642')
     KEY = os.environ['API_SERVER_KEY']
 
     def call(path, body=None, timeout=60, stream=False):
@@ -136,7 +136,9 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "rollback-v2026.7.1"
+              value: "canary-v2026.8.27"
+            - name: HERMES_URL
+              value: "http://hermes-canary-web:8642"
             - name: CHECK_DELAY
               value: "300"
             - name: PYTHONUNBUFFERED
