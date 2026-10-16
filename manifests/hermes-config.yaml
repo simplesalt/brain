@@ -74,8 +74,6 @@ auxiliary:
     fallback_chain:
       - provider: openrouter
         model: qwen/qwen3-vl-235b-a22b-instruct
-  web_extract:
-    provider: main
   compression:
     provider: main
   session_search:
