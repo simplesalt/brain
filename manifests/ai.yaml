@@ -238,7 +238,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
-                  key: HINDSIGHT_API_LLM_API_KEY
+                  key: GENERAL_API_LLM_API_KEY
             - name: GBRAIN_EMBEDDING_MODEL
               value: openai:text-embedding-3-small
             - name: GBRAIN_EMBEDDING_DIMENSIONS
@@ -355,7 +355,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
-                  key: HINDSIGHT_API_LLM_API_KEY
+                  key: GENERAL_API_LLM_API_KEY
             - name: GBRAIN_EMBEDDING_MODEL
               value: openai:text-embedding-3-small
             - name: GBRAIN_EMBEDDING_DIMENSIONS
