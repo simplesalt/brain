@@ -66,7 +66,7 @@ data:
         '1) hindsight recall for "gbrain upgrade"; '
         '2) the gbrain MCP tool named search with arguments {"query": "Dux Soup"}; '
         '3) the flux MCP tool get_kubernetes_resources with arguments {"apiVersion": "kustomize.toolkit.fluxcd.io/v1", "kind": "Kustomization", "namespace": "flux-system"}; '
-        '4) the hermes-msg MCP tool that lists channels or recent messages; '
+        '4) the hermes-msg MCP tool linkedin_search with arguments {"name": "Dylan Evans"}; '
         '5) the Notion MCP search for "Cloudflare"; '
         '6) the HubSpot MCP tool that returns user details; '
         '7) the GitHub MCP tool that returns the authenticated user; '
