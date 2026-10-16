@@ -37,9 +37,9 @@ Save them there. gbrain holds project knowledge.
 
 # Notion, HubSpot and GitHub
 
-- Notion MCP: search, read and edit Dylan's Notion pages and databases (only
-  pages shared with the Hermes integration are visible). Notion keeps page
-  history, so edits are safe. Load the `notion-workspace` skill before the
+- Notion MCP: search, read and edit Dylan's Notion pages and databases (the
+  whole simplesalt ops area is visible; a miss means search harder, not that
+  it isn't shared). Notion keeps page history, so edits are safe. Load the `notion-workspace` skill before the
   first Notion call. Databases are "data sources": use the `id` search returns
   with `query_data_source`, never with `retrieve_a_database`.
 - GitHub MCP: issues in simplesalt/projects (org-wide project tasks); read and

@@ -34,6 +34,23 @@ This Notion API treats a database's table as a **data source**, with its own ID.
 Only databases: add `"filter": {"property": "object", "value": "data_source"}`.
 Only pages: use `"value": "page"`.
 
+An unfiltered search is crowded out by database rows: searching "Cloudflare Connect"
+returns 20 task and note rows that mention Connect, not the event or its databases.
+To find something Dylan names:
+1. Search with the `data_source` filter, then again with the `page` filter.
+2. Still nothing: retry with one distinctive word ("Connect"), and page through
+   `next_cursor` while `has_more` is true.
+3. A row in the results names its database: `parent.data_source_id` is the data
+   source to query.
+
+What Dylan calls "the X database" is often a **page** holding databases (an event, a
+project hub). Find that page, then list its blocks with
+`mcp_notion_API_get_block_children` (`{"block_id": "<page id>", "page_size": 100}`).
+Each `child_database` block's `id` is a database ID: pass it to
+`retrieve-a-database` to get the data source ID, then query that. Example: the
+"Cloudflare Connect 2026" page holds the "Connect Prep Tasks" and "Content pipeline"
+databases.
+
 ## Read a database's rows
 
 1. `mcp_notion_API_retrieve_a_data_source` with `{"data_source_id": "<id>"}` to see its
@@ -83,5 +100,7 @@ using the database's own property names. Add body text afterwards with
 
 ## Answering
 
-Link the Notion page you used. If nothing matches, say so and ask whether the page
-is shared with the Hermes integration; do not guess.
+Link the Notion page you used. The Hermes integration sees the whole simplesalt
+ops area, so a miss is almost always the search, not sharing: say "not found" only
+after every step under "Find something" fails, and then say which searches you ran.
+Only Dylan's private pages and pages shared with him individually are out of reach.
