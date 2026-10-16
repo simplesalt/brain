@@ -476,7 +476,7 @@ spec:
                 });
               })();
         - name: install-cli-tools
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:e0df6adebddf29b91112aefc999d4aaf6846c9eb544faca5672a16a13590ff79
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -612,7 +612,7 @@ spec:
               mountPath: /seed
               readOnly: true
         - name: seed-hermes-config
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:e0df6adebddf29b91112aefc999d4aaf6846c9eb544faca5672a16a13590ff79
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -737,7 +737,7 @@ spec:
               readOnly: true
       containers:
         - name: hermes-agent
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:e0df6adebddf29b91112aefc999d4aaf6846c9eb544faca5672a16a13590ff79
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294
           imagePullPolicy: IfNotPresent
           args:
             - gateway

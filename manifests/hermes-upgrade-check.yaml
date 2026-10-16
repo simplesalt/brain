@@ -30,6 +30,12 @@ data:
         except Exception as e:
             return 0, repr(e)
 
+    time.sleep(int(os.environ.get('CHECK_DELAY', '0')))
+    for _ in range(60):
+        if call('/health')[0] == 200:
+            break
+        time.sleep(10)
+
     for p in ['/health', '/health/detailed', '/v1/models', '/v1/toolsets']:
         s, b = call(p)
         print(f'== GET {p} -> {s}')
@@ -46,12 +52,13 @@ data:
         'Upgrade health check. Make exactly these read-only tool calls, one each, and then reply with one line per call '
         'in the form "<tool>: OK" or "<tool>: FAILED <reason>": '
         '1) hindsight recall for "gbrain upgrade"; '
-        '2) the gbrain MCP search tool for "Dux Soup"; '
-        '3) the flux MCP tool that lists Flux Kustomizations (or Kubernetes namespaces); '
+        '2) the gbrain MCP tool named search with arguments {"query": "Dux Soup"}; '
+        '3) the flux MCP tool get_kubernetes_resources with arguments {"apiVersion": "kustomize.toolkit.fluxcd.io/v1", "kind": "Kustomization", "namespace": "flux-system"}; '
         '4) the hermes-msg MCP tool that lists channels or recent messages; '
         '5) the Notion MCP search for "Cloudflare"; '
         '6) the HubSpot MCP tool that returns user details; '
-        '7) the GitHub MCP tool that returns the authenticated user. '
+        '7) the GitHub MCP tool that returns the authenticated user; '
+        '8) hindsight reflect on "what is the state of the brain upgrade" (say how long it took). '
         'Do not write, send or change anything.'
     )
     t0 = time.time()
@@ -93,7 +100,7 @@ metadata:
   annotations:
     kustomize.toolkit.fluxcd.io/force: enabled
 spec:
-  activeDeadlineSeconds: 900
+  activeDeadlineSeconds: 1800
   ttlSecondsAfterFinished: 86400
   backoffLimit: 0
   template:
@@ -117,7 +124,9 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "v2026.8.27"
+              value: "v2026.9.14"
+            - name: CHECK_DELAY
+              value: "300"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: API_SERVER_KEY
