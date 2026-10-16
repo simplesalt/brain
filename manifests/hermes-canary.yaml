@@ -306,6 +306,30 @@ spec:
             - name: team-roster
               mountPath: /secrets/team-roster
               readOnly: true
+        - name: patch-tool-bridge
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:e0df6adebddf29b91112aefc999d4aaf6846c9eb544faca5672a16a13590ff79
+          command: ["python3", "-c"]
+          args:
+            - |
+              import pathlib, re, shutil
+              src = pathlib.Path('/opt/hermes/tools/tool_search.py')
+              dst = pathlib.Path('/patched/tool_search.py')
+              text = src.read_text()
+              pat = re.compile(r'"arguments":\s*\{\s*"type":\s*"object",\s*"description":\s*"[^"]*",?\s*\}')
+              new = ('"arguments": {"type": "string", "description": '
+                     '"The tool\'s arguments as a JSON object encoded in a string, matching its schema, '
+                     'e.g. \\"{\\\\\\"query\\\\\\": \\\\\\"x\\\\\\"}\\"."}')
+              hits = len(pat.findall(text))
+              if hits == 1:
+                  dst.write_text(pat.sub(lambda m: new, text))
+                  print('patch-tool-bridge: tool_call arguments declared as a JSON string')
+              else:
+                  shutil.copyfile(src, dst)
+                  print(f'patch-tool-bridge: WARNING expected 1 bridge arguments schema, found {hits}; image file used unchanged')
+              compile(dst.read_text(), str(dst), 'exec')
+          volumeMounts:
+            - name: patched-code
+              mountPath: /patched
       containers:
         - name: hermes-agent
           image: docker.io/nousresearch/hermes-agent:latest@sha256:e0df6adebddf29b91112aefc999d4aaf6846c9eb544faca5672a16a13590ff79
@@ -385,6 +409,10 @@ spec:
               mountPath: /opt/data
             - name: secret-env
               mountPath: /run/secret-env
+            - name: patched-code
+              mountPath: /opt/hermes/tools/tool_search.py
+              subPath: tool_search.py
+              readOnly: true
       volumes:
         - name: home
           emptyDir:
@@ -400,6 +428,8 @@ spec:
           secret:
             secretName: team-roster
             optional: true
+        - name: patched-code
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

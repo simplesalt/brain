@@ -136,7 +136,7 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "canary-v2026.8.27"
+              value: "canary-v2026.8.27-patched"
             - name: HERMES_URL
               value: "http://hermes-canary-web:8642"
             - name: CHECK_DELAY
