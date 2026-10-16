@@ -78,7 +78,7 @@ spec:
                   echo "${1}_${t}=${n}"
                 done
                 v=$(q "SELECT coalesce(string_agg(version_num, ','), 'none') FROM alembic_version") || v=unavailable
-                echo "${1}_alembic_version=${v}"
+                echo "${1}__alembic_head=${v}"
               }
 
               case "$DUMP_LABEL" in
@@ -145,7 +145,7 @@ spec:
               echo "hindsight-pg-dump: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           env:
             - name: DUMP_LABEL
-              value: "pre-0.8.6"
+              value: "pre-0.9.2"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -265,7 +265,7 @@ spec:
               pg_restore --host="$PGHOST" --dbname="$RESTORE_DB" --no-owner --no-privileges --exit-on-error --single-transaction --no-password "$file" \
                 || fail "pg_restore failed"
 
-              for line in $(grep '^before_' "$info" | grep -v '^before_alembic_version='); do
+              for line in $(grep '^before_' "$info" | grep -v '^before__alembic_head='); do
                 t=${line#before_}; t=${t%%=*}
                 b=${line#*=}
                 a=$(grep "^after_${t}=" "$info" | cut -d= -f2-)
@@ -276,7 +276,7 @@ spec:
                 echo "  $t: restored=$r live=$b..$a $v"
               done
               rv=$(rq "SELECT coalesce(string_agg(version_num, ','), 'none') FROM alembic_version")
-              bv=$(grep '^before_alembic_version=' "$info" | cut -d= -f2-)
+              bv=$(grep '^before__alembic_head=' "$info" | cut -d= -f2-)
               if [ "$rv" = "$bv" ]; then v=ok; else v=MISMATCH; status=FAIL; fi
               echo "  alembic_version: restored=$rv live=$bv $v"
               rt=$(rq "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
@@ -304,7 +304,7 @@ spec:
                   name: gbrain-pg-rehearsal-app
                   key: password
             - name: DUMP_LABEL
-              value: "pre-0.8.6"
+              value: "pre-0.9.2"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
