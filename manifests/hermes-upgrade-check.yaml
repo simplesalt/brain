@@ -36,10 +36,22 @@ data:
             break
         time.sleep(10)
 
-    for p in ['/health', '/health/detailed', '/v1/models', '/v1/toolsets']:
+    for p in ['/health', '/health/detailed', '/v1/models']:
         s, b = call(p)
         print(f'== GET {p} -> {s}')
         print(b[:3000])
+    s, b = call('/v1/toolsets')
+    print(f'== GET /v1/toolsets -> {s}')
+    try:
+        total = 0
+        for ts in json.loads(b).get('data', []):
+            n = len(ts.get('tools') or [])
+            if ts.get('enabled'):
+                total += n
+            print(f"toolset {ts.get('name')}: enabled={ts.get('enabled')} tools={n}")
+        print(f'enabled tool total: {total}')
+    except Exception as e:
+        print('toolsets parse failed', e, b[:500])
 
     s, b = call('/v1/models')
     try:
@@ -124,7 +136,7 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "v2026.9.14-b"
+              value: "rollback-v2026.7.1"
             - name: CHECK_DELAY
               value: "300"
             - name: PYTHONUNBUFFERED
