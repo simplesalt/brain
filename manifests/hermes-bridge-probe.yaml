@@ -13,7 +13,7 @@ data:
 
     KEY = os.environ['OPENROUTER_API_KEY']
     MODEL = os.environ.get('PROBE_MODEL', 'minimax/minimax-m2.7')
-    TRIALS = int(os.environ.get('PROBE_TRIALS', '4'))
+    TRIALS = int(os.environ.get('PROBE_TRIALS', '3'))
 
     def bridge(args_schema):
         return {'type': 'function', 'function': {
@@ -47,18 +47,25 @@ data:
         except Exception as e:
             return {'error': repr(e)}
 
-    for vname, schema in VARIANTS.items():
+    ROUTES = {
+        'ignore_groq': {'ignore': ['groq']},
+        'only_minimax': {'only': ['minimax']},
+        'only_novita': {'only': ['novita']},
+        'only_gmicloud': {'only': ['gmicloud']},
+        'only_atlas': {'only': ['atlas-cloud']},
+    }
+    for rname, route in ROUTES.items():
         for i in range(TRIALS):
             body = {'model': MODEL, 'messages': [{'role': 'user', 'content': PROMPT}],
-                    'tools': [bridge(schema)], 'tool_choice': 'required', 'max_tokens': 800}
+                    'tools': [bridge(VARIANTS['A_object_no_props'])], 'tool_choice': 'required',
+                    'max_tokens': 800, 'provider': route}
             r = post(body)
             if 'error' in r:
-                print(f'{vname} #{i}: ERROR {r}')
+                print(f'{rname} #{i}: ERROR {str(r)[:300]}')
                 continue
-            prov = r.get('provider')
             calls = ((r.get('choices') or [{}])[0].get('message') or {}).get('tool_calls') or []
             raw = calls[0]['function']['arguments'] if calls else None
-            print(f'{vname} #{i}: provider={prov} raw_arguments={raw}')
+            print(f"{rname} #{i}: provider={r.get('provider')} raw_arguments={raw}")
     print('== probe done')
 ---
 apiVersion: batch/v1
@@ -97,7 +104,7 @@ spec:
           command: ["python3", "/probe/probe.py"]
           env:
             - name: PROBE_RUN
-              value: "1"
+              value: "2"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: OPENROUTER_API_KEY
