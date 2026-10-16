@@ -34,8 +34,8 @@ data:
     }
     function title(o) {
       const p = o.properties || {};
-      for (const v of Object.values(p)) if (v?.type === 'title') return (v.title || []).map(x => x.plain_text).join('');
-      return (o.title || []).map(x => x.plain_text).join('');
+      for (const v of Object.values(p)) if (v?.type === 'title' && Array.isArray(v.title)) return v.title.map(x => x.plain_text).join('');
+      return Array.isArray(o.title) ? o.title.map(x => x.plain_text).join('') : '';
     }
     function show(label, r) {
       if (r.err || !r.json) { console.log(`${label}: ERROR ${String(r.text).slice(0, 300)}`); return; }
@@ -44,6 +44,11 @@ data:
       for (const o of res) console.log(`  ${o.object} ${o.id} "${title(o)}" parent=${JSON.stringify(o.parent)}`);
     }
     show('search "Cloudflare Connect"', await call('API-post-search', { query: 'Cloudflare Connect', page_size: 20 }));
+    show('databases matching "Cloudflare Connect"', await call('API-post-search', { query: 'Cloudflare Connect', page_size: 20, filter: { property: 'object', value: 'data_source' } }));
+    show('databases matching "Connect"', await call('API-post-search', { query: 'Connect', page_size: 20, filter: { property: 'object', value: 'data_source' } }));
+    show('pages matching "Cloudflare Connect 2026"', await call('API-post-search', { query: 'Cloudflare Connect 2026', page_size: 5, filter: { property: 'object', value: 'page' } }));
+    const kids = await call('API-get-block-children', { block_id: '3c8e6a5b977980d8a232ccb63cc3a1a2', page_size: 100 });
+    console.log('child databases of Cloudflare Connect 2026: ' + (kids.json ? kids.json.results.filter(b => b.type === 'child_database').map(b => `${b.id} "${b.child_database.title}"`).join(', ') : 'ERROR ' + String(kids.text).slice(0, 300)));
     show('search "Connect Prep Tasks"', await call('API-post-search', { query: 'Connect Prep Tasks', page_size: 20 }));
     show('page Cloudflare Connect 2026', await call('API-retrieve-a-page', { page_id: '3c8e6a5b977980d8a232ccb63cc3a1a2' }));
     show('data source Connect Prep Tasks', await call('API-retrieve-a-data-source', { data_source_id: '6f5ebffa-24c5-46ae-9dd6-1b5996ea8809' }));
@@ -64,7 +69,7 @@ data:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: notion-visibility-check-2
+  name: notion-visibility-check-3
   namespace: ssint-main-ai
   labels:
     entity: ssint
