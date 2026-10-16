@@ -124,9 +124,9 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "v2026.9.14"
+              value: "v2026.8.27-b"
             - name: CHECK_DELAY
-              value: "300"
+              value: "0"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: API_SERVER_KEY
