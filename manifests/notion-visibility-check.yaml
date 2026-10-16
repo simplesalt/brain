@@ -19,7 +19,11 @@ data:
       const line = text.split('\n').filter(l => l.startsWith('data:')).pop();
       return { sid: r.headers.get('mcp-session-id') || sid, msg: line ? JSON.parse(line.slice(5)) : (text ? JSON.parse(text) : null) };
     }
-    const init = await rpc(null, 1, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'check', version: '1' } });
+    let init;
+    for (let i = 0; ; i++) {
+      try { init = await rpc(null, 1, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'check', version: '1' } }); break; }
+      catch (e) { if (i >= 11) throw e; console.log('proxy not reachable yet: ' + (e.cause?.code || e.message)); await new Promise(r => setTimeout(r, 10000)); }
+    }
     const sid = init.sid;
     await rpc(sid, null, 'notifications/initialized', {});
     let n = 10;
@@ -60,7 +64,7 @@ data:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: notion-visibility-check-1
+  name: notion-visibility-check-2
   namespace: ssint-main-ai
   labels:
     entity: ssint
