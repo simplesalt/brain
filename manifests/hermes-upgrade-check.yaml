@@ -136,7 +136,7 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "v2026.9.14-patched"
+              value: "v2026.9.21"
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: CHECK_DELAY
