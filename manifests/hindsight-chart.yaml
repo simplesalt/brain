@@ -37,7 +37,7 @@ spec:
     timeout: 20m
   values:
     image:
-      digest: "sha256:ffa391a77284e49f6b55e32c86f33529ac4257831407b14038a72b6a0a232039"
+      digest: "sha256:84ab276b8f501546deb6ea9c64a57291718b4e16a59dd9e02a02fdd5adfe9028"
   postRenderers:
     - kustomize:
         patches:
@@ -52,3 +52,10 @@ spec:
                     port: 8888
                   periodSeconds: 10
                   failureThreshold: 90
+              - op: add
+                path: /spec/strategy
+                value:
+                  type: RollingUpdate
+                  rollingUpdate:
+                    maxSurge: 0
+                    maxUnavailable: 1
