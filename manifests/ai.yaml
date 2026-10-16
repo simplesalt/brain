@@ -476,7 +476,7 @@ spec:
                 });
               })();
         - name: install-cli-tools
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:6bece0644e29a347e5ae17db43c36938c86f171c6f5e0cef18aa2075d331f3a3
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -612,7 +612,7 @@ spec:
               mountPath: /seed
               readOnly: true
         - name: seed-hermes-config
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:6bece0644e29a347e5ae17db43c36938c86f171c6f5e0cef18aa2075d331f3a3
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -736,7 +736,7 @@ spec:
               mountPath: /secrets/team-roster
               readOnly: true
         - name: patch-tool-bridge
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:6bece0644e29a347e5ae17db43c36938c86f171c6f5e0cef18aa2075d331f3a3
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
           command: ["python3", "-c"]
           args:
             - |
@@ -761,7 +761,7 @@ spec:
               mountPath: /patched
       containers:
         - name: hermes-agent
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:6bece0644e29a347e5ae17db43c36938c86f171c6f5e0cef18aa2075d331f3a3
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
           imagePullPolicy: IfNotPresent
           args:
             - gateway

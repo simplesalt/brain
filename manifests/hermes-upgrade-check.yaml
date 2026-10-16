@@ -136,11 +136,11 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "v2026.9.21"
+              value: "v2026.9.24"
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: CHECK_DELAY
-              value: "300"
+              value: "240"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: API_SERVER_KEY
