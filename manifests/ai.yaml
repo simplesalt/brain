@@ -101,7 +101,7 @@ data:
     const b64url = s => Buffer.from(s).toString('base64url');
     const now = Math.floor(Date.now() / 1000);
     const unsigned = `${b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: process.env.GOOGLE_PRIVATE_KEY_ID ?? '' }))}.${b64url(JSON.stringify({
-      iss, sub, scope: 'https://www.googleapis.com/auth/gmail.modify',
+      iss, sub, scope: 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.events',
       aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600,
     }))}`;
     const jwt = `${unsigned}.${createSign('RSA-SHA256').update(unsigned).sign(privKey, 'base64url')}`;
@@ -186,29 +186,39 @@ spec:
                 || echo "WARN: config set facts.extraction_model failed (non-fatal)"
               $GBRAIN config set cycle.conversation_facts_backfill.enabled true \
                 || echo "WARN: config set cycle.conversation_facts_backfill.enabled failed (non-fatal)"
-              GMAIL_SOURCE=""
+              $GBRAIN config set cycle.enrich_thin.enabled true \
+                || echo "WARN: config set cycle.enrich_thin.enabled failed (non-fatal)"
+              $GBRAIN config set cycle.enrich_thin.max_cost_usd 1000000 \
+                || echo "WARN: config set cycle.enrich_thin.max_cost_usd failed (non-fatal)"
+              $GBRAIN config set cycle.enrich_thin.max_total_cost_usd 1000000 \
+                || echo "WARN: config set cycle.enrich_thin.max_total_cost_usd failed (non-fatal)"
+              GOOGLE_SOURCES=""
               if [ -n "$WORK_EMAIL" ] && [ -n "$GOOGLE_CLIENT_EMAIL" ] && [ -n "$GOOGLE_PRIVATE_KEY_B64" ]; then
-                if $GBRAIN sources list 2>/dev/null | grep -qw gmail; then
-                  GMAIL_SOURCE=gmail
-                elif $GBRAIN sources add gmail --kind google --account "$WORK_EMAIL" --services gmail \
-                    --history-days 90 --dir /install/google-gmail \
-                    --access command --token-command "bun /google/google-token.mjs"; then
-                  GMAIL_SOURCE=gmail
-                else
-                  echo "WARN: gbrain gmail source add failed (non-fatal)"
-                fi
+                EXISTING="$($GBRAIN sources list 2>/dev/null)"
+                for svc in gmail:gmail gcal:calendar; do
+                  id="${svc%%:*}"; service="${svc#*:}"
+                  if echo "$EXISTING" | grep -qw "$id"; then
+                    GOOGLE_SOURCES="$GOOGLE_SOURCES,$id"
+                  elif $GBRAIN sources add "$id" --kind google --account "$WORK_EMAIL" --services "$service" \
+                      --history-days 90 --dir "/install/google-$id" \
+                      --access command --token-command "bun /google/google-token.mjs"; then
+                    GOOGLE_SOURCES="$GOOGLE_SOURCES,$id"
+                  else
+                    echo "WARN: gbrain $id source add failed (non-fatal)"
+                  fi
+                done
               fi
-              GMAIL_SOURCE="$GMAIL_SOURCE" bun -e '
+              GOOGLE_SOURCES="${GOOGLE_SOURCES#,}" bun -e '
                 import { SQL } from "bun";
                 const t = process.env.GBRAIN_REMOTE_TOKEN;
                 if (!t) { console.error("FATAL: GBRAIN_REMOTE_TOKEN unset"); process.exit(1); }
                 const h = new Bun.CryptoHasher("sha256").update(t).digest("hex");
                 const db = new SQL(process.env.DATABASE_URL);
                 await db`INSERT INTO access_tokens (name, token_hash) VALUES (${"hermes-mcp"}, ${h}) ON CONFLICT (token_hash) DO NOTHING`;
-                if (process.env.GMAIL_SOURCE) {
-                  const grant = JSON.stringify({ source_id: ["default", process.env.GMAIL_SOURCE] });
+                if (process.env.GOOGLE_SOURCES) {
+                  const grant = JSON.stringify({ source_id: ["default", ...process.env.GOOGLE_SOURCES.split(",")] });
                   await db`UPDATE access_tokens SET permissions = (CASE WHEN jsonb_typeof(permissions) = ${"object"} THEN permissions ELSE ${"{}"}::jsonb END) || ${grant}::jsonb WHERE name = ${"hermes-mcp"}`;
-                  console.log("gbrain: hermes-mcp granted read on " + process.env.GMAIL_SOURCE);
+                  console.log("gbrain: hermes-mcp granted read on " + process.env.GOOGLE_SOURCES);
                 }
                 await db.end();
                 console.log("gbrain: hermes-mcp bearer asserted");
