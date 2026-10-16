@@ -217,7 +217,7 @@ spec:
                 await db`INSERT INTO access_tokens (name, token_hash) VALUES (${"hermes-mcp"}, ${h}) ON CONFLICT (token_hash) DO NOTHING`;
                 if (process.env.GOOGLE_SOURCES) {
                   const sources = "default," + process.env.GOOGLE_SOURCES;
-                  await db`UPDATE access_tokens SET permissions = (CASE WHEN jsonb_typeof(permissions) = ${"object"} THEN permissions ELSE ${"{}"}::jsonb END) || jsonb_build_object(${"source_id"}::text, to_jsonb(string_to_array(${sources}::text, ${","}::text))) WHERE name = ${"hermes-mcp"}`;
+                  await db`UPDATE access_tokens SET permissions = (CASE WHEN jsonb_typeof(permissions) = ${"object"} THEN permissions ELSE jsonb_build_object() END) || jsonb_build_object(${"source_id"}::text, to_jsonb(string_to_array(${sources}::text, ${","}::text))) WHERE name = ${"hermes-mcp"}`;
                   const [row] = await db`SELECT jsonb_typeof(permissions) AS t, permissions->${"source_id"} AS s FROM access_tokens WHERE name = ${"hermes-mcp"}`;
                   console.log("gbrain: hermes-mcp permissions " + row?.t + " source_id=" + JSON.stringify(row?.s));
                   console.log("gbrain: hermes-mcp granted read on " + process.env.GOOGLE_SOURCES);
