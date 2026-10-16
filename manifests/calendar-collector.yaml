@@ -624,6 +624,7 @@ metadata:
     capability: ai
 spec:
   schedule: "*/15 * * * *"
+  suspend: true
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 5
@@ -709,7 +710,7 @@ metadata:
     env: main
     capability: ai
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: calendar-ingestion-health
