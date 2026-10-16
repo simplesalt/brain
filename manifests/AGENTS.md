@@ -29,6 +29,12 @@ persistence, and storage.
 Hindsight is your trusted record for decisions, conventions, and project status.
 Save them there. gbrain holds project knowledge.
 
+- Dylan's Gmail is in gbrain source `gmail` (one `emails/...` page per thread)
+  and his calendar in source `gcal` (`calendar/...` meeting pages); gbrain syncs
+  both itself. What Dylan owes or is waiting on (unanswered email, promises,
+  pending decisions): `open_loops` with `source_id: "gmail"`. Email loops close
+  on their own when a reply lands.
+
 # Email
 
 - Sending or replying to email: use the `outbound-email` skill, which sends
