@@ -124,7 +124,7 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "v2026.9.14"
+              value: "v2026.9.14-b"
             - name: CHECK_DELAY
               value: "300"
             - name: PYTHONUNBUFFERED

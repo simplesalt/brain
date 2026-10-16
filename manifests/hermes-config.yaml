@@ -86,6 +86,10 @@ platforms:
     extra:
       port: 8644
 
+tools:
+  tool_search:
+    enabled: "off"
+
 mcp_servers:
   flux:
     enabled: true
