@@ -35,6 +35,7 @@ configMapGenerator:
       - skill-github-projects--gh_projects.py=manifests/hermes-skills/github-projects--gh_projects.py
       - skill-note-capture.md=manifests/hermes-skills/note-capture.md
       - skill-catch-up.md=manifests/hermes-skills/catch-up.md
+      - skill-clarify.md=manifests/hermes-skills/clarify.md
       - SOUL.md=manifests/SOUL.md
       - AGENTS.md=manifests/AGENTS.md
   - name: lease-sweep-script
