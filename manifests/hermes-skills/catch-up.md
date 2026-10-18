@@ -15,9 +15,10 @@ blocks. Nothing here is pushed to him unprompted.
   `id`, `loop_type` (`unanswered_inbound`, `unanswered_outbound`,
   `commitment_owed_by_me`, `commitment_owed_to_me`, `decision_pending`),
   `summary`, `counterparty_email`, `due_at` and `page_slug` (the email thread).
-- Note questions: `mcp_gbrain_list_pages` with `{"tag": "follow-up", "limit": 100}`;
+- Notes: `mcp_gbrain_list_pages` with `{"tag": "follow-up", "limit": 100}`;
   for each page, `mcp_gbrain_get_page` and take every `- [ ]` line under
-  `## Open questions`.
+  `## Action items` (to check on: is it done, still on track, or stuck?) and
+  under `## Open questions` (to answer).
 
 Skip loops that are clearly not his to act on (receipts, automated notices,
 newsletters): close them with `mcp_gbrain_mail_loops_close`
@@ -29,7 +30,8 @@ at the end, not one by one.
 Put every item in exactly one cluster, the thing he would have in his head while
 answering it:
 
-- all open questions on one note page form one cluster;
+- all open action items and questions on one note page form one cluster,
+  together with any email loop about the same meeting or task;
 - loops on the same email thread (`page_slug`) or with the same person or company
   form one cluster;
 - scheduling (meeting times, invites, reschedules) forms its own cluster;
@@ -65,6 +67,7 @@ so nothing repeats.
 - Decision or commitment handled, or one he drops:
   `mcp_gbrain_mail_loops_close` `{"id": <id>, "status": "done"}` (or `"dropped"`),
   with a short `note`.
-- Note question answered: follow step 5 of the `note-capture` skill.
+- Note question answered, or note action item done: follow step 5 of the
+  `note-capture` skill.
 
 End each batch with what was done in one line and how many items remain.
