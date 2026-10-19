@@ -516,10 +516,18 @@ spec:
                 fi
               fi
 
+              SS_SKILLS_SHA=c88c82c28a7b23380b38c3fcb13c26f550baa50d
+              rm -rf /tmp/ss-skills && mkdir -p /tmp/ss-skills \
+                && curl -fsSL "https://github.com/simplesalt/skills/archive/${SS_SKILLS_SHA}.tar.gz" \
+                  | tar -xz -C /tmp/ss-skills --strip-components=1 "skills-${SS_SKILLS_SHA}/skills" \
+                && echo "simplesalt skills fetched at $SS_SKILLS_SHA" \
+                || echo "ERROR: simplesalt skills fetch failed"
+
               python3 -c '
               import os, re, shutil, yaml
 
               seed_path = "/seed/skills.yaml"
+              ss_root = "/tmp/ss-skills/skills"
               bundled_root = "/opt/hermes/skills"
               skills_root = "/opt/data/skills"
               marker_path = "/opt/data/.no-bundled-skills"
@@ -555,13 +563,14 @@ spec:
                   gbrain = allow["gbrain"]
                   bundled = allow["bundled"]
                   local = allow.get("local") or []
-                  for names in (gbrain, bundled, local):
+                  simplesalt = allow.get("simplesalt") or []
+                  for names in (gbrain, bundled, local, simplesalt):
                       if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
-                          raise ValueError("gbrain, bundled and local must be lists of skill names")
+                          raise ValueError("gbrain, bundled, local and simplesalt must be lists of skill names")
               except Exception as e:
                   print("ERROR: cannot read allow-list %s (%s); removing all skills" % (seed_path, e))
-                  gbrain, bundled, local = [], [], []
-              allowed = set(gbrain) | set(bundled) | set(local)
+                  gbrain, bundled, local, simplesalt = [], [], [], []
+              allowed = set(gbrain) | set(bundled) | set(local) | set(simplesalt)
 
               os.makedirs(skills_root, exist_ok=True)
               for name in local:
@@ -578,6 +587,12 @@ spec:
                               target = os.path.join(dest, "scripts", extra[len(prefix):])
                               shutil.copyfile(os.path.join("/seed", extra), target)
                               os.chmod(target, 0o755)
+              for name in simplesalt:
+                  src = os.path.join(ss_root, name)
+                  if os.path.isfile(os.path.join(src, "SKILL.md")):
+                      dest = os.path.join(skills_root, "simplesalt-skills", name)
+                      shutil.rmtree(dest, ignore_errors=True)
+                      shutil.copytree(src, dest)
               for src in skill_dirs(bundled_root):
                   if src != bundled_root and skill_name(src) in bundled:
                       dest = os.path.join(skills_root, os.path.relpath(src, bundled_root))
@@ -595,19 +610,19 @@ spec:
 
               open(marker_path, "w").close()
 
-              kept = {"gbrain": set(), "bundled": set(), "local": set()}
+              kept = {"gbrain": set(), "bundled": set(), "local": set(), "simplesalt": set()}
               for d in skill_dirs(skills_root):
                   name = skill_name(d)
-                  kept["gbrain" if name in gbrain else "local" if name in local else "bundled"].add(name)
+                  kept["gbrain" if name in gbrain else "local" if name in local else "simplesalt" if name in simplesalt else "bundled"].add(name)
               missing = 0
-              for kind, names in (("gbrain", gbrain), ("bundled", bundled), ("local", local)):
+              for kind, names in (("gbrain", gbrain), ("bundled", bundled), ("local", local), ("simplesalt", simplesalt)):
                   for name in names:
                       if name in kept[kind]:
                           print("kept %s skill: %s" % (kind, name))
                       else:
                           missing += 1
                           print("ERROR: allow-listed %s skill missing: %s" % (kind, name))
-              print("skills: kept %d gbrain, %d bundled, %d local; removed %d; missing %d" % (len(kept["gbrain"]), len(kept["bundled"]), len(kept["local"]), removed, missing))
+              print("skills: kept %d gbrain, %d bundled, %d local, %d simplesalt; removed %d; missing %d" % (len(kept["gbrain"]), len(kept["bundled"]), len(kept["local"]), len(kept["simplesalt"]), removed, missing))
 
               chown_tree(skills_root)
               os.lchown(marker_path, owner, owner)

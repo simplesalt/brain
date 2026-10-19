@@ -47,14 +47,13 @@ Write Dylan one message with three parts:
    - for each action item without one: who owns it, and when it is due;
    - where it should be filed, if it is not clearly about one company or project.
 
-Load the `clarify` skill and ask the way it describes: what the note is meant
-to achieve (decisions, action items) is its What, what you settled in step 2 is
-its Where, and the missing items are its Gaps (only Dylan can settle them) and
-Unknowns (a check could settle them; run the check before asking). This skill
-has no Effort record: wherever `clarify` says to record or resolve a Gap or
-Unknown, record it on the note page instead (step 4 for open ones, step 5 when
-settled). Do not ask about anything step 2 already settled unless it is
-ambiguous.
+Load the `clarify` skill and ask the way it describes. In its terms, why the
+note was taken is the Why, its decisions and action items are the What, what
+you settled in step 2 is the Where, and the action items' owners and dates are
+the How. Its running record is the note page itself: every open gap is an open
+question (step 4) and every settled one is checked off with its answer
+(step 5). Settle anything a check can settle before asking, and do not ask
+about anything step 2 already settled unless it is ambiguous.
 
 If Dylan answers some and not others, or says "later", stop asking and file with
 everything still open recorded in step 4. Never drop an unanswered question and
