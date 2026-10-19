@@ -90,6 +90,18 @@ Change a row's properties with `mcp_notion_API_patch_page`:
 {"page_id": "<id>", "properties": {"Status": {"status": {"name": "Done"}}}}
 ```
 
+## Assign a task to Hermes
+
+When a task is yours, put yourself in its person field (Responsible, Assignee or
+Assign, whichever the database has). Your Notion user is the bot "hermes",
+`3fae6a5b-9779-81dc-b16a-00274d0fda37`. Notion's people picker doesn't list bots, so
+Dylan can't pick you there, but the API takes your ID:
+```json
+{"page_id": "<id>", "properties": {"Responsible": {"people": [{"id": "3fae6a5b-9779-81dc-b16a-00274d0fda37"}]}}}
+```
+Use the same `people` value when creating the row. Tasks for Dylan or Russell keep
+their own person IDs; find them with `mcp_notion_API_get_users`.
+
 ## Create a page
 
 Under a page: `mcp_notion_API_post_page` with
