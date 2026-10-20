@@ -38,7 +38,7 @@ data:
             'tools': [{'type': 'function', 'function': {
                 'name': 'tool_call', 'description': 'Invoke deferred tools.',
                 'parameters': {'type': 'object', 'properties': {'calls': schema}, 'required': ['calls']}}}],
-            'tool_choice': {'type': 'function', 'function': {'name': 'tool_call'}},
+            'tool_choice': 'auto',
             'max_tokens': 800,
         }
         req = urllib.request.Request('https://openrouter.ai/api/v1/chat/completions', data=json.dumps(body).encode())
@@ -61,7 +61,7 @@ data:
 
     for vname, schema in VARIANTS.items():
         for pname, prompt in PROMPTS.items():
-            for i in range(3):
+            for i in range(5):
                 print(f'{vname} | {pname} | try {i + 1}: {ask(schema, prompt)}', flush=True)
     print('== probe done')
 ---
