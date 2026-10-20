@@ -22,7 +22,7 @@ data:
     }
     VARIANTS = {
         'live (calls: array)': {"type": "array", "items": ENTRY},
-        'fix (calls: array or string)': {"anyOf": [{"type": "array", "items": ENTRY}, {"type": "string"}]},
+        'fix (calls: type [array, string])': {"type": ["array", "string"], "items": ENTRY},
     }
     PROMPTS = {
         'string calls': ('Call tool_call exactly once. Set its "calls" parameter to a JSON-encoded STRING, not an array: '
