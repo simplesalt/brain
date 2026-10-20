@@ -7,6 +7,7 @@ resources:
   - manifests/hindsight-chart.yaml
   - manifests/hindsight-pg-dump.yaml
   - manifests/hermes-upgrade-check.yaml
+  - manifests/hermes-schema-probe.yaml
   - manifests/big-agi.yaml
   - manifests/hermes-proxy.yaml
   - manifests/hermes-connectors.yaml

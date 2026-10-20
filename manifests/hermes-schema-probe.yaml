@@ -1,0 +1,127 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-schema-probe-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  probe.py: |
+    import json, os, urllib.request
+
+    KEY = os.environ['OPENROUTER_API_KEY']
+    ENTRY = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Exact tool name to invoke."},
+            "arguments": {"type": "string", "description": "The tool's arguments as a JSON object encoded in a string."},
+        },
+        "required": ["name", "arguments"],
+    }
+    VARIANTS = {
+        'live (calls: array)': {"type": "array", "items": ENTRY},
+        'fix (calls: array or string)': {"anyOf": [{"type": "array", "items": ENTRY}, {"type": "string"}]},
+    }
+    PROMPTS = {
+        'string calls': ('Call tool_call exactly once. Set its "calls" parameter to a JSON-encoded STRING, not an array: '
+                         'the string \'[{"name":"mcp__gbrain__search","arguments":"{\\"query\\":\\"Dux Soup\\"}"}]\'.'),
+        'array calls': 'Use tool_call to run the tool mcp__gbrain__search with query "Dux Soup".',
+    }
+
+    def ask(schema, prompt):
+        body = {
+            'model': 'minimax/minimax-m2.7',
+            'provider': {'only': ['groq'], 'allow_fallbacks': False},
+            'messages': [{'role': 'user', 'content': prompt}],
+            'tools': [{'type': 'function', 'function': {
+                'name': 'tool_call', 'description': 'Invoke deferred tools.',
+                'parameters': {'type': 'object', 'properties': {'calls': schema}, 'required': ['calls']}}}],
+            'tool_choice': {'type': 'function', 'function': {'name': 'tool_call'}},
+            'max_tokens': 800,
+        }
+        req = urllib.request.Request('https://openrouter.ai/api/v1/chat/completions', data=json.dumps(body).encode())
+        req.add_header('Authorization', 'Bearer ' + KEY)
+        req.add_header('Content-Type', 'application/json')
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                d = json.loads(r.read())
+            tc = (d['choices'][0]['message'].get('tool_calls') or [{}])[0]
+            args = (tc.get('function') or {}).get('arguments', '')
+            try:
+                calls = json.loads(args).get('calls')
+            except Exception:
+                calls = None
+            return f'ACCEPTED calls is {type(calls).__name__}: {args[:160]}'
+        except urllib.error.HTTPError as e:
+            return f'REJECTED {e.code}: {e.read().decode(errors="replace")[:300]}'
+        except Exception as e:
+            return f'ERROR {e!r}'
+
+    for vname, schema in VARIANTS.items():
+        for pname, prompt in PROMPTS.items():
+            for i in range(3):
+                print(f'{vname} | {pname} | try {i + 1}: {ask(schema, prompt)}', flush=True)
+    print('== probe done')
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hermes-schema-probe
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: hermes-schema-probe
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: python:3.12-alpine
+          command: ["python3", "/probe/probe.py"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: GENERAL_API_LLM_API_KEY
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: script
+              mountPath: /probe
+      volumes:
+        - name: script
+          configMap:
+            name: hermes-schema-probe-script
