@@ -154,13 +154,13 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "network-errors-2026-10-20"
+              value: "network-errors-fix-2026-10-20"
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: PROXY_URL
               value: "http://hermes-proxy:8000"
             - name: CHECK_DELAY
-              value: "0"
+              value: "60"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: API_SERVER_KEY
