@@ -14,8 +14,10 @@ data:
     BASE = os.environ.get('HERMES_URL', 'http://hermes-agent-web:8642')
     KEY = os.environ['API_SERVER_KEY']
 
-    def call(path, body=None, timeout=60, stream=False):
-        req = urllib.request.Request(BASE + path, method='POST' if body is not None else 'GET')
+    PROXY = os.environ.get('PROXY_URL', '')
+
+    def call(path, body=None, timeout=60, stream=False, base=None):
+        req = urllib.request.Request((base or BASE) + path, method='POST' if body is not None else 'GET')
         req.add_header('Authorization', 'Bearer ' + KEY)
         if body is not None:
             req.add_header('Content-Type', 'application/json')
@@ -23,7 +25,16 @@ data:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 if stream:
-                    return r.status, [l.decode(errors='replace').rstrip() for l in r]
+                    out, last, gap = [], time.time(), 0.0
+                    try:
+                        for l in r:
+                            now = time.time()
+                            gap, last = max(gap, now - last), now
+                            out.append(l.decode(errors='replace').rstrip())
+                    except Exception as e:
+                        out.append(f'STREAM BROKE after {len(out)} lines: {e!r}')
+                    out.append(f'max gap between stream lines: {gap:.0f}s')
+                    return r.status, out
                 return r.status, r.read().decode(errors='replace')
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode(errors='replace')
@@ -73,31 +84,38 @@ data:
         '8) hindsight reflect on "what is the state of the brain upgrade" (say how long it took). '
         'Do not write, send or change anything.'
     )
-    t0 = time.time()
-    s, lines = call('/v1/chat/completions', {
-        'model': model, 'stream': True,
-        'messages': [{'role': 'user', 'content': prompt}],
-    }, timeout=600, stream=True)
-    print(f'== POST /v1/chat/completions (stream) -> {s} in {time.time() - t0:.0f}s')
-    text = []
-    events = 0
-    if isinstance(lines, list):
-        for l in lines:
-            if not l.startswith('data:'):
-                continue
-            events += 1
-            d = l[5:].strip()
-            if d == '[DONE]':
-                break
-            try:
-                for c in json.loads(d).get('choices', []):
-                    text.append((c.get('delta') or {}).get('content') or '')
-            except Exception:
-                pass
-        print(f'stream events: {events}')
-        print(''.join(text)[-4000:])
-    else:
-        print(lines[:3000])
+    for label, base in [('direct', BASE)] + ([('via hermes-proxy', PROXY)] if PROXY else []):
+        t0 = time.time()
+        s, lines = call('/v1/chat/completions', {
+            'model': model, 'stream': True,
+            'messages': [{'role': 'user', 'content': prompt}],
+        }, timeout=600, stream=True, base=base)
+        print(f'== POST /v1/chat/completions (stream, {label}) -> {s} in {time.time() - t0:.0f}s')
+        text = []
+        events = 0
+        if isinstance(lines, list):
+            for l in lines:
+                if l.startswith(('STREAM BROKE', 'max gap')):
+                    print(l)
+                if not l.startswith('data:'):
+                    continue
+                events += 1
+                d = l[5:].strip()
+                if d == '[DONE]':
+                    print('got [DONE]')
+                    continue
+                try:
+                    doc = json.loads(d)
+                    for c in doc.get('choices', []):
+                        text.append((c.get('delta') or {}).get('content') or '')
+                        if c.get('finish_reason'):
+                            print(f"finish_reason: {c['finish_reason']}")
+                except Exception:
+                    pass
+            print(f'stream events: {events}')
+            print(''.join(text)[-4000:])
+        else:
+            print(lines[:3000])
     print('== hermes-upgrade-check done')
 ---
 apiVersion: batch/v1
@@ -136,11 +154,13 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "v2026.9.24"
+              value: "network-errors-2026-10-20"
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
+            - name: PROXY_URL
+              value: "http://hermes-proxy:8000"
             - name: CHECK_DELAY
-              value: "240"
+              value: "0"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: API_SERVER_KEY
