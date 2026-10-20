@@ -774,11 +774,29 @@ spec:
                      'e.g. \\"{\\\\\\"query\\\\\\": \\\\\\"x\\\\\\"}\\"."}')
               hits = len(pat.findall(text))
               if hits == 1:
-                  dst.write_text(pat.sub(lambda m: new, text))
+                  text = pat.sub(lambda m: new, text)
                   print('patch-tool-bridge: tool_call arguments declared as a JSON string')
               else:
-                  shutil.copyfile(src, dst)
-                  print(f'patch-tool-bridge: WARNING expected 1 bridge arguments schema, found {hits}; image file used unchanged')
+                  print(f'patch-tool-bridge: WARNING expected 1 bridge arguments schema, found {hits}; left unchanged')
+              calls = re.compile(r'("calls":\s*\{\s*)"type":\s*"array",')
+              hits = len(calls.findall(text))
+              if hits == 1:
+                  text = calls.sub(lambda m: m.group(1) + '"type": ["array", "string"],', text)
+                  print('patch-tool-bridge: tool_call calls may also arrive as a JSON string')
+              else:
+                  print(f'patch-tool-bridge: WARNING expected 1 bridge calls schema, found {hits}; left unchanged')
+              dst.write_text(text)
+              compile(dst.read_text(), str(dst), 'exec')
+              src = pathlib.Path('/opt/hermes/agent/conversation_loop.py')
+              dst = pathlib.Path('/patched/conversation_loop.py')
+              text = src.read_text()
+              old = 'The previous response was cut off by a network error mid-stream.'
+              if text.count(old) == 1:
+                  text = text.replace(old, 'The previous response was cut off mid-stream.')
+                  print('patch-tool-bridge: a cut-off response is no longer called a network error')
+              else:
+                  print('patch-tool-bridge: WARNING cut-off wording not found; left unchanged')
+              dst.write_text(text)
               compile(dst.read_text(), str(dst), 'exec')
           volumeMounts:
             - name: patched-code
@@ -867,6 +885,10 @@ spec:
             - name: patched-code
               mountPath: /opt/hermes/tools/tool_search.py
               subPath: tool_search.py
+              readOnly: true
+            - name: patched-code
+              mountPath: /opt/hermes/agent/conversation_loop.py
+              subPath: conversation_loop.py
               readOnly: true
       volumes:
         - name: home
