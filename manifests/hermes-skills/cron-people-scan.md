@@ -27,10 +27,8 @@ The script output above lists recent meetings and email threads from gbrain as J
      Source: <item title>, <item date>.
      ```
      Then tag the new page for a LinkedIn lookup: `mcp_gbrain_add_tag` with `{"slug": "<person slug>", "tag": "needs-linkedin"}`, but only if Dylan met them or wrote to them.
-   - Page exists: do not rewrite it. Add `mcp_gbrain_add_timeline_entry` with `{"slug": "<person slug>", "date": "<item date>", "summary": "<met or emailed about what>", "source": "<item slug>"}`.
-4. Link the item to the person: `mcp_gbrain_add_link` with `{"from": "<item slug>", "to": "<person slug>", "link_type": "attendee"}` for a meeting or `"link_type": "participant"` for email, and a short `context`. gbrain later writes a fuller summary for each person from everything linked to them.
-5. When the item is done, even if nobody qualified, mark it: `mcp_gbrain_add_tag` with `{"slug": "<item slug>", "tag": "people-scanned"}`.
+   - For a new page and an existing one alike, record where Dylan met them: `mcp_gbrain_add_timeline_entry` with `{"slug": "<person slug>", "date": "<item date>", "summary": "<met at or emailed about what>", "source": "<item slug>"}`. Never rewrite an existing page.
 
-Rules: use only gbrain tools. Do not search the web, do not send any message or email, and do not change meeting or email pages beyond the tag. If a call fails, fix its arguments from the error and continue with the next item.
+Rules: use only gbrain tools, one call at a time. Do not search the web, do not send any message or email, and do not change meeting or email pages. If a call fails, fix its arguments from the error and continue with the next item.
 
 Finish with one line per item: `<item slug>: created <names>; updated <names>; skipped <reason>`.

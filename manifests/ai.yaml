@@ -741,7 +741,7 @@ spec:
                   echo "WARN: cron $name not scheduled (non-fatal)"
                 fi
               }
-              schedule_job people-scan "every 1m"
+              schedule_job people-scan "every 1m" --model openai/gpt-oss-120b --provider openrouter
               schedule_job daily-brief "0 12 * * *" --skill catch-up --skill outbound-email
               cp /seed/cron-linkedin-lookup.py /opt/data/scripts/cron-linkedin-lookup.py
               if "$HERMES_BIN" cron list 2>/dev/null | grep -q linkedin-lookup; then

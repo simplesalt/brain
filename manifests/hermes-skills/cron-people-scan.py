@@ -3,9 +3,10 @@
 
 Runs every minute as the trigger for the people-scan cron job: it wakes Hermes only when gbrain has synced
 a meeting or email thread whose people it has not met yet. It lists Dylan's synced meetings (past ones only) and email
-threads from gbrain, drops the ones already tagged people-scanned, newsletters and automated mail,
-and prints a batch for Hermes to turn into people pages. With nothing to do it prints
-{"wakeAgent": false} so the job skips the model call.
+threads from gbrain, drops the ones already handled, newsletters and automated mail, and prints a
+batch for Hermes to turn into people pages. Handled slugs are kept on the gbrain page ops/people-scan
+(Hermes cannot tag pages in the gmail and gcal sources), marked when handed out so no item is
+processed twice. With nothing to do it prints {"wakeAgent": false} so the job skips the model call.
 """
 import datetime
 import json
@@ -15,7 +16,7 @@ import urllib.request
 
 URL = os.environ.get("GBRAIN_URL", "http://gbrain:3131/mcp")
 TOKEN = os.environ.get("GBRAIN_REMOTE_TOKEN", "gbrain-mcp")
-TAG = "people-scanned"
+STATE = "ops/people-scan"
 BATCH = int(os.environ.get("PEOPLE_SCAN_BATCH", "5"))
 DAYS = 90
 MAX_ATTENDEES = 10
@@ -111,10 +112,27 @@ def candidate(page, now, since):
             "from": fm.get("from"), "people": who, "dylan_wrote": "SENT" in labels}
 
 
+def load_state():
+    try:
+        page = call("get_page", {"slug": STATE})
+    except RuntimeError:
+        return set()
+    body = (page.get("compiled_truth") or "") if isinstance(page, dict) else ""
+    m = re.search(r"```json\n(.*?)\n```", body, re.S)
+    return set(json.loads(m.group(1))) if m else set()
+
+
+def save_state(done):
+    content = ("---\ntype: note\ntitle: People scan state\n---\n\n# People scan state\n\n"
+               "Meetings and email threads the people-scan job has handled. Kept by cron-people-scan.py.\n\n"
+               "```json\n" + json.dumps(sorted(done)) + "\n```\n")
+    call("put_page", {"slug": STATE, "content": content})
+
+
 def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     since = now - datetime.timedelta(days=DAYS)
-    done = {p["slug"] for p in all_pages(tag=TAG)}
+    done = load_state()
     pages = [p for p in all_pages(type="meeting", source_id="gcal") + all_pages(type="email", source_id="gmail")
              if p["slug"] not in done]
     today = now.date().isoformat()
@@ -128,10 +146,12 @@ def main():
         verdict, item = candidate(page, now, since)
         if verdict == "take":
             batch.append(item)
+            done.add(page["slug"])
         elif verdict == "skip":
-            if not DRY_RUN:
-                call("add_tag", {"slug": page["slug"], "tag": TAG})
+            done.add(page["slug"])
             skipped += 1
+    if (batch or skipped) and not DRY_RUN:
+        save_state(done)
     if not batch:
         print(json.dumps({"wakeAgent": False}))
         return
