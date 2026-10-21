@@ -21,6 +21,7 @@ BATCH = int(os.environ.get("PEOPLE_SCAN_BATCH", "3"))
 DAYS = 90
 MAX_ATTENDEES = 10
 MAX_EXAMINED = 60
+BACKLOG_EVERY_MIN = 5
 DRY_RUN = os.environ.get("PEOPLE_SCAN_DRY_RUN") == "1"
 SKIP_LABELS = {"SPAM", "TRASH", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_SOCIAL", "CATEGORY_FORUMS"}
 AUTOMATED = re.compile(r"(no-?reply|do-?not-?reply|notification|newsletter|mailer|bounce|updates?@|news@|info@|"
@@ -138,6 +139,11 @@ def main():
     today = now.date().isoformat()
     pages = [p for p in pages if slug_date(p) <= today]
     pages.sort(key=slug_date, reverse=True)
+    fresh = (now - datetime.timedelta(days=2)).date().isoformat()
+    if not any(slug_date(p) >= fresh for p in pages) and now.minute % BACKLOG_EVERY_MIN:
+        # Only older backlog left: work it every few minutes, so it does not use up the chat model's rate limit.
+        print(json.dumps({"wakeAgent": False}))
+        return
     batch, skipped, examined = [], 0, 0
     for page in pages:
         if len(batch) >= BATCH or examined >= MAX_EXAMINED:
