@@ -101,7 +101,8 @@ data:
     const b64url = s => Buffer.from(s).toString('base64url');
     const now = Math.floor(Date.now() / 1000);
     const unsigned = `${b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: process.env.GOOGLE_PRIVATE_KEY_ID ?? '' }))}.${b64url(JSON.stringify({
-      iss, sub, scope: 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.events',
+      iss, sub, scope: process.argv[2] === 'contacts' ? 'https://www.googleapis.com/auth/contacts.readonly'
+        : 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.events',
       aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600,
     }))}`;
     const jwt = `${unsigned}.${createSign('RSA-SHA256').update(unsigned).sign(privKey, 'base64url')}`;
@@ -192,16 +193,26 @@ spec:
                 || echo "WARN: config set cycle.enrich_thin.max_cost_usd failed (non-fatal)"
               $GBRAIN config set cycle.enrich_thin.max_total_cost_usd 1000000 \
                 || echo "WARN: config set cycle.enrich_thin.max_total_cost_usd failed (non-fatal)"
+              $GBRAIN config set autopilot.incremental_extract_include_frontmatter true \
+                || echo "WARN: config set autopilot.incremental_extract_include_frontmatter failed (non-fatal)"
               GOOGLE_SOURCES=""
               if [ -n "$WORK_EMAIL" ] && [ -n "$GOOGLE_CLIENT_EMAIL" ] && [ -n "$GOOGLE_PRIVATE_KEY_B64" ]; then
                 EXISTING="$($GBRAIN sources list 2>/dev/null)"
-                for svc in gmail:gmail gcal:calendar; do
+                for svc in gcontacts:contacts gmail:gmail gcal:calendar; do
                   id="${svc%%:*}"; service="${svc#*:}"
+                  token_cmd="bun /google/google-token.mjs"
+                  if [ "$service" = contacts ]; then
+                    token_cmd="bun /google/google-token.mjs contacts"
+                    if ! $token_cmd >/dev/null 2>&1; then
+                      echo "WARN: contacts.readonly not granted to the service account yet; skipping gcontacts"
+                      continue
+                    fi
+                  fi
                   if echo "$EXISTING" | grep -qw "$id"; then
                     GOOGLE_SOURCES="$GOOGLE_SOURCES,$id"
                   elif $GBRAIN sources add "$id" --kind google --account "$WORK_EMAIL" --services "$service" \
                       --history-days 90 --dir "/install/google-$id" \
-                      --access command --token-command "bun /google/google-token.mjs"; then
+                      --access command --token-command "$token_cmd"; then
                     GOOGLE_SOURCES="$GOOGLE_SOURCES,$id"
                   else
                     echo "WARN: gbrain $id source add failed (non-fatal)"
