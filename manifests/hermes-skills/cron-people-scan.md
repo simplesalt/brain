@@ -1,6 +1,6 @@
 People scan: give gbrain a page for every real person Dylan meets or emails, linked to where he met them.
 
-The script output above lists recent meetings and email threads from gbrain as JSON. Work through every item, in order:
+The script output above lists recent meetings and email threads from gbrain as JSON. Work through every item, in order, and do not stop or answer until each one is done; each item is handed out only once:
 
 1. Read it with `mcp__gbrain__get_page` (`{"slug": "<item slug>"}`).
 2. For each address in its `people`, decide whether it is a real person Dylan deals with: a colleague, client, prospect, partner, investor, or someone he met, wrote to, or answered. Skip cold sales pitches he never answered, bulk or transactional mail from companies, shared inboxes, and anyone you cannot tell apart from a namesake.

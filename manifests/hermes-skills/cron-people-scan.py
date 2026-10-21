@@ -17,7 +17,7 @@ import urllib.request
 URL = os.environ.get("GBRAIN_URL", "http://gbrain:3131/mcp")
 TOKEN = os.environ.get("GBRAIN_REMOTE_TOKEN", "gbrain-mcp")
 STATE = "ops/people-scan"
-BATCH = int(os.environ.get("PEOPLE_SCAN_BATCH", "5"))
+BATCH = int(os.environ.get("PEOPLE_SCAN_BATCH", "3"))
 DAYS = 90
 MAX_ATTENDEES = 10
 MAX_EXAMINED = 60
