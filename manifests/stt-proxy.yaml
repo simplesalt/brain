@@ -41,7 +41,8 @@ data:
     # audio goes to Whisper on OpenRouter with the vocabulary list, then terms the
     # mic picked from the open conversation, as a spelling hint.
     # /healthz is unready until the key is filled, so an unfilled key shows up
-    # as an unready pod rather than as failed dictation.
+    # as an unready pod; the key is re-read from the mounted Secret, so the pod
+    # turns ready on its own once a person fills it.
     import base64, hashlib, hmac, json, os, re, threading, time, http.server, urllib.error, urllib.request
     from urllib.parse import unquote
 
@@ -49,7 +50,7 @@ data:
     JWT_HEADER = 'Cf-Access-Jwt-Assertion'
     ACCESS_TEAM = os.environ.get('ACCESS_TEAM_DOMAIN', '').rstrip('/')
     ACCESS_AUD = os.environ.get('ACCESS_AUD', '')
-    OPENROUTER_KEY = os.environ.get('OPENROUTER_API_KEY', '')
+    KEY_PATH = os.environ.get('KEY_PATH', '/secrets/OPENROUTER_API_KEY')
     STT_URL = os.environ.get('STT_URL', 'https://openrouter.ai/api/v1/audio/transcriptions')
     STT_MODEL = os.environ.get('STT_MODEL', 'openai/whisper-large-v3')
     STT_PROVIDER = os.environ.get('STT_PROVIDER', 'groq')
@@ -61,6 +62,14 @@ data:
     _FORMATS = {'audio/webm': 'webm', 'video/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a',
                 'audio/x-m4a': 'm4a', 'audio/m4a': 'm4a', 'audio/aac': 'aac', 'audio/mpeg': 'mp3',
                 'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac'}
+
+    def openrouter_key():
+        """The key, read from the mounted Secret on each use so a fill or rotation applies without a restart."""
+        try:
+            with open(KEY_PATH) as f:
+                return f.read().strip()
+        except OSError:
+            return ''
 
     _SHA256_PREFIX = bytes.fromhex('3031300d060960864801650304020105000420')
     _keys, _keys_at, _keys_lock = {}, 0.0, threading.Lock()
@@ -162,7 +171,7 @@ data:
         if prompt:
             req['provider']['options'] = {STT_PROVIDER: {'prompt': prompt}}
         r = urllib.request.Request(STT_URL, data=json.dumps(req).encode(), method='POST', headers={
-            'Authorization': 'Bearer ' + OPENROUTER_KEY, 'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + openrouter_key(), 'Content-Type': 'application/json',
             'X-Title': 'big-AGI dictation'})
         with urllib.request.urlopen(r, timeout=120) as resp:
             doc = json.load(resp)
@@ -188,7 +197,7 @@ data:
         def do_GET(self):
             if self.path != '/healthz':
                 self._reply(404, {'error': 'not found'})
-            elif not OPENROUTER_KEY.strip():
+            elif not openrouter_key():
                 self._reply(503, {'ok': False, 'error': 'OpenRouter key not filled'})
             else:
                 self._reply(200, {'ok': True})
@@ -205,7 +214,7 @@ data:
             if not verify_access_jwt(self.headers.get(JWT_HEADER, '')):
                 self._reply(401, {'error': 'not signed in'})
                 return
-            if not OPENROUTER_KEY.strip():
+            if not openrouter_key():
                 self._reply(503, {'error': 'voice service key not filled'})
                 return
             if not audio:
@@ -226,7 +235,7 @@ data:
 
     if __name__ == '__main__':
         srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
-        print(f'stt-proxy :{PORT}' + ('' if OPENROUTER_KEY.strip() else
+        print(f'stt-proxy :{PORT}' + ('' if openrouter_key() else
               ' (unready: secret openrouter-api-key is not filled)'), flush=True)
         srv.serve_forever()
 ---
@@ -270,7 +279,6 @@ data:
     MCP
     YAML
     SSO
-
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -308,18 +316,14 @@ spec:
               value: "https://fqurzlaaagt.cloudflareaccess.com"
             - name: ACCESS_AUD
               value: "afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c"
-            # optional: an unfilled key leaves the pod running but unready, not crash-looping.
-            - name: OPENROUTER_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: openrouter-api-key
-                  key: OPENROUTER_API_KEY
-                  optional: true
           volumeMounts:
             - name: script
               mountPath: /scripts
             - name: vocabulary
               mountPath: /stt
+            - name: key
+              mountPath: /secrets
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -345,6 +349,10 @@ spec:
         - name: vocabulary
           configMap:
             name: stt-vocabulary
+        - name: key
+          secret:
+            secretName: openrouter-api-key
+            optional: true
 ---
 apiVersion: v1
 kind: Service
