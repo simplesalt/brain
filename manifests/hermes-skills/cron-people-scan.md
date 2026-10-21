@@ -26,6 +26,7 @@ The script output above lists recent meetings and email threads from gbrain as J
 
      Source: <item title>, <item date>.
      ```
+     Then tag the new page for a LinkedIn lookup: `mcp_gbrain_add_tag` with `{"slug": "<person slug>", "tag": "needs-linkedin"}`, but only if Dylan met them or wrote to them.
    - Page exists: do not rewrite it. Add `mcp_gbrain_add_timeline_entry` with `{"slug": "<person slug>", "date": "<item date>", "summary": "<met or emailed about what>", "source": "<item slug>"}`.
 4. Link the item to the person: `mcp_gbrain_add_link` with `{"from": "<item slug>", "to": "<person slug>", "link_type": "attendee"}` for a meeting or `"link_type": "participant"` for email, and a short `context`. gbrain later writes a fuller summary for each person from everything linked to them.
 5. When the item is done, even if nobody qualified, mark it: `mcp_gbrain_add_tag` with `{"slug": "<item slug>", "tag": "people-scanned"}`.

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Pick the next meetings and email threads whose people gbrain has not met yet.
 
-Runs before the people-scan cron job. It lists Dylan's synced meetings (past ones only) and email
+Runs every minute as the trigger for the people-scan cron job: it wakes Hermes only when gbrain has synced
+a meeting or email thread whose people it has not met yet. It lists Dylan's synced meetings (past ones only) and email
 threads from gbrain, drops the ones already tagged people-scanned, newsletters and automated mail,
 and prints a batch for Hermes to turn into people pages. With nothing to do it prints
 {"wakeAgent": false} so the job skips the model call.
@@ -15,10 +16,10 @@ import urllib.request
 URL = os.environ.get("GBRAIN_URL", "http://gbrain:3131/mcp")
 TOKEN = os.environ.get("GBRAIN_REMOTE_TOKEN", "gbrain-mcp")
 TAG = "people-scanned"
-BATCH = int(os.environ.get("PEOPLE_SCAN_BATCH", "12"))
+BATCH = int(os.environ.get("PEOPLE_SCAN_BATCH", "5"))
 DAYS = 90
 MAX_ATTENDEES = 10
-MAX_EXAMINED = 200
+MAX_EXAMINED = 60
 DRY_RUN = os.environ.get("PEOPLE_SCAN_DRY_RUN") == "1"
 SKIP_LABELS = {"SPAM", "TRASH", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_SOCIAL", "CATEGORY_FORUMS"}
 AUTOMATED = re.compile(r"(no-?reply|do-?not-?reply|notification|newsletter|mailer|bounce|updates?@|news@|info@|"
