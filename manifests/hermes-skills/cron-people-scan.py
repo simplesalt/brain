@@ -7,11 +7,17 @@ threads from gbrain, drops the ones already handled, newsletters and automated m
 batch for Hermes to turn into people pages. Handled slugs are kept on the gbrain page ops/people-scan
 (Hermes cannot tag pages in the gmail and gcal sources), marked when handed out so no item is
 processed twice. With nothing to do it prints {"wakeAgent": false} so the job skips the model call.
+
+Hermes only judges: its answer lists the real people as JSON after a PEOPLE-SCAN-RESULT line. Before
+picking the next batch, this script reads those answers from the job's saved output and writes the
+pages itself (a new page, or a timeline entry on an existing one), so page format never depends on
+the model.
 """
 import datetime
 import json
 import os
 import re
+import sys
 import urllib.request
 
 URL = os.environ.get("GBRAIN_URL", "http://gbrain:3131/mcp")
@@ -22,6 +28,8 @@ DAYS = 90
 MAX_ATTENDEES = 10
 MAX_EXAMINED = 60
 BACKLOG_EVERY_MIN = 5
+OUTPUT_DIR = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "cron", "output")
+MARKER = "PEOPLE-SCAN-RESULT"
 DRY_RUN = os.environ.get("PEOPLE_SCAN_DRY_RUN") == "1"
 SKIP_LABELS = {"SPAM", "TRASH", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_SOCIAL", "CATEGORY_FORUMS"}
 AUTOMATED = re.compile(r"(no-?reply|do-?not-?reply|notification|newsletter|mailer|bounce|updates?@|news@|info@|"
@@ -44,6 +52,8 @@ def call(tool, args):
                 if "error" in msg:
                     raise RuntimeError(f"{tool}: {msg['error']}")
                 text = msg["result"]["content"][0]["text"]
+                if msg["result"].get("isError"):
+                    raise RuntimeError(f"{tool}: {text[:300]}")
                 try:
                     return json.loads(text)
                 except json.JSONDecodeError:
@@ -123,6 +133,10 @@ def load_state():
     return set(json.loads(m.group(1))) if m else set()
 
 
+def applied_marks(done):
+    return {s[len("output:"):] for s in done if s.startswith("output:")}
+
+
 def save_state(done):
     content = ("---\ntype: note\ntitle: People scan state\n---\n\n# People scan state\n\n"
                "Meetings and email threads the people-scan job has handled. Kept by cron-people-scan.py.\n\n"
@@ -130,10 +144,82 @@ def save_state(done):
     call("put_page", {"slug": STATE, "content": content})
 
 
+def page_slug(name):
+    return "people/" + (re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "unknown")
+
+
+def yaml_str(s):
+    return json.dumps(s, ensure_ascii=False)
+
+
+def write_person(p):
+    """Create the person's page, or add this meeting or thread to the page they already have."""
+    name, email, item = (p.get("name") or "").strip(), (p.get("email") or "").strip().lower(), p.get("item") or ""
+    if not name or "@" not in email or not item:
+        return
+    entry = {"date": p.get("date") or "", "summary": (p.get("summary") or "Met or emailed Dylan")[:200], "source": item}
+    slug = p.get("existing_slug")
+    if slug:
+        try:
+            call("get_page", {"slug": slug})
+        except RuntimeError:
+            slug = None
+    if not slug:
+        slug = page_slug(name)
+        try:
+            call("get_page", {"slug": slug})
+            exists = True
+        except RuntimeError:
+            exists = False
+        if not exists:
+            fm = ["---", "type: person", f"title: {yaml_str(name)}"]
+            if p.get("company"):
+                fm.append(f"company: {yaml_str(p['company'])}")
+            fm += ["emails:", f"  - {yaml_str(email)}", "aliases:", f"  - {yaml_str(email)}", "---"]
+            about = (p.get("about") or "").strip()
+            body = f"\n\n# {name}\n\n## About\n\n{about}\n\nSource: {p.get('title') or item}, {entry['date']}.\n"
+            call("put_page", {"slug": slug, "content": "\n".join(fm) + body})
+            if p.get("dylan_met_or_wrote"):
+                call("add_tag", {"slug": slug, "tag": "needs-linkedin"})
+    call("add_timeline_entry", dict(entry, slug=slug))
+
+
+def apply_results(state_files):
+    """Write pages for every saved people-scan answer not applied yet; returns the files applied."""
+    applied = []
+    try:
+        jobs = os.listdir(OUTPUT_DIR)
+    except OSError:
+        return applied
+    for job in jobs:
+        d = os.path.join(OUTPUT_DIR, job)
+        for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            key = f"{job}/{f}"
+            if key in state_files or not f.endswith(".md"):
+                continue
+            text = open(os.path.join(d, f), encoding="utf-8", errors="replace").read()
+            if MARKER not in text:
+                continue
+            m = re.search(r"\[.*\]", text.split(MARKER, 1)[1], re.S)
+            try:
+                people = json.loads(m.group(0)) if m else []
+            except json.JSONDecodeError:
+                people = []
+            for p in people if isinstance(people, list) else []:
+                try:
+                    write_person(p)
+                except Exception as e:
+                    print(f"people-scan: could not write {p.get('name')}: {e}", file=sys.stderr)
+            applied.append(key)
+    return applied
+
+
 def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     since = now - datetime.timedelta(days=DAYS)
     done = load_state()
+    applied = apply_results(applied_marks(done))
+    done |= {"output:" + k for k in applied}
     pages = [p for p in all_pages(type="meeting", source_id="gcal") + all_pages(type="email", source_id="gmail")
              if p["slug"] not in done]
     today = now.date().isoformat()
@@ -142,6 +228,8 @@ def main():
     fresh = (now - datetime.timedelta(days=2)).date().isoformat()
     if not any(slug_date(p) >= fresh for p in pages) and now.minute % BACKLOG_EVERY_MIN:
         # Only older backlog left: work it every few minutes, so it does not use up the chat model's rate limit.
+        if applied and not DRY_RUN:
+            save_state(done)
         print(json.dumps({"wakeAgent": False}))
         return
     batch, skipped, examined = [], 0, 0
@@ -156,7 +244,7 @@ def main():
         elif verdict == "skip":
             done.add(page["slug"])
             skipped += 1
-    if (batch or skipped) and not DRY_RUN:
+    if (batch or skipped or applied) and not DRY_RUN:
         save_state(done)
     if not batch:
         print(json.dumps({"wakeAgent": False}))
