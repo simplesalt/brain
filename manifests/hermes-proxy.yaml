@@ -300,8 +300,9 @@ data:
                     is_stream = bool(doc.get('stream'))
             except Exception:
                 pass
-            if (SIDE_KEY and self.command == 'POST' and self.path.split('?', 1)[0].endswith('/chat/completions')
-                    and is_side_request(doc)):
+            authorized = HERMES_KEY and hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + HERMES_KEY)
+            if (SIDE_KEY and authorized and self.command == 'POST'
+                    and self.path.split('?', 1)[0].endswith('/chat/completions') and is_side_request(doc)):
                 try:
                     return self._side(doc, is_stream)
                 except Exception as e:
@@ -410,6 +411,8 @@ spec:
       app: hermes-proxy
   template:
     metadata:
+      annotations:
+        hermes-proxy/script-revision: "side-request-auth"
       labels:
         app: hermes-proxy
         entity: ssint
