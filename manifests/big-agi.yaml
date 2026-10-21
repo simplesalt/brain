@@ -458,6 +458,8 @@ spec:
         entity: ssint
         env: main
         capability: ai
+      annotations:
+        gate-script-sha: 51c176300e5ef729
     spec:
       containers:
         - name: big-agi
