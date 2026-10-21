@@ -22,10 +22,10 @@ word you cannot read as `[?]` with your best guess, e.g. `[?Kessler]`.
 Before asking anything, settle what a check can settle:
 
 - What the note was for: if it has a date, or Dylan says when, look for a
-  meeting then: `mcp_gbrain_search` with `{"query": "<YYYY-MM-DD> <names on the
+  meeting then: `mcp__gbrain__search` with `{"query": "<YYYY-MM-DD> <names on the
   page>", "source_id": "gcal", "types": ["meeting"]}` (meeting slugs start with
   `calendar/YYYY/MM/YYYY-MM-DD-`). A matching meeting tells you who was there.
-- Who is who: for every name, initial or company, `mcp_gbrain_search` (add the
+- Who is who: for every name, initial or company, `mcp__gbrain__search` (add the
   company or meeting attendees as context). Treat a match as settled only when
   it is unambiguous; otherwise it stays a question.
 - Where it belongs: the company, project or person the note is mostly about.
@@ -61,7 +61,7 @@ never fill it with a guess.
 
 ## 4. File it
 
-Write one page with `mcp_gbrain_put_page`:
+Write one page with `mcp__gbrain__put_page`:
 
 - slug: `notes/YYYY-MM-DD-<short-topic>` (the note's date if it has one, else today)
 - content:
@@ -98,13 +98,13 @@ unknown is written with owner `?` and also gets an open question asking who owns
 it. Leave out a section only when it is empty.
 
 When the page has any unchecked item in either section, also call
-`mcp_gbrain_add_tag` with tag `follow-up`; that is what makes `catch-up` bring it
+`mcp__gbrain__add_tag` with tag `follow-up`; that is what makes `catch-up` bring it
 back.
 
 Then link each settled person, company, project or meeting:
-`mcp_gbrain_add_link` from the note's slug to the entity's slug, with `context`
+`mcp__gbrain__add_link` from the note's slug to the entity's slug, with `context`
 naming what the note says about them. For each action item owned by or owed to a
-known person, also `mcp_gbrain_add_timeline_entry` on that person's page
+known person, also `mcp__gbrain__add_timeline_entry` on that person's page
 (`{"slug": <person>, "date": <note date>, "summary": "<owner> → <task> (due ...)",
 "source": <note slug>}`), so it shows up in their history. Never create a new person or
 company page from a note alone; an unmatched name stays an open question.
@@ -117,11 +117,11 @@ and how many questions are still open.
 When Dylan answers a question or reports an action item done (here or through
 `catch-up`):
 
-1. `mcp_gbrain_get_page` with `include_content: true` to get the current page.
+1. `mcp__gbrain__get_page` with `include_content: true` to get the current page.
 2. Apply the answer: fix the transcript, fill the owner or due date, add the
    links it makes possible (step 4), and turn the line into
    `- [x] <question> — <answer>` or `- [x] <owner> → <task> — done <date>`.
    An answer can raise a new question; add it as a new `- [ ]` line.
-3. `mcp_gbrain_put_page` with the full updated content (it replaces the page).
-4. When no `- [ ]` line remains in either section, `mcp_gbrain_remove_tag` the
+3. `mcp__gbrain__put_page` with the full updated content (it replaces the page).
+4. When no `- [ ]` line remains in either section, `mcp__gbrain__remove_tag` the
    `follow-up` tag.

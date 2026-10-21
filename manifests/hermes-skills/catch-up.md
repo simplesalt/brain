@@ -10,13 +10,13 @@ blocks. Nothing here is pushed to him unprompted.
 
 ## 1. Gather
 
-- Email and commitments: `mcp_gbrain_open_loops` with
+- Email and commitments: `mcp__gbrain__open_loops` with
   `{"source_id": "gmail", "group_by": "none", "limit": 200}`. Each loop has an
   `id`, `loop_type` (`unanswered_inbound`, `unanswered_outbound`,
   `commitment_owed_by_me`, `commitment_owed_to_me`, `decision_pending`),
   `summary`, `counterparty_email`, `due_at` and `page_slug` (the email thread).
-- Notes: `mcp_gbrain_list_pages` with `{"tag": "follow-up", "limit": 100}`;
-  for each page, `mcp_gbrain_get_page` and take every `- [ ]` line under
+- Notes: `mcp__gbrain__list_pages` with `{"tag": "follow-up", "limit": 100}`;
+  for each page, `mcp__gbrain__get_page` and take every `- [ ]` line under
   `## Action items` (to check on: is it done, still on track, or stuck?) and
   under `## Open questions` (to answer).
 
