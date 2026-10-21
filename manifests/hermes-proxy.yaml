@@ -133,6 +133,107 @@ data:
             return body
         return json.dumps(doc).encode()
 
+    FAILED_DIR = os.environ.get('FAILED_DIR', '/data/failed')
+    HERMES_KEY = os.environ.get('HERMES_KEY', '')
+    RETRY_LIMIT = 3
+    RETRY_INTERVAL = int(os.environ.get('RETRY_INTERVAL', '60'))
+    _retry_lock = threading.Lock()
+
+    def save_failure(raw, profile, reason):
+        """Keep a chat Hermes did not finish in its own folder, for the retry loop."""
+        try:
+            doc = json.loads(raw)
+        except Exception:
+            return
+        if not any(isinstance(m, dict) and m.get('role') == 'user' for m in doc.get('messages') or []):
+            return
+        rid = time.strftime('%Y%m%d-%H%M%S', time.gmtime()) + '-' + hashlib.sha256(raw).hexdigest()[:6]
+        d = os.path.join(FAILED_DIR, rid)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'request.json'), 'wb') as f:
+            f.write(raw)
+        _write_state(d, {'reason': reason, 'failed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                         'profile': profile, 'state': 'pending', 'attempts': 0})
+        print(f'hermes-proxy: saved failed chat {rid}: {reason}', flush=True)
+
+    def _write_state(d, state):
+        with open(os.path.join(d, 'state.json.tmp'), 'w') as f:
+            json.dump(state, f, indent=1)
+        os.replace(os.path.join(d, 'state.json.tmp'), os.path.join(d, 'state.json'))
+
+    def _retry_one(rid, d, state):
+        """Re-send the saved chat with a note that the last attempt failed; True when Hermes finished."""
+        with open(os.path.join(d, 'request.json'), 'rb') as f:
+            doc = json.loads(f.read())
+        doc['messages'].append({'role': 'user', 'content': (
+            f"[Note from the chat relay, not from Dylan] Your previous attempt to answer the message above "
+            f"failed ({state['reason']}) at {state['failed_at']}; the conversation is saved as failed chat {rid}. "
+            f"Look at it and try again: finish what was asked, then say briefly what you did.")})
+        doc['stream'] = True
+        profile = state.get('profile')
+        body = json.dumps(doc).encode()
+        if profile:
+            body = with_identity('/v1/chat/completions', body, profile)
+        headers = {'Content-Type': 'application/json', 'Content-Length': str(len(body)),
+                   'Authorization': 'Bearer ' + HERMES_KEY}
+        if profile:
+            headers[SESSION_KEY_HEADER] = session_key(profile)
+        conn = http.client.HTTPConnection(_HOST, _PORT, timeout=900)
+        try:
+            conn.request('POST', '/v1/chat/completions', body=body, headers=headers)
+            r = conn.getresponse()
+            if r.status >= 400:
+                state['last_error'] = f'HTTP {r.status}'
+                return False
+            text, finish = [], None
+            for line in r:
+                s = line.decode('utf-8', errors='replace').strip()
+                if not s.startswith('data: ') or s == 'data: [DONE]':
+                    continue
+                try:
+                    for c in json.loads(s[6:]).get('choices') or []:
+                        text.append((c.get('delta') or {}).get('content') or '')
+                        finish = c.get('finish_reason') or finish
+                except Exception:
+                    pass
+            with open(os.path.join(d, 'reply.md'), 'w') as f:
+                f.write(''.join(text))
+            state['last_error'] = None if finish not in (None, 'error') else f'finish_reason {finish}'
+            return state['last_error'] is None
+        finally:
+            conn.close()
+
+    def retry_loop():
+        """Every RETRY_INTERVAL seconds, re-ask Hermes each saved chat that is still pending, up to RETRY_LIMIT times."""
+        while True:
+            time.sleep(RETRY_INTERVAL)
+            try:
+                names = sorted(os.listdir(FAILED_DIR))
+            except FileNotFoundError:
+                continue
+            for rid in names:
+                d = os.path.join(FAILED_DIR, rid)
+                try:
+                    with open(os.path.join(d, 'state.json')) as f:
+                        state = json.load(f)
+                    if state.get('state') != 'pending':
+                        continue
+                    state['attempts'] += 1
+                    try:
+                        ok = _retry_one(rid, d, state)
+                    except Exception as e:
+                        ok, state['last_error'] = False, repr(e)
+                    if ok:
+                        state['state'] = 'retried'
+                    elif state['attempts'] >= RETRY_LIMIT:
+                        state['state'] = 'gave-up'
+                    state['last_attempt_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                    _write_state(d, state)
+                    print(f"hermes-proxy: retried failed chat {rid} (attempt {state['attempts']}): {state['state']}"
+                          f"{'' if ok else ' ' + str(state.get('last_error'))}", flush=True)
+                except Exception as e:
+                    print(f'hermes-proxy: retry of {rid} skipped: {e!r}', flush=True)
+
     class ProxyHandler(http.server.BaseHTTPRequestHandler):
         timeout = 300
         def do_GET(self): self._proxy()
@@ -144,6 +245,7 @@ data:
         def _proxy(self):
             n = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(n) if n else b''
+            raw = body
             is_stream = False
             try:
                 if body:
@@ -156,14 +258,18 @@ data:
                 body = with_identity(self.path, body, profile)
             fwd = {k: v for k, v in self.headers.items() if k.lower() not in _SKIP_REQ}
             # Chat Completions only: on Responses/Runs a session key also merges conversations.
-            if profile and self.path.split('?', 1)[0].endswith('/chat/completions'):
+            is_chat = self.command == 'POST' and self.path.split('?', 1)[0].endswith('/chat/completions')
+            if profile and is_chat:
                 fwd[SESSION_KEY_HEADER] = session_key(profile)
             if body or self.command in ('POST', 'PUT'):
                 fwd['Content-Length'] = str(len(body))
+            self._finish, failure, conn = None, None, None
             try:
                 conn = http.client.HTTPConnection(_HOST, _PORT, timeout=300)
                 conn.request(self.command, self.path, body=body, headers=fwd)
                 r = conn.getresponse()
+                if r.status >= 400:
+                    failure = f'Hermes answered HTTP {r.status}'
                 self.send_response(r.status)
                 skip = _SKIP_RESP_BASE | ({'content-length'} if is_stream else set())
                 for k, v in r.getheaders():
@@ -172,14 +278,23 @@ data:
                 self.end_headers()
                 if is_stream:
                     self._stream(r)
+                    if failure is None and self._finish in (None, 'error'):
+                        failure = 'Hermes hit an error mid-reply' if self._finish else 'the reply stopped before it finished'
                 else:
                     self.wfile.write(r.read())
             except Exception as e:
+                failure = failure or f'the connection broke mid-reply ({type(e).__name__})'
                 try: self.send_error(502, str(e))
                 except Exception: pass
             finally:
-                try: conn.close()
-                except Exception: pass
+                if conn is not None:
+                    try: conn.close()
+                    except Exception: pass
+                if is_chat and failure:
+                    try:
+                        save_failure(raw, profile, failure)
+                    except Exception as e:
+                        print(f'hermes-proxy: could not save failed chat: {e!r}', flush=True)
 
         def _stream(self, r):
             buf = b''
@@ -208,6 +323,9 @@ data:
                         d = json.loads(payload)
                         if 'choices' not in d:
                             return True
+                        for c in d['choices'] or []:
+                            if isinstance(c, dict) and c.get('finish_reason'):
+                                self._finish = c['finish_reason']
                     except json.JSONDecodeError:
                         pass
             elif s.strip() == '' and prev_dropped:
@@ -217,6 +335,7 @@ data:
             return False
 
     if __name__ == '__main__':
+        threading.Thread(target=retry_loop, daemon=True).start()
         srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), ProxyHandler)
         print(f'hermes-proxy :{PORT} → {HERMES_URL}', flush=True)
         srv.serve_forever()
@@ -232,6 +351,8 @@ metadata:
     capability: ai
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: hermes-proxy
@@ -255,6 +376,13 @@ spec:
               value: "http://hermes-agent-web:8642"
             - name: PORT
               value: "8000"
+            - name: FAILED_DIR
+              value: /data/failed
+            - name: HERMES_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: HERMES_BEARER_TOKEN
             - name: ACCESS_TEAM_DOMAIN
               value: "https://fqurzlaaagt.cloudflareaccess.com"
             - name: ACCESS_AUD
@@ -265,6 +393,8 @@ spec:
             - name: team-roster
               mountPath: /secrets/team-roster
               readOnly: true
+            - name: failed
+              mountPath: /data
           readinessProbe:
             tcpSocket:
               port: 8000
@@ -283,6 +413,9 @@ spec:
               cpu: 200m
               memory: 128Mi
       volumes:
+        - name: failed
+          persistentVolumeClaim:
+            claimName: hermes-proxy-failed
         - name: script
           configMap:
             name: hermes-proxy-script
@@ -307,3 +440,22 @@ spec:
     - name: http
       port: 8000
       targetPort: 8000
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hermes-proxy-failed
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi

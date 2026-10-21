@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-retry-test-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  test.py: |
+    import http.client, json, os, time
+    time.sleep(int(os.environ.get('DELAY', '90')))
+    body = json.dumps({'model': 'hermes-agent', 'stream': True, 'messages': [{'role': 'user', 'content':
+        'Retry test from the build agent, nothing to store: call hindsight recall for "retry test", then reply with one line saying RETRY-TEST OK.'}]}).encode()
+    conn = http.client.HTTPConnection('hermes-proxy', 8000, timeout=60)
+    conn.request('POST', '/v1/chat/completions', body=body, headers={
+        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + os.environ['KEY']})
+    r = conn.getresponse()
+    print('status', r.status, 'first bytes', r.read(64)[:64], flush=True)
+    conn.sock.close()
+    print('disconnected mid-reply on purpose', flush=True)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hermes-retry-test
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: hermes-retry-test
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: test
+          image: python:3.12-alpine
+          command: ["python3", "/test/test.py"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: HERMES_BEARER_TOKEN
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: script
+              mountPath: /test
+      volumes:
+        - name: script
+          configMap:
+            name: hermes-retry-test-script
