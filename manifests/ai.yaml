@@ -193,6 +193,8 @@ spec:
                 || echo "WARN: config set cycle.enrich_thin.max_cost_usd failed (non-fatal)"
               $GBRAIN config set cycle.enrich_thin.max_total_cost_usd 1000000 \
                 || echo "WARN: config set cycle.enrich_thin.max_total_cost_usd failed (non-fatal)"
+              $GBRAIN config set cycle.enrich_thin.max_pages_per_tick 25 \
+                || echo "WARN: config set cycle.enrich_thin.max_pages_per_tick failed (non-fatal)"
               $GBRAIN config set autopilot.incremental_extract_include_frontmatter true \
                 || echo "WARN: config set autopilot.incremental_extract_include_frontmatter failed (non-fatal)"
               GOOGLE_SOURCES=""
@@ -362,6 +364,14 @@ spec:
                 chmod +x /usr/local/bin/gbrain
                 GBRAIN=/usr/local/bin/gbrain
               fi
+              (
+                sleep 300
+                while true; do
+                  echo "enrich_thin: start"
+                  $GBRAIN dream --phase enrich_thin --repo /tmp 2>&1 | tail -n 20 || echo "WARN: enrich_thin run failed"
+                  sleep 3600
+                done
+              ) &
               exec $GBRAIN autopilot --repo /tmp --interval 60
           env:
             - name: DATABASE_URL

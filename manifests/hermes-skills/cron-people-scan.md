@@ -22,12 +22,12 @@ The script output above lists recent meetings and email threads from gbrain as J
 
      ## About
 
-     <One or two sentences: who they are, what they do, and how Dylan knows them, taken only from this item.>
+     <One sentence: who they are, what they do or what their company does, and how Dylan knows them, taken only from this item. Use the words someone would search for, e.g. "runs an AI interviewing startup".>
 
      Source: <item title>, <item date>.
      ```
    - Page exists: do not rewrite it. Add `mcp_gbrain_add_timeline_entry` with `{"slug": "<person slug>", "date": "<item date>", "summary": "<met or emailed about what>", "source": "<item slug>"}`.
-4. Link the person to the item: `mcp_gbrain_add_link` with `{"from": "<person slug>", "to": "<item slug>", "link_type": "attended"}` for a meeting or `"link_type": "emailed"` for email, and a short `context`.
+4. Link the item to the person: `mcp_gbrain_add_link` with `{"from": "<item slug>", "to": "<person slug>", "link_type": "attendee"}` for a meeting or `"link_type": "participant"` for email, and a short `context`. gbrain later writes a fuller summary for each person from everything linked to them.
 5. When the item is done, even if nobody qualified, mark it: `mcp_gbrain_add_tag` with `{"slug": "<item slug>", "tag": "people-scanned"}`.
 
 Rules: use only gbrain tools. Do not search the web, do not send any message or email, and do not change meeting or email pages beyond the tag. If a call fails, fix its arguments from the error and continue with the next item.
