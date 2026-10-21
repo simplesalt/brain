@@ -1134,16 +1134,34 @@ data:
       return `${text.slice(0, sentinelAt).replace(/\s+$/, '')}\n\n${block}\n\n${text.slice(sentinelAt)}`;
     }
 
-    // Searches gbrain for an existing page of `type` matching a LinkedIn URL or an
-    // exact title, so re-discovering someone (or a company) another source already
-    // knows doesn't fork a duplicate page. Only adopted on a clear match (URL
-    // equality or exact-title equality).
+    // Lowercased https URL without www, query, fragment or trailing slash, so
+    // linkedin: values and aliases written by other sources compare equal.
+    function normalizeLinkedinUrl(u) {
+      const s = String(u ?? '').trim();
+      if (!/linkedin\.com\//i.test(s)) return null;
+      return canonicalizeProfileUrl(/^https?:\/\//i.test(s) ? s : `https://${s}`)
+        .toLowerCase().replace('://www.', '://');
+    }
+
+    // Case- and accent-insensitive name key.
+    function nameKey(s) {
+      return String(s ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+    }
+
+    // Searches gbrain for an existing page of `type` so re-discovering someone (or
+    // a company) another source already knows doesn't fork a duplicate page.
+    // Order: a page listing the LinkedIn URL (linkedin: or aliases), else the
+    // only page with exactly this name that doesn't carry a different LinkedIn
+    // URL. Anything less clear returns null.
     async function findMatchingPageSlug(type, { url, name }) {
-      const queries = uniqueList([url, name]);
+      const wantUrl = normalizeLinkedinUrl(url);
+      const wantName = nameKey(name);
       const seen = new Set();
+      const nameHits = [];
+      const queries = uniqueList([linkedinVanity(url), url, name]);
       for (const q of queries) {
         let results;
-        try { results = await gbrainSearch(q, { limit: 5, types: [type] }); }
+        try { results = await gbrainSearch(q, { limit: 10, types: [type] }); }
         catch { continue; }
         for (const r of results ?? []) {
           if (!r?.slug || seen.has(r.slug)) continue;
@@ -1151,13 +1169,12 @@ data:
           const page = await gbrainGetPage(r.slug).catch(() => null);
           if (!page) continue;
           const fm = page.frontmatter ?? {};
-          const urlMatch = url && fm.linkedin
-            && canonicalizeProfileUrl(String(fm.linkedin)) === canonicalizeProfileUrl(url);
-          const nameMatch = name && String(page.title ?? '').trim().toLowerCase() === name.toLowerCase();
-          if (urlMatch || nameMatch) return r.slug;
+          const urls = [...asList(fm.linkedin), ...asList(fm.aliases)].map(normalizeLinkedinUrl).filter(Boolean);
+          if (wantUrl && urls.includes(wantUrl)) return r.slug;
+          if (wantName && nameKey(page.title) === wantName && !(wantUrl && urls.length)) nameHits.push(r.slug);
         }
       }
-      return null;
+      return nameHits.length === 1 ? nameHits[0] : null;
     }
 
     async function findMatchingPersonSlug(profileRow, fullName) {
@@ -1233,15 +1250,10 @@ data:
     // that already carries it is not rewritten.
     async function syncPersonPage(profileRow, rawPayload, eventId, timelineBullet = null, details = null) {
       const fullName = [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim();
-      let slug = profileRow.gbrain_slug || deriveSlug(profileRow);
-      let existing = await gbrainGetPage(slug, { includeContent: true });
-      if (!existing && !profileRow.gbrain_slug) {
-        const found = await findMatchingPersonSlug(profileRow, fullName);
-        if (found) {
-          slug = found;
-          existing = await gbrainGetPage(slug, { includeContent: true });
-        }
-      }
+      const slug = profileRow.gbrain_slug
+        || (await findMatchingPersonSlug(profileRow, fullName))
+        || deriveSlug(profileRow);
+      const existing = await gbrainGetPage(slug, { includeContent: true });
 
       const det = personDetailsFor(profileRow, fullName, details);
       await writePageWithRetry('syncPersonPage', slug, existing, eventId, (ex) => {
@@ -1791,7 +1803,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "6"
+        simplesalt.company/restart-epoch: "7"
     spec:
       serviceAccountName: duxsoup-ingest
       containers:
