@@ -716,6 +716,19 @@ spec:
               print("hindsight: bank retain and observation missions set")
               ' || echo "WARN: hindsight bank missions not set (non-fatal)"
 
+              mkdir -p /opt/data/scripts
+              cp /seed/cron-people-scan.py /opt/data/scripts/cron-people-scan.py
+              HERMES_BIN=/opt/hermes/.venv/bin/hermes
+              if "$HERMES_BIN" cron list 2>/dev/null | grep -q people-scan; then
+                echo "cron: people-scan already scheduled"
+              elif "$HERMES_BIN" cron create "every 30m" "$(cat /seed/cron-people-scan.md)" \
+                  --name people-scan --script cron-people-scan.py --deliver local; then
+                echo "cron: people-scan scheduled every 30m"
+              else
+                echo "WARN: cron people-scan not scheduled (non-fatal)"
+              fi
+              chown -R 10000:10000 /opt/data/scripts /opt/data/cron 2>/dev/null || true
+
               cp /seed/SOUL.md /opt/data/SOUL.md
 
               python3 -c '
