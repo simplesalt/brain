@@ -1,0 +1,364 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+---
+# Filled by a person out of band (see the secrets-handling skill); Flux merges
+# so reconciliation never wipes the value. stt-proxy stays unready until it is.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openrouter-api-key
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stt-proxy-script
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+data:
+  stt.py: |
+    #!/usr/bin/env python3
+    # Transcribes dictation from the big-AGI mic button. It owns the OpenRouter
+    # key, so big-AGI's pod holds none: the big-AGI gate forwards each recording
+    # here with the caller's Cloudflare Access JWT, which is verified below. The
+    # audio goes to Whisper on OpenRouter with the vocabulary list, then terms the
+    # mic picked from the open conversation, as a spelling hint.
+    # /healthz is unready until the key is filled, so an unfilled key shows up
+    # as an unready pod rather than as failed dictation.
+    import base64, hashlib, hmac, json, os, re, threading, time, http.server, urllib.error, urllib.request
+    from urllib.parse import unquote
+
+    PORT = int(os.environ.get('PORT', '8000'))
+    JWT_HEADER = 'Cf-Access-Jwt-Assertion'
+    ACCESS_TEAM = os.environ.get('ACCESS_TEAM_DOMAIN', '').rstrip('/')
+    ACCESS_AUD = os.environ.get('ACCESS_AUD', '')
+    OPENROUTER_KEY = os.environ.get('OPENROUTER_API_KEY', '')
+    STT_URL = os.environ.get('STT_URL', 'https://openrouter.ai/api/v1/audio/transcriptions')
+    STT_MODEL = os.environ.get('STT_MODEL', 'openai/whisper-large-v3')
+    STT_PROVIDER = os.environ.get('STT_PROVIDER', 'groq')
+    STT_LANGUAGE = os.environ.get('STT_LANGUAGE', 'en')
+    VOCAB_PATH = os.environ.get('VOCAB_PATH', '/stt/vocabulary.txt')
+    MAX_AUDIO = 24 * 1024 * 1024
+    # Whisper reads at most 224 prompt tokens; ~4 characters a token.
+    MAX_PROMPT_CHARS = 800
+    _FORMATS = {'audio/webm': 'webm', 'video/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a',
+                'audio/x-m4a': 'm4a', 'audio/m4a': 'm4a', 'audio/aac': 'aac', 'audio/mpeg': 'mp3',
+                'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac'}
+
+    _SHA256_PREFIX = bytes.fromhex('3031300d060960864801650304020105000420')
+    _keys, _keys_at, _keys_lock = {}, 0.0, threading.Lock()
+
+    def _b64(s):
+        return base64.urlsafe_b64decode(s + '=' * (-len(s) % 4))
+
+    def _jwks(force=False):
+        global _keys, _keys_at
+        with _keys_lock:
+            age = time.time() - _keys_at
+            if age < 60 or (_keys and age < 3600 and not force):
+                return _keys
+            try:
+                with urllib.request.urlopen(ACCESS_TEAM + '/cdn-cgi/access/certs', timeout=10) as r:
+                    doc = json.load(r)
+                _keys = {k['kid']: (int.from_bytes(_b64(k['n']), 'big'), int.from_bytes(_b64(k['e']), 'big'))
+                         for k in doc.get('keys', []) if k.get('kty') == 'RSA'}
+                _keys_at = time.time()
+            except Exception as e:
+                _keys_at = time.time()
+                print(f'stt-proxy: Access certs fetch failed: {e}', flush=True)
+            return _keys
+
+    def _rs256_ok(key, signed, sig):
+        n, e = key
+        k = (n.bit_length() + 7) // 8
+        if len(sig) != k:
+            return False
+        em = pow(int.from_bytes(sig, 'big'), e, n).to_bytes(k, 'big')
+        t = _SHA256_PREFIX + hashlib.sha256(signed).digest()
+        want = b'\x00\x01' + b'\xff' * (k - len(t) - 3) + b'\x00' + t
+        return hmac.compare_digest(em, want)
+
+    def verify_access_jwt(token):
+        """Return the claims of a verified Cloudflare Access JWT that names an email, else None."""
+        if not (token and ACCESS_TEAM and ACCESS_AUD) or token.count('.') != 2:
+            return None
+        try:
+            h64, p64, s64 = token.split('.')
+            head, claims = json.loads(_b64(h64)), json.loads(_b64(p64))
+            if head.get('alg') != 'RS256':
+                return None
+            key = _jwks().get(head.get('kid')) or _jwks(force=True).get(head.get('kid'))
+            if not key or not _rs256_ok(key, (h64 + '.' + p64).encode(), _b64(s64)):
+                return None
+            now = time.time()
+            aud = claims.get('aud')
+            aud = aud if isinstance(aud, list) else [aud]
+            if claims.get('iss') != ACCESS_TEAM or ACCESS_AUD not in aud:
+                return None
+            if claims.get('exp', 0) < now - 30 or claims.get('nbf', 0) > now + 30:
+                return None
+            email = claims.get('email')
+            return claims if isinstance(email, str) and '@' in email else None
+        except Exception:
+            return None
+
+    _TERM_OK = re.compile(r"^[\w][\w .'+#&/-]{0,39}$")
+
+    def conversation_terms(header):
+        """Terms the mic picked from the open conversation, sent URL-encoded and comma-separated."""
+        out = []
+        for t in unquote(header or '').split(','):
+            t = t.strip()
+            if _TERM_OK.match(t) and t not in out:
+                out.append(t)
+        return out[:60]
+
+    def vocabulary_prompt(extra=()):
+        """The vocabulary list, then terms from the conversation, as a Whisper prompt.
+        The list is re-read each call so edits apply without a restart."""
+        try:
+            with open(VOCAB_PATH) as f:
+                terms = [t.strip() for t in f if t.strip() and not t.lstrip().startswith('#')]
+        except OSError:
+            terms = []
+        seen = {t.lower() for t in terms}
+        terms += [t for t in extra if t.lower() not in seen]
+        prompt = 'Glossary:'
+        for t in terms:
+            if len(prompt) + len(t) + 2 > MAX_PROMPT_CHARS:
+                break
+            prompt += (' ' if prompt.endswith(':') else ', ') + t
+        return prompt + '.' if terms else ''
+
+    def transcribe(audio, fmt, extra=()):
+        """Return the transcript of audio (bytes in format fmt), or raise."""
+        req = {
+            'model': STT_MODEL,
+            'input_audio': {'data': base64.b64encode(audio).decode(), 'format': fmt},
+            'response_format': 'json',
+            'temperature': 0,
+            'provider': {'order': [STT_PROVIDER], 'allow_fallbacks': True},
+        }
+        if STT_LANGUAGE:
+            req['language'] = STT_LANGUAGE
+        prompt = vocabulary_prompt(extra)
+        if prompt:
+            req['provider']['options'] = {STT_PROVIDER: {'prompt': prompt}}
+        r = urllib.request.Request(STT_URL, data=json.dumps(req).encode(), method='POST', headers={
+            'Authorization': 'Bearer ' + OPENROUTER_KEY, 'Content-Type': 'application/json',
+            'X-Title': 'big-AGI dictation'})
+        with urllib.request.urlopen(r, timeout=120) as resp:
+            doc = json.load(resp)
+        text = doc.get('text')
+        if not isinstance(text, str):
+            raise RuntimeError('no text in transcription response')
+        return text.strip()
+
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        timeout = 180
+        def log_message(self, *a): pass
+
+        def _reply(self, status, doc):
+            out = json.dumps(doc).encode()
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def do_GET(self):
+            if self.path != '/healthz':
+                self._reply(404, {'error': 'not found'})
+            elif not OPENROUTER_KEY.strip():
+                self._reply(503, {'ok': False, 'error': 'OpenRouter key not filled'})
+            else:
+                self._reply(200, {'ok': True})
+
+        def do_POST(self):
+            if self.path.split('?', 1)[0] != '/transcribe':
+                self._reply(404, {'error': 'not found'})
+                return
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            if n > MAX_AUDIO:
+                self._reply(413, {'error': 'recording too long'})
+                return
+            audio = self.rfile.read(n) if n else b''
+            if not verify_access_jwt(self.headers.get(JWT_HEADER, '')):
+                self._reply(401, {'error': 'not signed in'})
+                return
+            if not OPENROUTER_KEY.strip():
+                self._reply(503, {'error': 'voice service key not filled'})
+                return
+            if not audio:
+                self._reply(400, {'error': 'no audio'})
+                return
+            ctype = self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+            fmt = _FORMATS.get(ctype, 'webm')
+            try:
+                extra = conversation_terms(self.headers.get('X-STT-Terms', ''))
+                self._reply(200, {'text': transcribe(audio, fmt, extra)})
+            except urllib.error.HTTPError as e:
+                detail = e.read()[:500].decode('utf-8', 'replace')
+                print(f'stt-proxy: transcription HTTP {e.code}: {detail}', flush=True)
+                self._reply(502, {'error': f'transcription service answered {e.code}'})
+            except Exception as e:
+                print(f'stt-proxy: transcription failed: {e}', flush=True)
+                self._reply(502, {'error': 'transcription failed'})
+
+    if __name__ == '__main__':
+        srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
+        print(f'stt-proxy :{PORT}' + ('' if OPENROUTER_KEY.strip() else
+              ' (unready: secret openrouter-api-key is not filled)'), flush=True)
+        srv.serve_forever()
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stt-vocabulary
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+data:
+  # Terms dictation should spell this way, one per line, most important first.
+  # Whisper reads only the first ~800 characters; lines starting with # are skipped.
+  vocabulary.txt: |
+    Groq
+    Hermes
+    Hindsight
+    gbrain
+    Big AGI
+    OpenRouter
+    Simple Salt
+    Dylan
+    Russell
+    Claude
+    MiniMax
+    Gemini
+    Whisper
+    Flux
+    k3s
+    Kubernetes
+    kubectl
+    Cloudflare
+    GitHub
+    GitOps
+    Notion
+    HubSpot
+    Dux Soup
+    LinkedIn
+    MCP
+    YAML
+    SSO
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stt-proxy
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stt-proxy
+  template:
+    metadata:
+      labels:
+        app: stt-proxy
+        entity: ssint
+        env: main
+        capability: voice
+    spec:
+      containers:
+        - name: stt-proxy
+          image: python:3.12-alpine
+          command: ["python", "/scripts/stt.py"]
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PORT
+              value: "8000"
+            - name: ACCESS_TEAM_DOMAIN
+              value: "https://fqurzlaaagt.cloudflareaccess.com"
+            - name: ACCESS_AUD
+              value: "afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c"
+            # optional: an unfilled key leaves the pod running but unready, not crash-looping.
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openrouter-api-key
+                  key: OPENROUTER_API_KEY
+                  optional: true
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: vocabulary
+              mountPath: /stt
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: script
+          configMap:
+            name: stt-proxy-script
+        - name: vocabulary
+          configMap:
+            name: stt-vocabulary
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stt-proxy
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+spec:
+  selector:
+    app: stt-proxy
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
