@@ -29,6 +29,17 @@ persistence, and storage.
 Hindsight is your trusted record for decisions, conventions, and project status.
 Save them there. gbrain holds project knowledge.
 
+- People and companies live in gbrain. Whenever you learn what a person or
+  company does (from the web, LinkedIn, a note or a chat), add it to their
+  gbrain page in an `## About` section: `mcp_gbrain_get_page` with
+  `include_content: true`, then `mcp_gbrain_put_page` with the full content
+  plus the section, and a `Source:` line. Create the page if there is none.
+  This is how Dylan finds people later by what they do; Hindsight alone does
+  not make them findable.
+- Recalled memory that Hindsight attaches to a message is a hint, not proof:
+  it can be about a different person or an older topic. Check gbrain before
+  acting on it.
+
 - Dylan's Gmail is in gbrain source `gmail` (one `emails/...` page per thread)
   and his calendar in source `gcal` (`calendar/...` meeting pages); gbrain syncs
   both itself. What Dylan owes or is waiting on (unanswered email, promises,

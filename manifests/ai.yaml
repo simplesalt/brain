@@ -678,12 +678,32 @@ spec:
               chmod 600 /opt/data/config.yaml
 
               mkdir -p /opt/data/hindsight
-              printf '{"mode":"local_external","apiKey":"%s","api_url":"%s","banks":{"%s":{"bankId":"%s","budget":"mid","enabled":true}},"recall_budget":"low","recall_prefetch_method":"recall","recall_max_tokens":250,"recall_max_input_chars":300,"recall_types":"observation"}\n' \
+              printf '{"mode":"local_external","apiKey":"%s","api_url":"%s","banks":{"%s":{"bankId":"%s","budget":"mid","enabled":true}},"recall_budget":"low","recall_prefetch_method":"recall","recall_max_tokens":250,"recall_max_input_chars":300,"recall_types":"world","recall_sync":true,"recall_prompt_preamble":"# Hindsight Memory (possibly related notes from past chats)\\nThese were found by similarity to this message. Some may be about a different person, topic or time. Use the ones that clearly apply; check gbrain before acting on any of them."}\n' \
                 "$HINDSIGHT_API_KEY" "$HINDSIGHT_API_URL" "$HINDSIGHT_BANK_ID" "$HINDSIGHT_BANK_ID" \
                 > /opt/data/hindsight/config.json
               chown -R 10000:10000 /opt/data/hindsight
               chmod 700 /opt/data/hindsight
               chmod 600 /opt/data/hindsight/config.json
+
+              python3 -c '
+              import json, os, urllib.request
+              retain = ("Extract durable knowledge: technical and architectural decisions, design/content/brand direction, "
+                        "user preferences, project context, and what people and companies do and how Dylan knows them. "
+                        "Ignore chat mechanics: what the assistant asked, offered, planned or explained, which tools it "
+                        "called and whether they worked, requests to name or title a chat, that a message had an image, "
+                        "turn or session counts, and restatements of what the user just asked. Ignore routine greetings, "
+                        "transient operational details, ephemeral system-state snapshots, one-off command output, and "
+                        "initialization status. Retain only what will still be true and useful next week.")
+              observe = ("Consolidate durable facts about people, companies, decisions and preferences. Never form an "
+                         "observation that describes the conversation itself: who asked what, what the assistant did or "
+                         "offered, chat titles, images sent, or that a conversation happened.")
+              body = json.dumps({"updates": {"retain_mission": retain, "observations_mission": observe}}).encode()
+              url = os.environ["HINDSIGHT_API_URL"] + "/v1/default/banks/" + os.environ["HINDSIGHT_BANK_ID"] + "/config"
+              req = urllib.request.Request(url, data=body, method="PATCH", headers={
+                  "Content-Type": "application/json", "Authorization": "Bearer " + os.environ["HINDSIGHT_API_KEY"]})
+              urllib.request.urlopen(req, timeout=30).read()
+              print("hindsight: bank retain and observation missions set")
+              ' || echo "WARN: hindsight bank missions not set (non-fatal)"
 
               cp /seed/SOUL.md /opt/data/SOUL.md
 
