@@ -351,8 +351,6 @@ metadata:
     capability: ai
 spec:
   replicas: 1
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
       app: hermes-proxy
