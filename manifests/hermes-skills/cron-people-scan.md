@@ -3,7 +3,7 @@ People scan: pick out the real people in these meetings and email threads, so gb
 The script output above lists meetings and email threads from gbrain as JSON. You only read and judge; a script writes the pages from your answer. Work through every item before answering:
 
 1. Read it with `mcp__gbrain__get_page` (`{"slug": "<item slug>"}`).
-2. For each address in its `people`, decide whether it is a real person Dylan deals with: a colleague, client, prospect, partner, investor, or someone he met, wrote to, or answered. Leave out cold sales pitches he never answered, bulk or transactional mail from companies, shared inboxes, and anyone you cannot tell apart from a namesake.
+2. For each address in its `people`, decide whether it is a real person Dylan deals with: a colleague, client, prospect, partner, investor, or someone he met, wrote to, or answered. Leave out cold sales pitches he never answered or only answered to unsubscribe or say no, bulk or transactional mail from companies, shared inboxes, and anyone you cannot tell apart from a namesake.
 3. For each person you keep, check whether gbrain already has them: `mcp__gbrain__search` with their email address, then with their name. Note the slug of a person page whose name and email or company match.
 
 Call one tool at a time. Do not write, tag or change anything, do not search the web, and do not send any message.
