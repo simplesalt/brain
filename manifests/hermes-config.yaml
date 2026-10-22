@@ -1,13 +1,10 @@
 _config_version: 39
-
 model:
   provider: openrouter
   default: minimax/minimax-m2.7
-
 fallback_providers:
   - provider: openrouter
     model: openai/gpt-oss-120b
-
 agent:
   environment_hint: |-
     At the start of every session, call hindsight_recall before giving your
@@ -15,7 +12,6 @@ agent:
     decisions, and open tasks. Use hindsight_recall (not gbrain) for personal
     memory — gbrain is for project knowledge, hindsight is for your own
     episodic memory across sessions.
-
   disabled_toolsets:
     - search
     - x_search
@@ -38,7 +34,6 @@ agent:
     - feishu_doc
     - feishu_drive
     - spotify
-
 platform_toolsets:
   cli:
     - clarify
@@ -50,24 +45,19 @@ platform_toolsets:
     - terminal
     - vision
     - web
-
 terminal:
   backend: local
   env_passthrough:
     - GBRAIN_REMOTE_TOKEN
-
 memory:
   provider: hindsight
   memory_enabled: false
   user_profile_enabled: false
-
 skills:
   write_approval: true
   creation_nudge_interval: 0
-
 web:
   backend: firecrawl
-
 auxiliary:
   vision:
     provider: openrouter
@@ -79,32 +69,44 @@ auxiliary:
     provider: main
   session_search:
     provider: main
-
 platforms:
   webhook:
     enabled: true
     extra:
       port: 8644
-
-
 mcp_servers:
   flux:
-    enabled: true
+    enabled: false
     url: http://mcp-flux.flux-system:9090/mcp
     timeout: 180
     tools:
       exclude:
         - apply_kubernetes_resource
         - apply_kubernetes_manifest
-
-
   gbrain:
     enabled: true
     url: http://gbrain:3131/mcp
     headers:
       Authorization: "Bearer ${GBRAIN_REMOTE_TOKEN}"
     timeout: 60
-
+    tools:
+      include:
+        - search
+        - query
+        - get_page
+        - put_page
+        - list_pages
+        - get_timeline
+        - add_timeline_entry
+        - add_tag
+        - remove_tag
+        - get_tags
+        - add_link
+        - get_backlinks
+        - open_loops
+        - find_experts
+        - resolve_slugs
+        - capture
   gbrain-mail:
     enabled: true
     url: http://gbrain:3131/mcp
@@ -114,23 +116,39 @@ mcp_servers:
     tools:
       include:
         - loops_close
-
   hermes-msg:
     enabled: true
     url: http://hermes-msg.ssint-main-msg:8080/mcp
     timeout: 60
-
   notion:
     enabled: true
     url: http://mcp-proxy:3001/mcp
     timeout: 60
-
+    tools:
+      include:
+        - API-post-search
+        - API-get-block-children
+        - API-get-users
+        - API-patch-page
+        - API-post-page
+        - API-query-data-source
+        - API-retrieve-a-data-source
+        - API-retrieve-a-page
+        - API-retrieve-page-markdown
+        - API-update-page-markdown
   hubspot:
     enabled: true
     url: http://mcp-proxy:3002/mcp
     timeout: 60
-
+    tools:
+      include:
+        - hubspot-search-objects
+        - hubspot-list-associations
+        - hubspot-batch-read-objects
   github:
-    enabled: true
+    enabled: false
     url: http://mcp-proxy:3003/mcp
     timeout: 60
+tools:
+  tool_search:
+    enabled: off

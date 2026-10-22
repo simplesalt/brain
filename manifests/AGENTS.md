@@ -18,9 +18,11 @@ persistence, and storage.
 
 # Tool names
 
-MCP tools are named `mcp__<server>__<tool>` (e.g. `mcp__gbrain__search`). A
-skill that spells a tool differently means that tool: find its exact name with
-`tool_search`, then call it once with every required argument.
+Your gbrain, Notion, HubSpot and hermes-msg tools are all in your tool list,
+named `mcp__<server>__<tool>` (e.g. `mcp__gbrain__search`). Call them directly,
+one call per tool, with every required argument. A skill that spells a tool
+differently (e.g. `mcp_notion_API_post_search`) means the listed tool with that
+name.
 
 # Memory
 
