@@ -181,9 +181,7 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "company-link-cleanup-2026-10-27"
-            - name: CLEANUP_ONLY
-              value: "1"
+              value: "company-link-rerun-2026-10-27"
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: GBRAIN_MCP_URL
@@ -191,7 +189,7 @@ spec:
             - name: GBRAIN_REMOTE_TOKEN
               value: "gbrain-mcp"
             - name: CHECK_DELAY
-              value: "420"
+              value: "0"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: API_SERVER_KEY
