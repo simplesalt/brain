@@ -1,0 +1,73 @@
+name: repin-builder
+
+on:
+  schedule:
+    - cron: "0 8 * * 5"
+    - cron: "0 8 * * 0"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Show what would move without committing
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: repin-builder
+  cancel-in-progress: false
+
+jobs:
+  repin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Repin builder HelmReleases
+        id: repin
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          arguments=()
+          summary_prefix=""
+          if [ "${DRY_RUN}" = "true" ]; then
+            arguments+=(--dry-run)
+            summary_prefix="Dry run: "
+          fi
+          output=$(python3 scripts/repin-builder.py "${arguments[@]}")
+          echo "${output}"
+          last_line=$(tail -n 1 <<<"${output}")
+          echo "version=${last_line##* }" >> "${GITHUB_OUTPUT}"
+          while IFS= read -r line; do
+            echo "- ${summary_prefix}${line}" >> "${GITHUB_STEP_SUMMARY}"
+          done <<<"${output}"
+
+      - name: Commit and push
+        if: ${{ inputs.dry_run != true }}
+        env:
+          BUILDER_VERSION: ${{ steps.repin.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "nothing changed, no commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add manifests/coding-rc.yaml manifests/coding-fe.yaml
+          git commit -m "chore(coding): repin every builder pod to builder ${BUILDER_VERSION}"
+          attempt=1
+          until git push origin HEAD:main; do
+            if [ "${attempt}" -ge 4 ]; then
+              echo "push still rejected after ${attempt} attempts"
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            git pull --rebase origin main
+          done
