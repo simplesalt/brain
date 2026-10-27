@@ -342,7 +342,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-rehearsal-runner-20261027d
+  name: gbrain-rehearsal-runner-20261027e
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -866,7 +866,7 @@ spec:
             - name: RUNNER_MODE
               value: upgrade
             - name: RUNNER_RUN_ID
-              value: "20261027d"
+              value: "20261027e"
             - name: RUNNER_WAIT_ITERATIONS
               value: "480"
             - name: GBRAIN_MCP_URL
