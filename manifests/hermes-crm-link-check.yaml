@@ -18,10 +18,15 @@ data:
     KEY = os.environ['API_SERVER_KEY']
     GBRAIN = os.environ.get('GBRAIN_MCP_URL', 'http://gbrain:3131/mcp')
     GBRAIN_TOKEN = os.environ['GBRAIN_REMOTE_TOKEN']
-    PERSON = 'Linkcheck Testperson'
-    COMPANY = 'Zzyzx Example Labs'
+    # A soft-deleted page keeps its slug for 72h and refuses a fresh put_page,
+    # so every run needs names no earlier run used.
+    TAG = os.environ['RUN_TAG']
+    PERSON = f'Linkcheck {TAG.title()}'
+    COMPANY = f'Zzyzx {TAG.title()} Labs'
+    PERSON_SLUG = f'people/linkcheck-{TAG.lower()}'
+    COMPANY_SLUG = f'companies/zzyzx-{TAG.lower()}-labs'
     # Only pages whose slug carries one of these are ever deleted.
-    TEST_MARKERS = ('linkcheck-testperson', 'zzyzx')
+    TEST_MARKERS = (f'linkcheck-{TAG.lower()}', f'zzyzx-{TAG.lower()}')
 
     def http(url, body=None, token=KEY, timeout=60):
         req = urllib.request.Request(url, method='POST' if body is not None else 'GET')
@@ -83,8 +88,8 @@ data:
             print(f'== delete_page {slug} -> {gbrain("delete_page", {"slug": slug, "expected_revision": rev})}')
 
     if os.environ.get('CLEANUP_ONLY') == '1':
-        delete_test_pages(['people/linkcheck-testperson', 'companies/zzyzx-example-labs']
-                          + sorted(slugs_matching(PERSON, 'linkcheck-testperson') | slugs_matching(COMPANY, 'zzyzx')))
+        delete_test_pages([PERSON_SLUG, COMPANY_SLUG]
+                          + sorted(slugs_matching(PERSON, TEST_MARKERS[0]) | slugs_matching(COMPANY, TEST_MARKERS[1])))
         print('== hermes-crm-link-check cleanup done')
         raise SystemExit(0)
 
@@ -115,14 +120,14 @@ data:
         print(b[:3000])
 
     time.sleep(10)
-    people = slugs_matching(PERSON, 'linkcheck-testperson')
-    ok, page = gbrain('get_page', {'slug': 'people/linkcheck-testperson'})
+    people = slugs_matching(PERSON, TEST_MARKERS[0])
+    ok, page = gbrain('get_page', {'slug': PERSON_SLUG})
     if ok:
-        people.add('people/linkcheck-testperson')
-    companies = slugs_matching(COMPANY, 'zzyzx')
-    ok, page = gbrain('get_page', {'slug': 'companies/zzyzx-example-labs'})
+        people.add(PERSON_SLUG)
+    companies = slugs_matching(COMPANY, TEST_MARKERS[1])
+    ok, page = gbrain('get_page', {'slug': COMPANY_SLUG})
     if ok:
-        companies.add('companies/zzyzx-example-labs')
+        companies.add(COMPANY_SLUG)
     print(f'== person pages: {sorted(people)}')
     print(f'== company pages: {sorted(companies)}')
 
@@ -135,7 +140,7 @@ data:
             ltype = l.get('link_type') or l.get('type') or ''
             if ltype == 'works_at' and gbrain('get_page', {'slug': target})[0]:
                 works_at.append((p, target))
-                if 'zzyzx' in target:
+                if TEST_MARKERS[1] in target:
                     companies.add(target)
 
     passed = bool(people) and bool(companies) and bool(works_at)
@@ -181,7 +186,9 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "company-link-rerun-2026-10-27"
+              value: "company-link-rerun2-2026-10-27"
+            - name: RUN_TAG
+              value: "quillmoor"
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: GBRAIN_MCP_URL
