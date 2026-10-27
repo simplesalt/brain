@@ -342,7 +342,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-rehearsal-runner-20261027e
+  name: gbrain-rehearsal-runner-20261027f
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -672,14 +672,9 @@ spec:
                 run $GBRAIN repair timeline --apply $RUNNER_REPAIR_ARGS
                 echo "startup effects re-chunk pages and leave vectors stale; the runbook step that embeds them is gbrain embed --stale"
                 echo "before embed --stale: chunks=$(qv "SELECT count(*) FROM content_chunks") embedded=$(qv "SELECT count(embedding) FROM content_chunks")"
-                echo "waiting up to 10 min for the autopilot to embed stale chunks under the paid-spend preapproval"
-                i=0
-                while [ "$i" -lt 60 ]; do
-                  C="$(qv "SELECT count(*) FROM content_chunks")"; EM="$(qv "SELECT count(embedding) FROM content_chunks")"
-                  [ "$C" = "$EM" ] && break
-                  i=$((i + 1)); sleep 10
-                done
-                echo "after waiting $((i * 10))s: chunks=$C embedded=$EM"
+                run $GBRAIN embed --stale --yes --max-usd 1
+                C="$(qv "SELECT count(*) FROM content_chunks")"; EM="$(qv "SELECT count(embedding) FROM content_chunks")"
+                echo "after embed --stale --yes --max-usd 1: chunks=$C embedded=$EM"
                 C="$(qv "SELECT count(*) FROM content_chunks")"; E="$(qv "SELECT count(embedding) FROM content_chunks")"; T="$(qv "SELECT count(*) FROM timeline_entries")"
                 echo "after: chunks=$C embedded=$E timeline=$T (restore baseline: 1490 chunks, 358 timeline entries)"
                 if [ "$C" = "$E" ]; then chk "every chunk embedded after repairs" PASS; else chk "every chunk embedded after repairs" FAIL; fi
@@ -866,7 +861,7 @@ spec:
             - name: RUNNER_MODE
               value: upgrade
             - name: RUNNER_RUN_ID
-              value: "20261027e"
+              value: "20261027f"
             - name: RUNNER_WAIT_ITERATIONS
               value: "480"
             - name: GBRAIN_MCP_URL

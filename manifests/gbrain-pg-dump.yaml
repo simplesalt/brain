@@ -20,7 +20,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-pg-dump-20261027
+  name: gbrain-pg-dump-20261027-hop
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -35,7 +35,7 @@ spec:
   template:
     metadata:
       labels:
-        app: gbrain-pg-dump-20261027
+        app: gbrain-pg-dump-20261027-hop
         entity: ssint
         env: main
         capability: ai
@@ -250,7 +250,7 @@ spec:
               exit 0
           env:
             - name: DUMP_LABEL
-              value: "pre-upgrade-20261027"
+              value: "pre-hop-20261027"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
