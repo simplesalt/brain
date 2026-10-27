@@ -71,6 +71,23 @@ data:
                 found.add(slug)
         return found
 
+    def delete_test_pages(slugs):
+        for slug in sorted(slugs):
+            if not any(m in slug for m in TEST_MARKERS):
+                continue
+            ok, page = gbrain('get_page', {'slug': slug})
+            if not ok:
+                print(f'== delete_page {slug}: already gone ({str(page)[:200]})')
+                continue
+            rev = page.get('revision') if isinstance(page, dict) else None
+            print(f'== delete_page {slug} -> {gbrain("delete_page", {"slug": slug, "expected_revision": rev})}')
+
+    if os.environ.get('CLEANUP_ONLY') == '1':
+        delete_test_pages(['people/linkcheck-testperson', 'companies/zzyzx-example-labs']
+                          + sorted(slugs_matching(PERSON, 'linkcheck-testperson') | slugs_matching(COMPANY, 'zzyzx')))
+        print('== hermes-crm-link-check cleanup done')
+        raise SystemExit(0)
+
     time.sleep(int(os.environ.get('CHECK_DELAY', '0')))
     for _ in range(60):
         if http(HERMES + '/health')[0] == 200:
@@ -125,9 +142,7 @@ data:
     print(f'== works_at links: {works_at}')
     print('RESULT: PASS' if passed else 'RESULT: FAIL')
 
-    for slug in sorted(people | companies):
-        if any(m in slug for m in TEST_MARKERS):
-            print(f'== delete_page {slug} -> {gbrain("delete_page", {"slug": slug})}')
+    delete_test_pages(people | companies)
     print('== hermes-crm-link-check done')
 ---
 apiVersion: batch/v1
@@ -166,7 +181,9 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "company-link-2026-10-27"
+              value: "company-link-cleanup-2026-10-27"
+            - name: CLEANUP_ONLY
+              value: "1"
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: GBRAIN_MCP_URL
