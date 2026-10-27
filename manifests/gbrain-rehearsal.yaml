@@ -8,7 +8,7 @@ metadata:
     env: main
     capability: ai
 data:
-  GBRAIN_REHEARSAL_SHA: "f8d1e3936d908935ce96e18c14249aecd85fb5b2"
+  GBRAIN_REHEARSAL_SHA: "23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc"
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -71,7 +71,7 @@ metadata:
     env: main
     capability: ai
 spec:
-  replicas: 0
+  replicas: 1
   strategy:
     type: Recreate
   selector:
@@ -80,7 +80,7 @@ spec:
   template:
     metadata:
       annotations:
-        simplesalt.company/restart-epoch: "3"
+        simplesalt.company/restart-epoch: "4"
       labels:
         app: gbrain-rehearsal
         entity: ssint
@@ -164,12 +164,24 @@ spec:
                 || echo "WARN: gbrain init failed; serve may not work correctly"
               $GBRAIN config set mcp.publish_advisor true \
                 || echo "WARN: config set mcp.publish_advisor failed (non-fatal)"
+              $GBRAIN config set memory.auto_writeback salient \
+                || echo "WARN: config set memory.auto_writeback failed (non-fatal)"
               $GBRAIN config set search.reranker.model voyage:rerank-2.5 \
                 || echo "WARN: config set search.reranker.model failed (non-fatal)"
-              $GBRAIN config set facts.extraction_model openrouter:minimax/minimax-m2.7 \
+              $GBRAIN config set facts.extraction_model openrouter:openai/gpt-oss-120b \
                 || echo "WARN: config set facts.extraction_model failed (non-fatal)"
               $GBRAIN config set cycle.conversation_facts_backfill.enabled true \
                 || echo "WARN: config set cycle.conversation_facts_backfill.enabled failed (non-fatal)"
+              $GBRAIN config set cycle.enrich_thin.enabled false \
+                || echo "WARN: config set cycle.enrich_thin.enabled failed (non-fatal)"
+              $GBRAIN config set cycle.enrich_thin.max_cost_usd 1000000 \
+                || echo "WARN: config set cycle.enrich_thin.max_cost_usd failed (non-fatal)"
+              $GBRAIN config set cycle.enrich_thin.max_total_cost_usd 1000000 \
+                || echo "WARN: config set cycle.enrich_thin.max_total_cost_usd failed (non-fatal)"
+              $GBRAIN config set cycle.enrich_thin.max_pages_per_tick 25 \
+                || echo "WARN: config set cycle.enrich_thin.max_pages_per_tick failed (non-fatal)"
+              $GBRAIN config set autopilot.incremental_extract_include_frontmatter true \
+                || echo "WARN: config set autopilot.incremental_extract_include_frontmatter failed (non-fatal)"
               bun -e '
                 import { SQL } from "bun";
                 const t = process.env.GBRAIN_REMOTE_TOKEN;
@@ -195,7 +207,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
-                  key: HINDSIGHT_API_LLM_API_KEY
+                  key: GENERAL_API_LLM_API_KEY
             - name: GBRAIN_EMBEDDING_MODEL
               value: openai:text-embedding-3-small
             - name: GBRAIN_EMBEDDING_DIMENSIONS
@@ -221,7 +233,7 @@ spec:
               containerPort: 3131
           startupProbe:
             periodSeconds: 10
-            failureThreshold: 90
+            failureThreshold: 200
             httpGet:
               path: /health
               port: 3131
@@ -285,7 +297,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
-                  key: HINDSIGHT_API_LLM_API_KEY
+                  key: GENERAL_API_LLM_API_KEY
             - name: GBRAIN_EMBEDDING_MODEL
               value: openai:text-embedding-3-small
             - name: GBRAIN_EMBEDDING_DIMENSIONS
@@ -328,7 +340,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-rehearsal-runner
+  name: gbrain-rehearsal-runner-20261027
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -410,8 +422,8 @@ spec:
               export PATH="/install/bin:$PATH"
               MODE="${RUNNER_MODE:-inspect}"
               case "$MODE" in
-                inspect|apply-repairs) ;;
-                *) echo "FATAL: RUNNER_MODE must be inspect or apply-repairs (got: $MODE)"; exit 1 ;;
+                inspect|apply-repairs|upgrade) ;;
+                *) echo "FATAL: RUNNER_MODE must be inspect, apply-repairs or upgrade (got: $MODE)"; exit 1 ;;
               esac
               case "${DATABASE_URL#*@}" in
                 gbrain-pg-rehearsal-rw*) ;;
@@ -505,10 +517,220 @@ spec:
                 i=0
                 until wget -q -T 3 -O /dev/null http://gbrain-rehearsal:3131/health; do
                   i=$((i + 1))
-                  if [ "$i" -ge 180 ]; then echo "WARN: gbrain-rehearsal not healthy after 900s; continuing anyway"; break; fi
+                  if [ "$i" -ge "${RUNNER_WAIT_ITERATIONS:-180}" ]; then
+                    if [ "$MODE" = "upgrade" ]; then echo "FATAL: gbrain-rehearsal not healthy after $((i * 5))s; the upgrade rehearsal cannot continue"; exit 1; fi
+                    echo "WARN: gbrain-rehearsal not healthy after $((i * 5))s; continuing anyway"; break
+                  fi
                   echo "waiting for gbrain-rehearsal /health ($i)"
                   sleep 5
                 done
+              fi
+
+              if [ "$MODE" = "upgrade" ]; then
+                case "${GBRAIN_MCP_URL:-}" in
+                  http://gbrain-rehearsal:3131/*) ;;
+                  *) echo "FATAL: GBRAIN_MCP_URL must target gbrain-rehearsal (got: ${GBRAIN_MCP_URL:-unset}); refusing to run"; exit 1 ;;
+                esac
+
+                cat > /work/mcp.ts <<'EOF'
+              const [name, argsJson = "{}", label = "", expr = ""] = process.argv.slice(2);
+              const url = process.env.GBRAIN_MCP_URL as string;
+              const token = process.env.GBRAIN_REMOTE_TOKEN as string;
+
+              const parseMcp = (text: string): any => {
+                let msg: any = null;
+                for (const block of text.split("\n\n")) {
+                  const data = block.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).join("\n");
+                  if (!data) continue;
+                  try { const o = JSON.parse(data); if (o.result || o.error) msg = o; } catch { /* keep scanning */ }
+                }
+                if (msg) return msg;
+                try { return JSON.parse(text); } catch { return null; }
+              };
+              const pick = (o: any, k: string): any => {
+                if (o === null || typeof o !== "object") return undefined;
+                if (k in o) return o[k];
+                for (const v of Object.values(o)) { const f = pick(v, k); if (f !== undefined) return f; }
+                return undefined;
+              };
+
+              const isList = name === "tools/list";
+              let r: any = null;
+              let isError = false;
+              try {
+                const res = await fetch(url, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: `Bearer ${token}` },
+                  body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: isList ? "tools/list" : "tools/call", params: isList ? {} : { name, arguments: JSON.parse(argsJson) } }),
+                });
+                const text = await res.text();
+                if (!res.ok) { console.log(`HTTP ${res.status}: ${text.slice(0, 300)}`); r = { http_status: res.status }; isError = true; }
+                else {
+                  const msg = parseMcp(text);
+                  if (!msg) { console.log("unparseable MCP response: " + text.slice(0, 300)); isError = true; }
+                  else if (msg.error) { console.log("rpc error: " + JSON.stringify(msg.error).slice(0, 500)); r = msg.error; isError = true; }
+                  else if (isList) {
+                    r = (msg.result?.tools ?? []).map((t: any) => t.name).sort();
+                    console.log(`tools/list: ${r.length} tools`);
+                    console.log(r.join("\n"));
+                  } else {
+                    isError = !!msg.result?.isError;
+                    const out = (msg.result?.content ?? []).map((c: any) => c.text ?? "").join("\n");
+                    try { r = JSON.parse(out); } catch { r = out; }
+                    console.log(`${name}: isError=${isError}`);
+                    console.log(out.slice(0, 2000));
+                  }
+                }
+              } catch (e) {
+                console.log("ERROR: " + (e instanceof Error ? e.message : String(e)));
+                isError = true;
+              }
+              await Bun.write("/work/last.json", JSON.stringify(r));
+              if (expr) {
+                let ok = false;
+                try { ok = !!new Function("r", "isError", "pick", "env", `return (${expr});`)(r, isError, (k: string) => pick(r, k), process.env); }
+                catch (e) { console.log("expression error: " + String(e)); }
+                console.log(`CHECK ${label}: ${ok ? "PASS" : "FAIL"}`);
+              }
+              EOF
+
+                CHECK_FAILED=""
+                scan() {
+                  label="$1"; shift
+                  OUT="$("$@" 2>&1)"
+                  echo "$OUT"
+                  case "$OUT" in
+                    *": FAIL"*) CHECK_FAILED="$CHECK_FAILED
+              - $label" ;;
+                  esac
+                  echo
+                }
+                chk() {
+                  echo "CHECK $1: $2"
+                  if [ "$2" != PASS ]; then CHECK_FAILED="$CHECK_FAILED
+              - $1"; fi
+                }
+                qv() { bun /work/q.ts "$1" | tail -n +2 | head -n 1; }
+                mc() { scan "$3" bun /work/mcp.ts "$@"; }
+                cfg() {
+                  V="$($GBRAIN config get "$1" 2>&1)"
+                  echo "config $1 = $V"
+                  if [ -n "${2:-}" ]; then
+                    case "$V" in *"$2"*) chk "config $1 contains $2" PASS ;; *) chk "config $1 contains $2" FAIL ;; esac
+                  fi
+                }
+
+                section "U0. wait for the bearer MCP to answer (serve is up, hermes-mcp token seeded)"
+                i=0
+                until bun /work/mcp.ts tools/list >/work/ready.txt 2>&1 && grep -q "tools/list: " /work/ready.txt; do
+                  i=$((i + 1))
+                  if [ "$i" -ge 120 ]; then echo "FATAL: bearer tools/list never answered; the rehearsal gbrain is not serving"; cat /work/ready.txt; exit 1; fi
+                  echo "waiting for bearer tools/list ($i)"
+                  sleep 5
+                done
+                echo "bearer MCP answering"
+
+                section "U1. gbrain --version (expect 0.60.214)"
+                V="$($GBRAIN --version 2>&1)"; echo "$V"
+                case "$V" in *0.60.214*) chk "version is 0.60.214" PASS ;; *) chk "version is 0.60.214" FAIL ;; esac
+
+                section "U2. config version row (expect 242)"
+                V="$(qv "SELECT value FROM config WHERE key = 'version'")"; echo "config version = $V"
+                if [ "$V" = "242" ]; then chk "schema version 242" PASS; else chk "schema version 242" FAIL; fi
+
+                section "U3. config readback"
+                cfg mcp.publish_advisor true
+                cfg mcp.publish_skills
+                cfg search.reranker.model voyage:rerank-2.5
+                cfg facts.extraction_model openrouter:openai/gpt-oss-120b
+                cfg memory.auto_writeback salient
+                cfg persistence.unbound_write
+                cfg cycle.conversation_facts_backfill.enabled true
+
+                section "U4. sources list --json (local_path null) and sync.repo_path unset"
+                $GBRAIN sources list --json >/work/sources.json 2>/work/sources.err
+                echo "[exit $?]"
+                scan "sources local_path null" bun -e '
+                  const j = JSON.parse(require("fs").readFileSync("/work/sources.json", "utf8"));
+                  const rows = Array.isArray(j) ? j : (j.sources ?? []);
+                  const bad = rows.filter((s) => s.local_path !== null && s.local_path !== undefined);
+                  console.log("sources: " + rows.length + ", with local_path set: " + bad.length);
+                  console.log("CHECK sources local_path null: " + (rows.length > 0 && bad.length === 0 ? "PASS" : "FAIL"));
+                '
+                V="$(qv "SELECT count(*) FROM config WHERE key = 'sync.repo_path' AND coalesce(value, '') <> ''")"; echo "sync.repo_path rows with a value = $V"
+                if [ "$V" = "0" ]; then chk "sync.repo_path unset" PASS; else chk "sync.repo_path unset" FAIL; fi
+
+                section "U5. repair dry runs, apply, counts"
+                echo "before: chunks=$(qv "SELECT count(*) FROM content_chunks") embedded=$(qv "SELECT count(embedding) FROM content_chunks") timeline=$(qv "SELECT count(*) FROM timeline_entries")"
+                run $GBRAIN repair safe-chunks
+                run $GBRAIN repair timeline
+                run $GBRAIN repair safe-chunks --apply $RUNNER_REPAIR_ARGS
+                run $GBRAIN repair timeline --apply $RUNNER_REPAIR_ARGS
+                C="$(qv "SELECT count(*) FROM content_chunks")"; E="$(qv "SELECT count(embedding) FROM content_chunks")"; T="$(qv "SELECT count(*) FROM timeline_entries")"
+                echo "after: chunks=$C embedded=$E timeline=$T (restore baseline: 1490 chunks, 358 timeline entries)"
+                if [ "$C" = "$E" ]; then chk "every chunk embedded after repairs" PASS; else chk "every chunk embedded after repairs" FAIL; fi
+                if [ "$T" = "358" ]; then chk "timeline_entries == 358" PASS; else chk "timeline_entries == 358 (got $T)" FAIL; fi
+
+                section "U6. live pages below chunker_version 4 (expect 0)"
+                V="$(qv "SELECT count(*) FROM pages WHERE deleted_at IS NULL AND chunker_version < 4")"; echo "pages below chunker 4 = $V"
+                if [ "$V" = "0" ]; then chk "no pages below chunker_version 4" PASS; else chk "no pages below chunker_version 4" FAIL; fi
+
+                section "U7. get_stats and get_health over the bearer MCP"
+                mc get_stats '{}' "get_stats embedded_count == chunk_count" 'pick("embedded_count") === pick("chunk_count") && pick("chunk_count") > 0'
+                mc get_health '{}' "get_health missing_embeddings == 0" '(pick("missing_embeddings") ?? 0) === 0'
+
+                section "U8. canned bearer search on 3 existing person pages"
+                for n in 0 1 2; do
+                  SLUG="$(qv "SELECT slug FROM pages WHERE type = 'person' AND deleted_at IS NULL ORDER BY slug OFFSET $n LIMIT 1")"
+                  TITLE="$(qv "SELECT coalesce(nullif(title, ''), slug) FROM pages WHERE type = 'person' AND deleted_at IS NULL ORDER BY slug OFFSET $n LIMIT 1")"
+                  echo "person page $n: slug=$SLUG title=$TITLE"
+                  export EXPECT_SLUG="$SLUG" TITLE
+                  scan "search finds $SLUG" bun /work/mcp.ts search "$(bun -e 'console.log(JSON.stringify({ query: process.env.TITLE, limit: 5 }))')" "search finds person page $n" 'env.EXPECT_SLUG !== "" && JSON.stringify(r).includes(env.EXPECT_SLUG)'
+                done
+
+                section "U9. put_page revision guard (scratch page, rehearsal copy only)"
+                TS="notes/upgrade-rehearsal-${RUNNER_RUN_ID:-none}"
+                BODY='{"slug":"'"$TS"'","content":"---\ntype: note\ntitle: Upgrade rehearsal check\n---\n\nScratch page written by the rehearsal runner."}'
+                mc put_page "$BODY" "put_page create ok" '!isError'
+                mc put_page "$BODY" "put_page without revision -> revision_conflict" 'isError && (r?.error === "revision_conflict" || r?.write_error === "revision_conflict")'
+                mc get_page '{"slug":"'"$TS"'"}' "get_page returns a revision" '!isError && !!pick("revision")'
+                REV="$(bun -e 'const r = JSON.parse(require("fs").readFileSync("/work/last.json", "utf8")); const f = (o, k) => o && typeof o === "object" ? (k in o ? o[k] : Object.values(o).map((v) => f(v, k)).find((x) => x !== undefined)) : undefined; console.log(f(r, "revision") ?? "")')"
+                echo "revision read: $REV"
+                BODY2='{"slug":"'"$TS"'","expected_revision":"'"$REV"'","content":"---\ntype: note\ntitle: Upgrade rehearsal check\n---\n\nScratch page, second write with the expected revision."}'
+                mc put_page "$BODY2" "put_page with expected_revision ok" '!isError'
+
+                section "U10. add_timeline_entry round trip incl. a Dux Soup shaped entry"
+                mc add_timeline_entry '{"slug":"'"$TS"'","date":"2026-10-27","summary":"Rehearsal plain entry","detail":"plain detail","source":"rehearsal:plain"}' "add_timeline_entry plain ok" '!isError'
+                mc add_timeline_entry '{"slug":"'"$TS"'","date":"2026-10-27","summary":"LinkedIn message: success","detail":"line one\nline two\n\nline four","source":"duxsoup:message:rehearsal-'"${RUNNER_RUN_ID:-none}"'"}' "add_timeline_entry dux soup shaped ok" '!isError'
+                V="$(qv "SELECT count(*) FROM timeline_entries t JOIN pages p ON p.id = t.page_id WHERE p.slug = '$TS' AND t.summary = 'LinkedIn message: success' AND position(chr(10) in t.detail) > 0")"
+                echo "dux soup shaped rows read back with newlines intact = $V"
+                if [ "$V" = "1" ]; then chk "dux soup timeline entry read back" PASS; else chk "dux soup timeline entry read back" FAIL; fi
+
+                section "U11. put_raw_data"
+                mc put_raw_data '{"slug":"'"$TS"'","source":"rehearsal","data":{"run":"'"${RUNNER_RUN_ID:-none}"'","ok":true}}' "put_raw_data ok" '!isError'
+
+                section "U12. tools/list with the hermes-mcp token (sorted names)"
+                mc tools/list '{}' "tools/list answers with tools" 'Array.isArray(r) && r.length > 0 && r.includes("put_page") && r.includes("search")'
+
+                section "U13. doctor summary, hermes-mcp token row, writer probe"
+                $GBRAIN doctor --json >/work/doctor.json 2>/work/doctor.err
+                echo "[doctor exit $?]"
+                scan "doctor summary" bun -e '
+                  const raw = require("fs").readFileSync("/work/doctor.json", "utf8");
+                  let j; try { j = JSON.parse(raw); } catch { console.log("doctor output is not JSON: " + raw.slice(0, 500)); console.log("CHECK doctor json parses: FAIL"); process.exit(0); }
+                  const checks = Array.isArray(j.checks) ? j.checks : [];
+                  const by = {};
+                  for (const c of checks) by[c.status ?? "unknown"] = (by[c.status ?? "unknown"] ?? 0) + 1;
+                  console.log("doctor status=" + (j.status ?? "n/a") + " health_score=" + (j.health_score ?? "n/a") + " checks=" + JSON.stringify(by));
+                  for (const c of checks) if (c.status && c.status !== "ok" && c.status !== "pass") console.log("  " + c.status + ": " + c.name + " - " + String(c.message ?? "").slice(0, 200));
+                  console.log("CHECK doctor json parses: PASS");
+                '
+                V="$(qv "SELECT count(*) FROM access_tokens WHERE name = 'hermes-mcp' AND revoked_at IS NULL")"; echo "active hermes-mcp token rows = $V"
+                if [ "$V" -ge 1 ] 2>/dev/null; then chk "hermes-mcp bearer present (startup log line 'hermes-mcp bearer asserted' is in the gbrain-rehearsal pod log)" PASS; else chk "hermes-mcp bearer present" FAIL; fi
+                run $GBRAIN sources writer status --probe --json
+
+                section "U-summary"
+                if [ -n "$CHECK_FAILED" ]; then echo "UPGRADE CHECKS FAILED:$CHECK_FAILED"; else echo "UPGRADE CHECKS: all PASS"; fi
               fi
 
               if [ "$MODE" = "apply-repairs" ]; then
@@ -623,9 +845,15 @@ spec:
               exit 0
           env:
             - name: RUNNER_MODE
-              value: inspect
+              value: upgrade
             - name: RUNNER_RUN_ID
-              value: "6"
+              value: "20261027"
+            - name: RUNNER_WAIT_ITERATIONS
+              value: "480"
+            - name: GBRAIN_MCP_URL
+              value: http://gbrain-rehearsal:3131/mcp
+            - name: GBRAIN_REMOTE_TOKEN
+              value: "gbrain-mcp"
             - name: RUNNER_REPAIR_ARGS
               value: ""
             - name: RUNNER_WAIT_FOR_SERVE
@@ -648,7 +876,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
-                  key: HINDSIGHT_API_LLM_API_KEY
+                  key: GENERAL_API_LLM_API_KEY
             - name: GBRAIN_EMBEDDING_MODEL
               value: openai:text-embedding-3-small
             - name: GBRAIN_EMBEDDING_DIMENSIONS
