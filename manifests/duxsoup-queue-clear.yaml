@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duxsoup-queue-clear-script
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+data:
+  clear.mjs: |
+    // One-off: removes two LinkedIn messages Hermes queued to a phone number and
+    // a bare name (they can never send), as Dylan asked on 2026-10-27. Dux Soup
+    // can only empty the whole queue (/reset), so this checks the queue holds
+    // nothing but the known items, empties it, and queues the two visits again.
+    // Re-runs are no-ops once the broken messages are gone.
+    // https://support.dux-soup.com/article/230-queue-management-api
+    import { createHmac } from 'crypto';
+
+    const BASE = process.env.DUXSOUP_BASE_URL ?? 'https://app.dux-soup.com';
+    const USER = process.env.DUXSOUP_USER_ID ?? '';
+    const KEY = process.env.DUXSOUP_API_KEY ?? '';
+    const BROKEN = ['0ee8ef03-bb63-1c52e0ff7c0b', '80dc3df8-8ed7-ee702d4e2a48'];
+    const VISITS = {
+      '4ed20e80-92a3-525021e99562': 'https://www.linkedin.com/in/jeremy-wong-0051aa9b',
+      '9af64ba4-9869-16950f3055d0': 'https://www.linkedin.com/in/brian-douglass-1942308a',
+    };
+
+    const sign = (s) => createHmac('sha1', KEY).update(s).digest('base64');
+    const root = `${BASE}/xapi/remote/control/${USER}`;
+
+    async function get(path) {
+      const url = `${root}${path}`;
+      const r = await fetch(url, { headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': sign(url) } });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`GET ${path} ${r.status}: ${text.slice(0, 200)}`);
+      return JSON.parse(text);
+    }
+
+    async function post(path, extra) {
+      const targeturl = `${root}${path}`;
+      const body = JSON.stringify({ targeturl, timestamp: Date.now(), userid: USER, ...extra });
+      const r = await fetch(targeturl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': sign(body) },
+        body,
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`POST ${path} ${r.status}: ${text.slice(0, 200)}`);
+      return text;
+    }
+
+    if (!USER || !KEY) throw new Error('DUXSOUP_USER_ID / DUXSOUP_API_KEY not set');
+    const raw = await get('/queue/items');
+    const items = Array.isArray(raw) ? raw : (raw.items ?? raw.data ?? []);
+    const ids = items.map((i) => i.messageid);
+    console.log(`queue before: ${JSON.stringify(items.map((i) => ({ messageid: i.messageid, command: i.command })))}`);
+    if (!BROKEN.some((id) => ids.includes(id))) {
+      console.log('broken messages already gone; nothing to do');
+      process.exit(0);
+    }
+    const unknown = ids.filter((id) => !BROKEN.includes(id) && !(id in VISITS));
+    if (unknown.length) {
+      console.error(`queue holds items this job does not know (${unknown.join(', ')}); not clearing`);
+      process.exit(1);
+    }
+    console.log(`reset: ${await post('/reset', { params: {} })}`);
+    for (const id of ids.filter((x) => x in VISITS)) {
+      const res = await post('/queue', { command: 'visit', params: { profile: VISITS[id], campaignid: 'default' } });
+      console.log(`requeued visit ${VISITS[id]}: ${res}`);
+    }
+    console.log(`queue after: ${JSON.stringify(await get('/queue/items'))}`);
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: duxsoup-queue-clear-20261027
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: duxsoup-queue-clear
+        entity: ssint
+        env: main
+        capability: msg
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: clear
+          image: oven/bun:1-alpine
+          command: ["bun", "/script/clear.mjs"]
+          env:
+            - name: DUXSOUP_USER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-user-id
+                  key: user_id
+            - name: DUXSOUP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-api-key
+                  key: api_key
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: script
+              mountPath: /script
+      volumes:
+        - name: script
+          configMap:
+            name: duxsoup-queue-clear-script

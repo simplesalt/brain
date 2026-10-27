@@ -552,9 +552,11 @@ data:
       const campaign_id = await ensureLookupCampaign();
       const requested_at = new Date().toISOString();
       // batchEnroll signal: https://support.dux-soup.com/article/229-extension-control-api
+      // target 'local' runs it in Dylan's browser extension; there is no Dux Soup
+      // Cloud session, and a 'cloud' signal is discarded after a minute unrun.
       await duxPost('/signal', {
         signal: 'batchEnroll',
-        params: { searchurl: search_url, campaignid: campaign_id, maxenrolls: max, target: 'cloud' },
+        params: { searchurl: search_url, campaignid: campaign_id, maxenrolls: max, target: 'local' },
       });
       return {
         search_url,
@@ -969,7 +971,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "4"
+        simplesalt.company/restart-epoch: "5"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
