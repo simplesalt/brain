@@ -71,7 +71,7 @@ metadata:
     env: main
     capability: ai
 spec:
-  replicas: 1
+  replicas: 0
   strategy:
     type: Recreate
   selector:

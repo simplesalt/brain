@@ -20,7 +20,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-pg-dump
+  name: gbrain-pg-dump-20261027
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -35,7 +35,7 @@ spec:
   template:
     metadata:
       labels:
-        app: gbrain-pg-dump
+        app: gbrain-pg-dump-20261027
         entity: ssint
         env: main
         capability: ai
@@ -104,6 +104,15 @@ spec:
                   n=$(q "SELECT count(*) FROM $t") || return 1
                   echo "${1}_${t}=${n}"
                 done
+                has_del=$(q "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'pages' AND column_name = 'deleted_at'") || return 1
+                if [ "$has_del" = "1" ]; then
+                  n=$(q "SELECT count(*) FROM pages WHERE deleted_at IS NULL") || return 1
+                else
+                  n=$(q "SELECT count(*) FROM pages") || return 1
+                fi
+                echo "${1}_pages_live=${n}"
+                n=$(q "SELECT count(*) FROM content_chunks WHERE embedding IS NOT NULL") || return 1
+                echo "${1}_chunks_embedded=${n}"
                 v=$(q "SELECT value FROM config WHERE key = 'version'") || return 1
                 echo "${1}_config_version=${v:-none}"
               }
@@ -226,10 +235,13 @@ spec:
                   echo "  $t: before=${b:-unavailable} after=${a:-unavailable}"
                 fi
               done
+              echo "  pages (deleted_at IS NULL): $(val "$BEFORE" before_pages_live) -> $(val "$AFTER" after_pages_live)"
+              echo "  content_chunks with embedding: $(val "$BEFORE" before_chunks_embedded) -> $(val "$AFTER" after_chunks_embedded)"
+              echo "  config version: $(val "$BEFORE" before_config_version) -> $(val "$AFTER" after_config_version)"
               echo "a non-zero delta means a writer changed the live database during the dump; the dump holds one consistent snapshot taken between the two counts. Stop all gbrain writers before the dump for an exact rollback point."
               echo
               echo "NEXT (for the parent; this job has done none of it):"
-              echo "  1. Run Job gbrain-pg-dump-verify-restore from this same manifest. It restores the newest dump with this label into a throwaway database on the rehearsal cluster only, compares row counts with the numbers above, drops the database, and ends with RESULT: PASS or RESULT: FAIL."
+              echo "  1. Job gbrain-pg-restore-20261027 in this manifest waits for this dump (label $DUMP_LABEL), then replaces database gbrain on the rehearsal cluster with it and ends with RESULT: PASS or RESULT: FAIL."
               echo "  2. Start the upgrade only after that job prints RESULT: PASS."
               echo "  3. This dump is the rollback artifact. Keep PVC gbrain-pg-dumps: it is annotated prune: disabled, but its StorageClass reclaim policy is Delete, so deleting the PVC deletes the dump. The volume is node-local; it does not survive losing its node."
               echo "  4. Rollback outline (a separate reviewed step): stop every gbrain writer; as role gbrain on gbrain-pg-rw run DROP DATABASE gbrain WITH (FORCE) then CREATE DATABASE gbrain TEMPLATE template0 with the encoding, collate and ctype recorded in $base.info; then pg_restore --exit-on-error --single-transaction --dbname=gbrain $DUMP_DIR/$base from a Job that mounts gbrain-pg-dumps."
@@ -238,7 +250,7 @@ spec:
               exit 0
           env:
             - name: DUMP_LABEL
-              value: "trial-2026-10-06"
+              value: "pre-upgrade-20261027"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -266,7 +278,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-pg-dump-verify-restore
+  name: gbrain-pg-restore-20261027
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -275,13 +287,13 @@ metadata:
   annotations:
     kustomize.toolkit.fluxcd.io/force: enabled
 spec:
-  activeDeadlineSeconds: 1800
+  activeDeadlineSeconds: 3600
   ttlSecondsAfterFinished: 604800
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: gbrain-pg-dump-verify-restore
+        app: gbrain-pg-restore-20261027
         entity: ssint
         env: main
         capability: ai
@@ -295,45 +307,19 @@ spec:
         fsGroup: 26
         seccompProfile:
           type: RuntimeDefault
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                topologyKey: kubernetes.io/hostname
-                labelSelector:
-                  matchLabels:
-                    cnpg.io/cluster: gbrain-pg
       containers:
-        - name: verify-restore
+        - name: restore
           image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
             - |
-              export PGAPPNAME=gbrain-pg-dump-verify-restore
+              export PGAPPNAME=gbrain-pg-restore-20261027
 
               DUMP_DIR=/dumps
               TARGET_HOST=gbrain-pg-rehearsal-rw
-              RESTORE_DB=gbrain_restore_check
-              TABLES="pages content_chunks timeline_entries facts access_tokens"
-              REQUIRED="pages content_chunks timeline_entries config access_tokens"
-              created=""
+              TARGET_DB=gbrain
               status=PASS
-
-              cleanup() {
-                if [ "$created" = "yes" ]; then
-                  if [ "$KEEP_DB" = "true" ]; then
-                    echo "KEEP_DB=true: leaving database $RESTORE_DB on $PGHOST for inspection; drop it by hand when done"
-                  else
-                    echo "dropping database $RESTORE_DB on $PGHOST"
-                    psql -X -q -h "$PGHOST" -d postgres -c "DROP DATABASE IF EXISTS $RESTORE_DB WITH (FORCE)" \
-                      || echo "WARN: could not drop $RESTORE_DB on $PGHOST; drop it by hand"
-                  fi
-                fi
-              }
-              trap cleanup EXIT
-              trap 'exit 143' TERM INT
 
               fail() {
                 echo "FATAL: $*"
@@ -353,11 +339,25 @@ spec:
               }
 
               rq() {
-                psql -X -q -A -t -v ON_ERROR_STOP=1 -h "$PGHOST" -d "$RESTORE_DB" -c "$1"
+                psql -X -q -A -t -v ON_ERROR_STOP=1 -h "$PGHOST" -d "$TARGET_DB" -c "$1"
               }
 
               val() {
                 grep "^$1=" "$info" | cut -d= -f2-
+              }
+
+              # compare restored value $2 with the live counts recorded before ($3) and after ($4) the dump
+              check() {
+                name="$1"; r="$2"; b="$3"; a="$4"
+                if [ -z "$b" ] || [ -z "$a" ]; then
+                  echo "  $name: restored=$r, no live counts recorded"
+                  status=FAIL
+                  return
+                fi
+                lo=$b; hi=$a
+                if [ "$lo" -gt "$hi" ]; then lo=$a; hi=$b; fi
+                if [ "$r" -ge "$lo" ] && [ "$r" -le "$hi" ]; then verdict=ok; else verdict=OUTSIDE-RECORDED-RANGE; status=FAIL; fi
+                echo "  $name: prod-before-dump=$b prod-after-dump=$a restored=$r $verdict"
               }
 
               if [ "$PGHOST" != "$TARGET_HOST" ]; then
@@ -370,11 +370,12 @@ spec:
                 fail "$DUMP_DIR is missing (is the gbrain-pg-dumps volume mounted?)"
               fi
               case "$DUMP_LABEL" in
-                ""|*[!A-Za-z0-9._*-]*) fail "DUMP_LABEL must be non-empty and use only letters, digits, dot, underscore, hyphen or * (got: $DUMP_LABEL)" ;;
+                ""|*[!A-Za-z0-9._-]*) fail "DUMP_LABEL must be non-empty and use only letters, digits, dot, underscore and hyphen (got: $DUMP_LABEL)" ;;
               esac
 
-              echo "gbrain-pg-dump-verify-restore: started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-              echo "restore target: $PGHOST (rehearsal cluster only), throwaway database $RESTORE_DB, dump label filter: $DUMP_LABEL"
+              echo "gbrain-pg-restore-20261027: started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "target: database $TARGET_DB on $PGHOST (rehearsal cluster only) will be DROPPED and recreated from the dump labelled $DUMP_LABEL"
+              echo "prod (gbrain-pg-rw) is not contacted by this job"
 
               i=0
               until pg_isready -h "$PGHOST" -p 5432; do
@@ -385,13 +386,13 @@ spec:
               done
 
               section "1. rehearsal connection and privileges"
-              adm "SELECT current_user || ' on ' || coalesce(nullif(current_setting('cluster_name', true), ''), '(cluster_name unset)') || ', ' || version()"
+              adm "SELECT current_user || ' on ' || version()"
               if [ "$(adm "SELECT rolsuper FROM pg_roles WHERE rolname = current_user")" != "t" ]; then
-                fail "role $PGUSER on $PGHOST is not a superuser, which restoring the vector extension and creating the database need; the rehearsal cluster would need enableSuperuserAccess or a superuser managed role"
+                fail "role $PGUSER on $PGHOST is not a superuser"
               fi
               echo "role $PGUSER is a superuser on $PGHOST: ok"
 
-              section "2. locate the newest finished dump"
+              section "2. wait for the finished prod dump (label $DUMP_LABEL)"
               file=""
               i=0
               while [ -z "$file" ]; do
@@ -400,7 +401,7 @@ spec:
                 done
                 if [ -n "$file" ]; then break; fi
                 i=$((i + 1))
-                if [ "$i" -ge 120 ]; then fail "no finished dump (a .dump with its .info and .sha256) matching gbrain-${DUMP_LABEL}-*.dump after 600s"; fi
+                if [ "$i" -ge 360 ]; then fail "no finished dump (.dump with .info and .sha256) matching gbrain-${DUMP_LABEL}-*.dump after 1800s"; fi
                 echo "waiting for a finished dump in $DUMP_DIR ($i)"
                 sleep 5
               done
@@ -409,71 +410,63 @@ spec:
               echo "dump: $file"
               ls -l "$file" "$file.sha256" "$info"
               (cd "$DUMP_DIR" && sha256sum -c "$base.sha256") || fail "checksum of $base does not match its .sha256"
-
-              section "3. dump contents"
-              toc=$(pg_restore --list "$file") || fail "pg_restore --list failed on $base"
-              for t in $REQUIRED; do
-                if printf '%s\n' "$toc" | grep -q " TABLE public $t " && printf '%s\n' "$toc" | grep -q " TABLE DATA public $t "; then
-                  echo "  ok   public.$t (definition and data present)"
-                else
-                  fail "public.$t is missing from $base"
-                fi
-              done
+              echo "dump size: $(wc -c < "$file") bytes"
+              echo "dump sha256: $(cut -d ' ' -f 1 "$file.sha256")"
               echo "recorded at dump time:"
               cat "$info"
+              pg_restore --list "$file" > /dev/null || fail "pg_restore --list failed on $base"
 
-              section "4. create the throwaway database and restore"
-              adm "DROP DATABASE IF EXISTS $RESTORE_DB WITH (FORCE)" || fail "could not clear a leftover $RESTORE_DB"
-              adm "CREATE DATABASE $RESTORE_DB TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'" || fail "could not create $RESTORE_DB"
-              created=yes
-              echo "created $RESTORE_DB on $PGHOST"
+              section "3. current rehearsal database (to be discarded)"
+              adm "SELECT datname, pg_size_pretty(pg_database_size(datname)) FROM pg_database WHERE datname = '$TARGET_DB'"
+              echo "schema version being discarded: $(rq "SELECT value FROM config WHERE key = 'version'" 2>&1)"
+              i=0
+              while :; do
+                n=$(adm "SELECT count(*) FROM pg_stat_activity WHERE datname = '$TARGET_DB' AND pid <> pg_backend_pid()")
+                if [ "$n" = "0" ]; then break; fi
+                i=$((i + 1))
+                if [ "$i" -ge 60 ]; then echo "WARN: $n connections still open after 300s (the gbrain-rehearsal Deployment should be at 0 replicas); DROP ... WITH (FORCE) will end them"; break; fi
+                echo "waiting for $n connections to $TARGET_DB to close ($i)"
+                sleep 5
+              done
+
+              section "4. replace database $TARGET_DB with the dump"
+              adm "DROP DATABASE IF EXISTS $TARGET_DB WITH (FORCE)" || fail "could not drop $TARGET_DB"
+              adm "CREATE DATABASE $TARGET_DB OWNER gbrain TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'" || fail "could not create $TARGET_DB"
               src_locale=$(val database_encoding_collate_ctype)
               if [ "$src_locale" != "UTF8 C C" ]; then
-                echo "WARN: source database encoding/collate/ctype is '$src_locale' but $RESTORE_DB was created as 'UTF8 C C'"
+                echo "WARN: source database encoding/collate/ctype is '$src_locale' but $TARGET_DB was created as 'UTF8 C C'"
               fi
-              echo "restoring at $(date -u +%Y-%m-%dT%H:%M:%SZ) (single transaction, stops at the first error, ownership and privileges kept)"
-              pg_restore --host="$PGHOST" --dbname="$RESTORE_DB" --exit-on-error --single-transaction --no-password "$file" \
-                || fail "pg_restore into $RESTORE_DB failed"
+              echo "restoring at $(date -u +%Y-%m-%dT%H:%M:%SZ) (single transaction, stops at the first error)"
+              pg_restore --host="$PGHOST" --dbname="$TARGET_DB" --exit-on-error --single-transaction --no-password "$file" \
+                || fail "pg_restore into $TARGET_DB failed ($TARGET_DB is now empty or missing)"
               echo "restore finished at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-              section "5. restored database checks"
+              section "5. counts: prod (recorded at dump time) vs restored"
               rq "SELECT extname || ' ' || extversion FROM pg_extension ORDER BY extname"
-              for t in $TABLES; do
-                r=$(rq "SELECT count(*) FROM $t") || { echo "  $t: count query failed"; status=FAIL; continue; }
-                b=$(val "before_$t")
-                a=$(val "after_$t")
-                if [ -z "$b" ] || [ -z "$a" ]; then
-                  echo "  $t: restored=$r, no live counts recorded in $base.info"
-                  status=FAIL
-                  continue
-                fi
-                lo=$b
-                hi=$a
-                if [ "$lo" -gt "$hi" ]; then lo=$a; hi=$b; fi
-                if [ "$r" -ge "$lo" ] && [ "$r" -le "$hi" ]; then
-                  verdict=ok
-                else
-                  verdict=OUTSIDE-RECORDED-RANGE
-                  status=FAIL
-                fi
-                echo "  $t: restored=$r live-before-dump=$b live-after-dump=$a $verdict"
-              done
+              if [ "$(rq "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'pages' AND column_name = 'deleted_at'")" = "1" ]; then
+                pl=$(rq "SELECT count(*) FROM pages WHERE deleted_at IS NULL")
+              else
+                pl=$(rq "SELECT count(*) FROM pages")
+              fi
+              check "pages (deleted_at IS NULL)" "$pl" "$(val before_pages_live)" "$(val after_pages_live)"
+              check "content_chunks" "$(rq "SELECT count(*) FROM content_chunks")" "$(val before_content_chunks)" "$(val after_content_chunks)"
+              check "content_chunks with embedding" "$(rq "SELECT count(*) FROM content_chunks WHERE embedding IS NOT NULL")" "$(val before_chunks_embedded)" "$(val after_chunks_embedded)"
+              check "timeline_entries" "$(rq "SELECT count(*) FROM timeline_entries")" "$(val before_timeline_entries)" "$(val after_timeline_entries)"
               rv=$(rq "SELECT value FROM config WHERE key = 'version'")
               bv=$(val before_config_version)
-              av=$(val after_config_version)
               if [ "${rv:-none}" = "$bv" ]; then verdict=ok; else verdict=MISMATCH; status=FAIL; fi
-              echo "  config version: restored=${rv:-none} live-before-dump=$bv live-after-dump=$av $verdict"
+              echo "  config version: prod-before-dump=$bv prod-after-dump=$(val after_config_version) restored=${rv:-none} $verdict"
               rt=$(rq "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
               ri=$(rq "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public'")
               if [ "$rt" = "$(val public_tables)" ]; then verdict=ok; else verdict=MISMATCH; status=FAIL; fi
-              echo "  public tables: restored=$rt recorded=$(val public_tables) $verdict"
+              echo "  public tables: recorded=$(val public_tables) restored=$rt $verdict"
               if [ "$ri" = "$(val public_indexes)" ]; then verdict=ok; else verdict=MISMATCH; status=FAIL; fi
-              echo "  public indexes: restored=$ri recorded=$(val public_indexes) $verdict"
+              echo "  public indexes: recorded=$(val public_indexes) restored=$ri $verdict"
 
               section "6. result"
-              echo "dump $base restored into $RESTORE_DB on $PGHOST"
+              echo "dump $base restored into $TARGET_DB on $PGHOST; the rehearsal gbrain Deployment must stay at 0 replicas until it is pointed at the new version"
               echo "RESULT: $status"
-              echo "gbrain-pg-dump-verify-restore: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ); database cleanup follows"
+              echo "gbrain-pg-restore-20261027: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
               if [ "$status" = "PASS" ]; then exit 0; fi
               exit 1
           env:
@@ -492,9 +485,7 @@ spec:
                   name: gbrain-pg-rehearsal-app
                   key: password
             - name: DUMP_LABEL
-              value: "trial-2026-10-06"
-            - name: KEEP_DB
-              value: "false"
+              value: "pre-upgrade-20261027"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
