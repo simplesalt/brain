@@ -181,6 +181,8 @@ spec:
                 || echo "WARN: gbrain init failed; serve may not work correctly"
               $GBRAIN config set mcp.publish_advisor true \
                 || echo "WARN: config set mcp.publish_advisor failed (non-fatal)"
+              $GBRAIN config set memory.auto_writeback salient \
+                || echo "WARN: config set memory.auto_writeback failed (non-fatal)"
               $GBRAIN config set search.reranker.model voyage:rerank-2.5 \
                 || echo "WARN: config set search.reranker.model failed (non-fatal)"
               $GBRAIN config set facts.extraction_model openrouter:openai/gpt-oss-120b \
