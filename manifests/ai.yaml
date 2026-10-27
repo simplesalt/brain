@@ -370,7 +370,7 @@ spec:
                 sleep 300
                 while true; do
                   echo "enrich_thin: start"
-                  $GBRAIN dream --phase enrich_thin --repo /tmp 2>&1 | tail -n 20 || echo "WARN: enrich_thin run failed"
+                  $GBRAIN dream --phase enrich_thin 2>&1 | tail -n 20 || echo "WARN: enrich_thin run failed"
                   sleep 3600
                 done
               ) &
