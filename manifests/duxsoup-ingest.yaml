@@ -1803,7 +1803,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "7"
+        simplesalt.company/restart-epoch: "8"
     spec:
       serviceAccountName: duxsoup-ingest
       containers:
