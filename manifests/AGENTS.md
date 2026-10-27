@@ -54,6 +54,21 @@ Save them there. gbrain holds project knowledge.
   over MCP does not create links or timeline entries from the text. Keep the
   page's existing Timeline section when you rewrite it; gbrain refuses a
   rewrite that would drop timeline entries.
+- Saving a person who works at a company takes all four steps, every time,
+  even when the company is only named in passing:
+  1. Find the company page: `mcp__gbrain__search` with the company name and
+     `"types": ["company"]`. Use a result only if its title is that company.
+  2. None: create it with `mcp__gbrain__put_page`, slug `companies/<name in
+     lowercase-hyphens>` (e.g. `companies/acme-corp`), content
+     `---\ntype: company\ntitle: <name>\n---\n\n# <name>\n` plus an `## About`
+     section if you know what it does.
+  3. Save the person page (`people/<first-last>`) with `company: <name>` in its
+     frontmatter.
+  4. `mcp__gbrain__add_link` with `{"from": "<person slug>", "to": "<company
+     slug>", "link_type": "works_at", "context": "<their role, if known>"}`.
+     Both pages must exist first, or it fails with page_not_found.
+  Check the `add_link` result; a person saved with a company but no link is
+  not saved.
 - Every `put_page` on an existing page must pass `expected_revision` set to
   the `revision` from the `get_page` you just read; without it gbrain refuses
   with `revision_required`. On `revision_conflict`, read the page again,

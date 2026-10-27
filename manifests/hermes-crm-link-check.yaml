@@ -1,0 +1,202 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-crm-link-check-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  check.py: |
+    # Sends Hermes a CRM note about a made-up person at a made-up company, then
+    # checks gbrain for a person page, a company page and a works_at link
+    # between them, and soft-deletes every page the test made. Contacts no one.
+    import json, os, time, urllib.request
+
+    HERMES = os.environ.get('HERMES_URL', 'http://hermes-agent-web:8642')
+    KEY = os.environ['API_SERVER_KEY']
+    GBRAIN = os.environ.get('GBRAIN_MCP_URL', 'http://gbrain:3131/mcp')
+    GBRAIN_TOKEN = os.environ['GBRAIN_REMOTE_TOKEN']
+    PERSON = 'Linkcheck Testperson'
+    COMPANY = 'Zzyzx Example Labs'
+    # Only pages whose slug carries one of these are ever deleted.
+    TEST_MARKERS = ('linkcheck-testperson', 'zzyzx')
+
+    def http(url, body=None, token=KEY, timeout=60):
+        req = urllib.request.Request(url, method='POST' if body is not None else 'GET')
+        req.add_header('Authorization', 'Bearer ' + token)
+        if body is not None:
+            req.add_header('Content-Type', 'application/json')
+            req.add_header('Accept', 'application/json, text/event-stream')
+            req.data = json.dumps(body).encode()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.read().decode(errors='replace')
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(errors='replace')
+        except Exception as e:
+            return 0, repr(e)
+
+    def gbrain(name, args):
+        s, text = http(GBRAIN, {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                'params': {'name': name, 'arguments': args}}, token=GBRAIN_TOKEN)
+        msg = None
+        for line in text.splitlines():
+            if line.startswith('data:'):
+                try:
+                    msg = json.loads(line[5:].strip())
+                except Exception:
+                    pass
+        if msg is None:
+            try:
+                msg = json.loads(text)
+            except Exception:
+                return False, f'HTTP {s}: {text[:300]}'
+        if msg.get('error'):
+            return False, msg['error']
+        out = '\n'.join(c.get('text', '') for c in (msg.get('result') or {}).get('content', []))
+        try:
+            out = json.loads(out)
+        except Exception:
+            pass
+        return not (msg.get('result') or {}).get('isError'), out
+
+    def slugs_matching(query, marker):
+        found = set()
+        ok, res = gbrain('search', {'query': query})
+        for r in res if ok and isinstance(res, list) else []:
+            slug = r.get('slug') or ''
+            if marker in slug:
+                found.add(slug)
+        return found
+
+    time.sleep(int(os.environ.get('CHECK_DELAY', '0')))
+    for _ in range(60):
+        if http(HERMES + '/health')[0] == 200:
+            break
+        time.sleep(10)
+    s, b = http(HERMES + '/v1/models')
+    try:
+        model = json.loads(b)['data'][0]['id']
+    except Exception:
+        model = 'hermes-agent'
+
+    note = (
+        f'CRM note from a call I had today: {PERSON} is Head of Security at {COMPANY}. '
+        'They want a quote for a penetration test by the end of next week, and I said I would send it. '
+        'This is a made-up test contact: save it, but do not message, email or look up anyone.'
+    )
+    t0 = time.time()
+    s, b = http(HERMES + '/v1/chat/completions', {
+        'model': model, 'messages': [{'role': 'user', 'content': note}],
+    }, timeout=900)
+    print(f'== Hermes chat -> {s} in {time.time() - t0:.0f}s')
+    try:
+        print(json.loads(b)['choices'][0]['message']['content'][-3000:])
+    except Exception:
+        print(b[:3000])
+
+    time.sleep(10)
+    people = slugs_matching(PERSON, 'linkcheck-testperson')
+    ok, page = gbrain('get_page', {'slug': 'people/linkcheck-testperson'})
+    if ok:
+        people.add('people/linkcheck-testperson')
+    companies = slugs_matching(COMPANY, 'zzyzx')
+    ok, page = gbrain('get_page', {'slug': 'companies/zzyzx-example-labs'})
+    if ok:
+        companies.add('companies/zzyzx-example-labs')
+    print(f'== person pages: {sorted(people)}')
+    print(f'== company pages: {sorted(companies)}')
+
+    works_at = []
+    for p in sorted(people):
+        ok, links = gbrain('get_links', {'slug': p})
+        print(f'== get_links {p} -> {json.dumps(links)[:1500]}')
+        for l in links if ok and isinstance(links, list) else []:
+            target = l.get('to_slug') or l.get('to') or ''
+            ltype = l.get('link_type') or l.get('type') or ''
+            if ltype == 'works_at' and gbrain('get_page', {'slug': target})[0]:
+                works_at.append((p, target))
+                if 'zzyzx' in target:
+                    companies.add(target)
+
+    passed = bool(people) and bool(companies) and bool(works_at)
+    print(f'== works_at links: {works_at}')
+    print('RESULT: PASS' if passed else 'RESULT: FAIL')
+
+    for slug in sorted(people | companies):
+        if any(m in slug for m in TEST_MARKERS):
+            print(f'== delete_page {slug} -> {gbrain("delete_page", {"slug": slug})}')
+    print('== hermes-crm-link-check done')
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hermes-crm-link-check
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 2400
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: hermes-crm-link-check
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: check
+          image: python:3.12-alpine
+          command: ["python3", "/check/check.py"]
+          env:
+            - name: CHECK_STOP
+              value: "company-link-2026-10-27"
+            - name: HERMES_URL
+              value: "http://hermes-agent-web:8642"
+            - name: GBRAIN_MCP_URL
+              value: "http://gbrain:3131/mcp"
+            - name: GBRAIN_REMOTE_TOKEN
+              value: "gbrain-mcp"
+            - name: CHECK_DELAY
+              value: "420"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: HERMES_BEARER_TOKEN
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: script
+              mountPath: /check
+      volumes:
+        - name: script
+          configMap:
+            name: hermes-crm-link-check-script
