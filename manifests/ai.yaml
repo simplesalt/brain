@@ -149,7 +149,7 @@ spec:
           args:
             - |
               if [ ! -x /install/bin/gbrain ]; then
-                BUN_INSTALL=/install bun install -g github:garrytan/gbrain#5cfb84f1d3a809c70064c292c23db3d538d5c551 \
+                BUN_INSTALL=/install bun install -g github:garrytan/gbrain#23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc \
                   || { echo "FATAL: gbrain install failed"; exit 1; }
               fi
           volumeMounts:
@@ -181,6 +181,8 @@ spec:
                 || echo "WARN: gbrain init failed; serve may not work correctly"
               $GBRAIN config set mcp.publish_advisor true \
                 || echo "WARN: config set mcp.publish_advisor failed (non-fatal)"
+              $GBRAIN config set memory.auto_writeback salient \
+                || echo "WARN: config set memory.auto_writeback failed (non-fatal)"
               $GBRAIN config set search.reranker.model voyage:rerank-2.5 \
                 || echo "WARN: config set search.reranker.model failed (non-fatal)"
               $GBRAIN config set facts.extraction_model openrouter:openai/gpt-oss-120b \
@@ -312,7 +314,7 @@ spec:
               containerPort: 3131
           startupProbe:
             periodSeconds: 10
-            failureThreshold: 90
+            failureThreshold: 200
             httpGet:
               path: /health
               port: 3131
@@ -369,6 +371,14 @@ spec:
                 while true; do
                   echo "enrich_thin: start"
                   $GBRAIN dream --phase enrich_thin --repo /tmp 2>&1 | tail -n 20 || echo "WARN: enrich_thin run failed"
+                  sleep 3600
+                done
+              ) &
+              (
+                sleep 600
+                while true; do
+                  echo "embed-stale: start"
+                  $GBRAIN embed --stale --yes --max-usd 1 2>&1 | tail -n 20 || echo "WARN: embed --stale failed"
                   sleep 3600
                 done
               ) &
@@ -511,7 +521,7 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              GBRAIN_SHA=5cfb84f1d3a809c70064c292c23db3d538d5c551
+              GBRAIN_SHA=23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc
               STORED_VER=$(cat /opt/data/skills/.gbrain-version 2>/dev/null || echo "")
               if [ "$GBRAIN_SHA" != "$STORED_VER" ]; then
                 if (

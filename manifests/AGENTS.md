@@ -44,6 +44,20 @@ Save them there. gbrain holds project knowledge.
   plus the section, and a `Source:` line. Create the page if there is none.
   This is how Dylan finds people later by what they do; Hindsight alone does
   not make them findable.
+- gbrain is your source of truth for CRM work: talking to, reaching out to and
+  responding to people outside Simple Salt. Dylan has given standing consent
+  to save that work to gbrain without asking: people, companies, what was
+  said, promised or decided. Do not wait for a "save this".
+- After a `put_page` on a person or company, add what the page body cannot
+  carry: `mcp__gbrain__add_link` for relationships (works_at, founded, knows)
+  and `mcp__gbrain__add_timeline_entry` for each dated interaction. `put_page`
+  over MCP does not create links or timeline entries from the text. Keep the
+  page's existing Timeline section when you rewrite it; gbrain refuses a
+  rewrite that would drop timeline entries.
+- Every `put_page` on an existing page must pass `expected_revision` set to
+  the `revision` from the `get_page` you just read; without it gbrain refuses
+  with `revision_required`. On `revision_conflict`, read the page again,
+  merge, and retry with a new `request_id`.
 - Recalled memory that Hindsight attaches to a message is a hint, not proof:
   it can be about a different person or an older topic. Check gbrain before
   acting on it.
