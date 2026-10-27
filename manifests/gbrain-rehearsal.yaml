@@ -340,7 +340,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-rehearsal-runner-20261027
+  name: gbrain-rehearsal-runner-20261027b
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -731,6 +731,8 @@ spec:
 
                 section "U-summary"
                 if [ -n "$CHECK_FAILED" ]; then echo "UPGRADE CHECKS FAILED:$CHECK_FAILED"; else echo "UPGRADE CHECKS: all PASS"; fi
+                echo "gbrain-rehearsal-runner: complete (mode $MODE) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                exit 0
               fi
 
               if [ "$MODE" = "apply-repairs" ]; then
