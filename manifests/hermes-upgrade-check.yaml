@@ -93,6 +93,7 @@ data:
         print(f'== POST /v1/chat/completions (stream, {label}) -> {s} in {time.time() - t0:.0f}s')
         text = []
         events = 0
+        served = set()
         if isinstance(lines, list):
             for l in lines:
                 if l.startswith(('STREAM BROKE', 'max gap')):
@@ -106,6 +107,7 @@ data:
                     continue
                 try:
                     doc = json.loads(d)
+                    served.add(doc.get('model'))
                     for c in doc.get('choices', []):
                         text.append((c.get('delta') or {}).get('content') or '')
                         if c.get('finish_reason'):
@@ -113,6 +115,7 @@ data:
                 except Exception:
                     pass
             print(f'stream events: {events}')
+            print(f'served by: {sorted(str(m) for m in served)}')
             print(''.join(text)[-4000:])
         else:
             print(lines[:3000])
@@ -154,7 +157,7 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "network-errors-fix-2026-10-20"
+              value: "minimax-m3.1-switch-2026-10-28"
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: PROXY_URL
