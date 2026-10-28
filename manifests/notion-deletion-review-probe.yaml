@@ -1,0 +1,174 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notion-deletion-review-probe-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  probe.py: |
+    # Read-only check of the Deletion Review Notion key: who it is, how much of the
+    # workspace it sees, whether it can find and read trashed items, and what a
+    # trashed item says about who trashed it and when. Writes nothing to Notion.
+    import json, os, urllib.request, urllib.error
+
+    TOKEN = os.environ.get('NOTION_TOKEN', '')
+    API = 'https://api.notion.com/v1'
+    VERSION = '2025-09-03'
+    # Items dylan's own Notion connection showed in trash on 2026-10-28.
+    KNOWN_TRASHED = {
+        'Hotel for St. Louis (row)': '350e6a5b-9779-8048-94e0-fd9ba98c9349',
+        'November Strategy (page)': '2ace6a5b-9779-80ea-9ed6-dcd42cc97009',
+        'Fin+Personal work (database)': '1d6e6a5b-9779-80fd-a74b-d267bb2e7a32',
+    }
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(API + path, method=method)
+        req.add_header('Authorization', 'Bearer ' + TOKEN)
+        req.add_header('Notion-Version', VERSION)
+        if body is not None:
+            req.add_header('Content-Type', 'application/json')
+            req.data = json.dumps(body).encode()
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read())
+            except Exception:
+                return e.code, {}
+        except Exception as e:
+            return 0, {'message': repr(e)}
+
+    def title(obj):
+        for p in (obj.get('properties') or {}).values():
+            if isinstance(p, dict) and p.get('type') == 'title':
+                return ''.join(t.get('plain_text', '') for t in p.get('title', []))
+        return ''.join(t.get('plain_text', '') for t in obj.get('title', []) or [])
+
+    def search(body, cap=3000):
+        items, cursor = [], None
+        while len(items) < cap:
+            b = dict(body, page_size=100)
+            if cursor:
+                b['start_cursor'] = cursor
+            s, r = call('POST', '/search', b)
+            if s != 200:
+                return s, r.get('message', ''), items
+            items += r.get('results', [])
+            if not r.get('has_more'):
+                break
+            cursor = r.get('next_cursor')
+        return 200, '', items
+
+    if not TOKEN:
+        print('RESULT: FAIL no NOTION_DELETION_REVIEW_TOKEN in hermes-secrets')
+        raise SystemExit(0)
+
+    s, me = call('GET', '/users/me')
+    print(f'== identity: HTTP {s} type={me.get("type")} name={me.get("name")} id={me.get("id")}')
+    print(f'   workspace={(me.get("bot") or {}).get("workspace_name")} owner={json.dumps((me.get("bot") or {}).get("owner"))[:200]}')
+
+    s, err, live = search({})
+    kinds = {}
+    for o in live:
+        kinds[o.get('object')] = kinds.get(o.get('object'), 0) + 1
+    print(f'== visible without filter: HTTP {s} {err} total={len(live)} by_kind={kinds} in_trash_among_them={sum(1 for o in live if o.get("in_trash"))}')
+    tops = sorted({title(o) or o.get('id') for o in live if (o.get('parent') or {}).get('type') == 'workspace'})
+    print(f'   top-level items shared ({len(tops)}): {tops[:40]}')
+
+    trashed = []
+    for label, body in [('filter in_trash', {'filter': {'in_trash': True}}),
+                        ('filter value=page + in_trash', {'filter': {'property': 'object', 'value': 'page'}, 'in_trash': True})]:
+        s, err, got = search(body)
+        n_trash = sum(1 for o in got if o.get('in_trash'))
+        print(f'== search {label}: HTTP {s} {err[:200]} returned={len(got)} in_trash={n_trash}')
+        if n_trash and not trashed:
+            trashed = [o for o in got if o.get('in_trash')]
+    for o in sorted(trashed, key=lambda o: o.get('last_edited_time', ''), reverse=True)[:10]:
+        print(f'   trashed: {o.get("object")} "{title(o)}" edited={o.get("last_edited_time")} by={(o.get("last_edited_by") or {}).get("id")} parent={(o.get("parent") or {}).get("type")}')
+
+    users = {}
+    s, r = call('GET', '/users?page_size=100')
+    for u in r.get('results', []):
+        users[u.get('id')] = f'{u.get("type")}:{u.get("name")}'
+    print(f'== users: HTTP {s} {sorted(users.values())}')
+
+    readable = 0
+    for label, pid in KNOWN_TRASHED.items():
+        kind = 'databases' if 'database' in label else 'pages'
+        s, o = call('GET', f'/{kind}/{pid}')
+        bs, blocks = call('GET', f'/blocks/{pid}/children?page_size=100')
+        n = len(blocks.get('results', [])) if bs == 200 else None
+        if s == 200:
+            readable += 1
+        ed = (o.get('last_edited_by') or {}).get('id')
+        print(f'== known trashed {label}: HTTP {s} {o.get("message", "")[:150]} in_trash={o.get("in_trash")} '
+              f'edited={o.get("last_edited_time")} by={users.get(ed, ed)} blocks HTTP {bs} count={n}')
+
+    print('RESULT: ' + ('PASS' if trashed or readable else 'FAIL') +
+          f' trash_search={"yes" if trashed else "no"} known_trashed_readable={readable}/{len(KNOWN_TRASHED)}')
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: notion-deletion-review-probe
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: notion-deletion-review-probe
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: python:3.12-alpine
+          command: ["python3", "/probe/probe.py"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NOTION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: NOTION_DELETION_REVIEW_TOKEN
+                  optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: probe
+              mountPath: /probe
+      volumes:
+        - name: probe
+          configMap:
+            name: notion-deletion-review-probe-script

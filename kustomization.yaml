@@ -9,6 +9,7 @@ resources:
   - manifests/hindsight-pg-dump.yaml
   - manifests/hermes-upgrade-check.yaml
   - manifests/hermes-crm-link-check.yaml
+  - manifests/notion-deletion-review-probe.yaml
   - manifests/big-agi.yaml
   - manifests/stt-proxy.yaml
   - manifests/hermes-proxy.yaml
