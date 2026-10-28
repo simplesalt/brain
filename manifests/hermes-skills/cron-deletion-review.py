@@ -365,6 +365,14 @@ def main():
         roots = [e for e in roots if e not in old]
     roots.sort(key=lambda e: e["obj"].get("last_edited_time") or "")
     users = load_users() if roots else {}
+    # An item whose last editor is this job's own key was already restored and re-trashed by an earlier read, so the
+    # real deleter is gone from Notion; it is marked seen rather than blamed on the job.
+    me = (quiet("GET", "/users/me") or {}).get("id") if roots else None
+    own = [e for e in roots if me and (e["obj"].get("last_edited_by") or {}).get("id") == me]
+    for e in own:
+        print(f"deletion-review: {e['obj']['id']} was last trashed by this job; skipped", file=sys.stderr)
+    state["seen"] += [i for e in own for i in [e["obj"]["id"]] + [k["id"] for k in e["children"]]]
+    roots = [e for e in roots if e not in own]
     batch = []
     for entry in roots[:BATCH]:
         item = review_item(entry, users)
