@@ -157,7 +157,7 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "minimax-m3.1-switch-2026-10-28"
+              value: "reasoning-high-2026-10-28"
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: PROXY_URL

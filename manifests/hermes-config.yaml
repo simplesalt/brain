@@ -6,6 +6,9 @@ fallback_providers:
   - provider: openrouter
     model: openai/gpt-oss-120b
 agent:
+  reasoning_overrides:
+    "minimax/minimax-m3.1-flash": "high"
+    "openai/gpt-oss-120b": "high"
   environment_hint: |-
     At the start of every session, call hindsight_recall before giving your
     first response. Use it to retrieve context about ongoing work, recent
