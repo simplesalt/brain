@@ -348,6 +348,16 @@ def main():
         roots = [e for e in roots if e not in old]
     roots.sort(key=lambda e: e["obj"].get("last_edited_time") or "")
     users = load_users() if roots else {}
+    if roots and not any(u["type"] == "person" for u in users.values()):
+        print("deletion-review: Notion user list unavailable; cannot tell people from agents", file=sys.stderr)
+        print(json.dumps({"wakeAgent": False}))
+        return
+    # Only agents' deletions are reviewed: a deleter who is a person in the user list is skipped,
+    # while bots and ids missing from that list (connector identities) count as agents.
+    people = [e for e in roots
+              if users.get((e["obj"].get("last_edited_by") or {}).get("id"), {}).get("type") == "person"]
+    state["seen"] += [i for e in people for i in [e["obj"]["id"]] + [k["id"] for k in e["children"]]]
+    roots = [e for e in roots if e not in people]
     batch = []
     for entry in roots[:BATCH]:
         item = review_item(entry, users)
