@@ -146,6 +146,8 @@ spec:
           image: python:3.12-alpine
           command: ["python3", "/probe/probe.py"]
           env:
+            - name: PROBE_RUN
+              value: "after-sharing-2026-10-28"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NOTION_TOKEN
