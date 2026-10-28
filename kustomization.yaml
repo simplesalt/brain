@@ -41,6 +41,8 @@ configMapGenerator:
       - skill-catch-up.md=manifests/hermes-skills/catch-up.md
       - cron-people-scan.py=manifests/hermes-skills/cron-people-scan.py
       - cron-people-scan.md=manifests/hermes-skills/cron-people-scan.md
+      - cron-deletion-review.py=manifests/hermes-skills/cron-deletion-review.py
+      - cron-deletion-review.md=manifests/hermes-skills/cron-deletion-review.md
       - cron-daily-brief.py=manifests/hermes-skills/cron-daily-brief.py
       - cron-daily-brief.md=manifests/hermes-skills/cron-daily-brief.md
       - cron-linkedin-lookup.py=manifests/hermes-skills/cron-linkedin-lookup.py
