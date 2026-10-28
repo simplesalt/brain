@@ -1,7 +1,7 @@
 _config_version: 39
 model:
   provider: openrouter
-  default: minimax/minimax-m2.7
+  default: minimax/minimax-m3.1-flash
 fallback_providers:
   - provider: openrouter
     model: openai/gpt-oss-120b
