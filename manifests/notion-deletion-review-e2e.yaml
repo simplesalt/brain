@@ -120,7 +120,7 @@ spec:
           command: ["python3", "/e2e/e2e.py"]
           env:
             - name: E2E_RUN
-              value: "first-2026-10-28"
+              value: "restore-read-2026-10-28"
             - name: DELETION_REVIEW_DRY_RUN
               value: "1"
             - name: HERMES_HOME

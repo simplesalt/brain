@@ -40,6 +40,8 @@ MAX_PENDING = 200
 OUTPUT_DIR = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "cron", "output")
 MARKER = "DELETION-REVIEW-RESULT"
 DRY_RUN = os.environ.get("DELETION_REVIEW_DRY_RUN") == "1"
+# Dry runs still restore and re-trash a page to read it; this turns that off too.
+NO_RESTORE = os.environ.get("DELETION_REVIEW_NO_RESTORE") == "1"
 # Risk = S * L * (1 - 0.5 * R) * (1 - 0.3 * E): Substance of what was deleted, Loss (how much of it is
 # not found elsewhere), Replacement (a live page clearly replaces it), Explanation (a reason is recorded).
 THRESHOLD = 0.25
@@ -69,7 +71,7 @@ def call(tool, args):
 
 
 def notion(method, path, body=None):
-    """One Notion API call; raises RuntimeError on any HTTP error. Only reads are ever made."""
+    """One Notion API call; raises RuntimeError on any HTTP error. The only writes are the restore and re-trash in read_trashed()."""
     for attempt in range(2):
         req = urllib.request.Request(NOTION + path, method=method, data=json.dumps(body).encode() if body is not None else None)
         req.add_header("Authorization", "Bearer " + NOTION_TOKEN)
@@ -144,6 +146,20 @@ def read_text(block_id, budget, depth=2):
         if not r.get("has_more") or sum(map(len, text)) >= budget:
             break
     return text, children
+
+
+def read_trashed(page_id):
+    """The text and child pages of a page in trash. The API will not read a trashed page's blocks, so the page is
+    restored for the read and put straight back in trash, even if the read fails."""
+    if NO_RESTORE:
+        return [], []
+    if quiet("PATCH", f"/pages/{page_id}", {"in_trash": False}) is None:
+        return [], []
+    try:
+        return read_text(page_id, MAX_TEXT)
+    finally:
+        if quiet("PATCH", f"/pages/{page_id}", {"in_trash": True}) is None:
+            print(f"deletion-review: {page_id} was restored to read it and could not be trashed again", file=sys.stderr)
 
 
 def excerpt(block_id, limit):
@@ -230,12 +246,13 @@ def review_item(entry, users):
     """Everything Hermes needs about one trashed root, with the Substance score."""
     obj, kids = entry["obj"], entry["children"]
     is_page = obj.get("object") == "page"
-    text, child_pages = read_text(obj["id"], MAX_TEXT) if is_page else ([], [])
+    text, child_pages = read_trashed(obj["id"]) if is_page else ([], [])
     body = " ".join(" ".join(text).split())
     if not is_page:
         # A data source: its rows are the trashed items folded into it (the query endpoint is not used).
         child_pages = [title_of(k) for k in kids]
     words = len(body.split()) + sum(len(t.split()) for t in (title_of(k) for k in kids))
+    # The deleter comes from the search result taken before the restore, so the job never shows as the deleter.
     editor = users.get((obj.get("last_edited_by") or {}).get("id"), {})
     kind, pid = parent_ref(obj)
     parent = {"kind": kind, "id": pid, "title": None, "url": None, "excerpt": ""}
@@ -348,16 +365,6 @@ def main():
         roots = [e for e in roots if e not in old]
     roots.sort(key=lambda e: e["obj"].get("last_edited_time") or "")
     users = load_users() if roots else {}
-    if roots and not any(u["type"] == "person" for u in users.values()):
-        print("deletion-review: Notion user list unavailable; cannot tell people from agents", file=sys.stderr)
-        print(json.dumps({"wakeAgent": False}))
-        return
-    # Only agents' deletions are reviewed: a deleter who is a person in the user list is skipped,
-    # while bots and ids missing from that list (connector identities) count as agents.
-    people = [e for e in roots
-              if users.get((e["obj"].get("last_edited_by") or {}).get("id"), {}).get("type") == "person"]
-    state["seen"] += [i for e in people for i in [e["obj"]["id"]] + [k["id"] for k in e["children"]]]
-    roots = [e for e in roots if e not in people]
     batch = []
     for entry in roots[:BATCH]:
         item = review_item(entry, users)
