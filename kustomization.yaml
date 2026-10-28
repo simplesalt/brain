@@ -11,6 +11,7 @@ resources:
   - manifests/hermes-crm-link-check.yaml
   - manifests/notion-deletion-review-probe.yaml
   - manifests/notion-deletion-review-dryrun.yaml
+  - manifests/notion-deletion-review-e2e.yaml
   - manifests/big-agi.yaml
   - manifests/stt-proxy.yaml
   - manifests/hermes-proxy.yaml
