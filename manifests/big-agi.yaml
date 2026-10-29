@@ -32,6 +32,9 @@ data:
     JWT_HEADER = 'Cf-Access-Jwt-Assertion'
     STT_HOST = os.environ.get('STT_HOST', 'stt-proxy.ssint-main-voice')
     STT_PORT = int(os.environ.get('STT_PORT', '8000'))
+    HERMES_HOST = os.environ.get('HERMES_HOST', 'hermes-agent-web')
+    HERMES_PORT = int(os.environ.get('HERMES_PORT', '80'))
+    HERMES_PREFIX = '/_hermes'
     MIC_JS_PATH = os.environ.get('MIC_JS_PATH', '/scripts/mic.js')
     MIC_TAG = b'<script src="/_stt/mic.js" defer></script>'
     NAV_JS_PATH = os.environ.get('NAV_JS_PATH', '/scripts/nav.js')
@@ -92,8 +95,53 @@ data:
                 self._tidy()
             elif p.startswith('/_stt/'):
                 self._reply(404, {'error': 'not found'})
+            elif p == HERMES_PREFIX or p.startswith(HERMES_PREFIX + '/'):
+                self._hermes()
             else:
                 self._proxy()
+
+        # The Hermes console, shown in an admin pane inside big-AGI. Served under
+        # this origin so the pane needs no sign-in of its own; Hermes builds its
+        # links from X-Forwarded-Prefix. No WebSockets: the console pages left
+        # in its menu don't use them.
+        def _hermes(self):
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            body = self.rfile.read(n) if n else b''
+            path = self.path[len(HERMES_PREFIX):]
+            if not path.startswith('/'):
+                path = '/' + path
+            fwd = {k: v for k, v in self.headers.items() if k.lower() not in _SKIP_REQ | {'host', 'x-forwarded-prefix'}}
+            fwd['X-Forwarded-Prefix'] = HERMES_PREFIX
+            if body or self.command in ('POST', 'PUT', 'PATCH'):
+                fwd['Content-Length'] = str(len(body))
+            conn = None
+            try:
+                conn = http.client.HTTPConnection(HERMES_HOST, HERMES_PORT, timeout=600)
+                conn.request(self.command, path, body=body or None, headers=fwd)
+                r = conn.getresponse()
+                self.send_response_only(r.status, r.reason)
+                for k, v in r.getheaders():
+                    if k.lower() in _SKIP_RESP:
+                        continue
+                    if k.lower() == 'location' and v.startswith('/') and not v.startswith(HERMES_PREFIX + '/'):
+                        v = HERMES_PREFIX + v
+                    self.send_header(k, v)
+                self.end_headers()
+                if self.command != 'HEAD':
+                    while True:
+                        chunk = r.read1(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+            except Exception as e:
+                print(f'big-agi-gate: hermes console unreachable: {e}', flush=True)
+                try: self._reply(502, {'error': 'Hermes console unreachable'})
+                except Exception: pass
+            finally:
+                if conn is not None:
+                    try: conn.close()
+                    except Exception: pass
 
         def _reply(self, status, doc):
             out = json.dumps(doc).encode()
@@ -728,12 +776,13 @@ data:
       if (document.body) mount(); else document.addEventListener('DOMContentLoaded', mount);
     })();
   nav.js: |
-    // Trims big-AGI down to chat, adds a Hermes console link, and brands the
-    // tab as SS chat with the Simple Salt mark.
+    // Trims big-AGI down to chat, adds an admin button that shows the Hermes
+    // console beside it, and brands the tab as SS chat with the Simple Salt mark.
     // Hidden: the Call app, the Apps & Tools menu, the Discord and GitHub
-    // links, and the Beam and Call buttons by the chat box. The Hermes link
-    // opens hermes.simplesalt.company in a new tab. big-AGI re-renders its nav
-    // freely, so hiding is CSS and the link is re-added whenever it goes missing.
+    // links, and the Beam and Call buttons by the chat box. On phones an Admin
+    // link in the drawer opens hermes.simplesalt.company in a new tab. big-AGI
+    // re-renders its nav freely, so hiding is CSS and our buttons are re-added
+    // whenever they go missing.
     (() => {
       if (window.__ssNav) return;
       window.__ssNav = true;
@@ -764,25 +813,57 @@ data:
         #desktop-nav .MuiDivider-root,
         #mobile-nav button:not([aria-label^="Chat"]),
         button:has([data-testid="CallIcon"]),button:has(path[d="M 4,12 14,9"]),
-        .ss-nav-hidden{display:none!important}`;
+        .ss-nav-hidden{display:none!important}
+        #ss-admin-pane{position:fixed;top:0;right:0;bottom:0;left:var(--ss-nav-w,64px);z-index:1100;background:#fff}
+        #ss-admin-pane[hidden]{display:none}
+        #ss-admin-pane iframe{width:100%;height:100%;border:0;display:block}
+        .ss-admin-open #desktop-nav .NavButton-active:not(.ss-admin){background:transparent!important;color:inherit!important}`;
       (document.head || document.documentElement).appendChild(style);
 
-      function desktopLink() {
+      // Admin: a button beside Chat that opens the Hermes console in a pane over
+      // the chat area. The pane stays loaded while hidden; any other nav button
+      // closes it.
+      let pane = null;
+      function setAdmin(open) {
+        if (open && !pane) {
+          pane = document.createElement('div');
+          pane.id = 'ss-admin-pane';
+          pane.innerHTML = '<iframe src="/_hermes/" title="Admin"></iframe>';
+          document.body.appendChild(pane);
+        }
+        if (pane) pane.hidden = !open;
+        document.documentElement.classList.toggle('ss-admin-open', open);
+      }
+      document.addEventListener('pointerdown', (e) => {
+        const b = e.target.closest && e.target.closest('#desktop-nav button, #desktop-nav a');
+        if (b && !b.classList.contains('ss-admin')) setAdmin(false);
+      }, true);
+
+      function desktopAdmin() {
         const nav = document.getElementById('desktop-nav');
-        if (!nav || nav.querySelector('.ss-hermes')) return;
-        const group = nav.lastElementChild;
-        const like = group && group.querySelector('.NavButton-typeLink:not(a)');
-        if (!like) return;
-        const a = document.createElement('a');
-        a.className = like.className.replace('NavButton-active', '') + ' ss-hermes';
-        a.href = HERMES_URL;
-        a.target = '_blank';
-        a.rel = 'noopener';
-        a.title = 'Hermes console';
-        a.setAttribute('aria-label', 'Hermes console');
-        const svg = like.querySelector('svg');
-        a.innerHTML = `<svg class="${svg ? svg.getAttribute('class') : ''}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${ICON}</svg>`;
-        group.insertBefore(a, group.firstChild);
+        if (!nav) return;
+        document.documentElement.style.setProperty('--ss-nav-w', nav.getBoundingClientRect().right + 'px');
+        const chat = nav.querySelector('.NavButton-typeApp:not(.ss-admin)');
+        const gear = nav.lastElementChild && nav.lastElementChild.querySelector('button.NavButton-typeLink:not(.NavButton-active)');
+        if (!chat || !gear) return;
+        let btn = nav.querySelector('.ss-admin');
+        if (!btn) {
+          btn = document.createElement('button');
+          btn.type = 'button';
+          btn.title = 'admin';
+          btn.setAttribute('aria-label', 'admin');
+          const svg = chat.querySelector('svg');
+          btn.innerHTML = `<svg class="${svg ? svg.getAttribute('class') : ''}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${ICON}</svg>`;
+          btn.addEventListener('click', () => setAdmin(!document.documentElement.classList.contains('ss-admin-open')));
+        }
+        if (btn.previousElementSibling !== chat) chat.after(btn);
+        // Open: looks like the active Chat button. Closed: like an idle nav button.
+        const open = document.documentElement.classList.contains('ss-admin-open');
+        const look = open && /NavButton-active/.test(chat.className)
+          ? chat.className
+          : gear.className.replace('NavButton-typeLink', 'NavButton-typeApp');
+        const want = look.replace(/\s*ss-\S+/g, '') + ' ss-admin';
+        if (btn.className !== want) btn.className = want;
       }
 
       // Mobile drawer: keep only the Chat app, and put Hermes where Discord was.
@@ -797,7 +878,7 @@ data:
         a.href = HERMES_URL;
         a.target = '_blank';
         a.rel = 'noopener';
-        a.textContent = 'Hermes';
+        a.textContent = 'Admin';
         discord.parentElement.insertBefore(a, discord);
       }
 
@@ -817,7 +898,7 @@ data:
       let queued = false;
       const run = () => {
         queued = false;
-        try { tab(); desktopLink(); mobileItems(); } catch (_) {}
+        try { tab(); desktopAdmin(); mobileItems(); } catch (_) {}
       };
       const start = () => {
         run();
@@ -852,7 +933,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        gate-script-sha: 448c7888030cd127
+        gate-script-sha: ae376362c99a765e
     spec:
       containers:
         - name: big-agi
