@@ -12,7 +12,6 @@ resources:
   - manifests/hermes-chats.yaml
   - manifests/big-agi.yaml
   - manifests/stt-proxy.yaml
-  - manifests/stt-live-test.yaml
   - manifests/hermes-proxy.yaml
   - manifests/hermes-connectors.yaml
   - manifests/gbrain-embedding-secret.yaml
