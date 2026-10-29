@@ -22,6 +22,7 @@ resources:
   - manifests/lease-sweep.yaml
   - manifests/hermes-msg.yaml
   - manifests/duxsoup-ingest.yaml
+  - manifests/duxsoup-merge-duplicates.yaml
   - manifests/coding.yaml
   - manifests/coding-rc.yaml
   - manifests/coding-fe.yaml

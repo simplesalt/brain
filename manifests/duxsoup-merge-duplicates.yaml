@@ -1,0 +1,86 @@
+# One-off (simplesalt/projects#803, approved by Dylan 2026-10-29): two LinkedIn
+# visits created duplicate person pages before the search-parsing fix. Points the
+# profiles at the original pages, soft-deletes the duplicates and re-queues the
+# two visits, so the LinkedIn details land on the originals. Remove this file
+# once the Job has run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: duxsoup-merge-duplicates-20261029
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        entity: ssint
+        env: main
+        capability: msg
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: merge
+          image: oven/bun:1-alpine
+          command: ["bun", "-e"]
+          args:
+            - |
+              import { SQL } from 'bun';
+              import { createHmac } from 'crypto';
+              const PAIRS = [
+                { dup: 'people/ponangara', keep: 'people/pon-angara', profile: 'https://www.linkedin.com/in/ponangara' },
+                { dup: 'people/judijohnstone', keep: 'people/judi-johnstone', profile: 'https://www.linkedin.com/in/judijohnstone' },
+              ];
+              const sql = new SQL(process.env.DATABASE_URL);
+              async function gbrain(name, args) {
+                const r = await fetch('http://gbrain.ssint-main-ai:3131/mcp', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: `Bearer ${process.env.GBRAIN_REMOTE_TOKEN}` },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+                });
+                const t = await r.text();
+                if (!r.ok) throw new Error(`${name} HTTP ${r.status}: ${t.slice(0, 200)}`);
+                const line = t.split('\n').find((l) => l.startsWith('data: ')) ?? t;
+                const m = JSON.parse(line.replace(/^data: /, ''));
+                const out = (m.result?.content ?? []).map((c) => c.text ?? '').join('\n');
+                if (m.error || m.result?.isError) throw new Error(`${name}: ${JSON.stringify(m.error ?? out).slice(0, 300)}`);
+                return out.slice(0, 200);
+              }
+              async function duxVisit(profile) {
+                const USER = process.env.DUXSOUP_USER_ID;
+                const targeturl = `https://app.dux-soup.com/xapi/remote/control/${USER}/queue`;
+                const body = JSON.stringify({ targeturl, timestamp: Date.now(), userid: USER, command: 'visit', params: { profile, campaignid: 'lookup-visits' } });
+                const sig = createHmac('sha1', process.env.DUXSOUP_API_KEY).update(body).digest('base64');
+                const r = await fetch(targeturl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': sig }, body });
+                return `${r.status} ${(await r.text()).slice(0, 120)}`;
+              }
+              for (const p of PAIRS) {
+                await gbrain('get_page', { slug: p.keep });
+                const rows = await sql`UPDATE profiles SET gbrain_slug = ${p.keep}, updated_at = now() WHERE gbrain_slug = ${p.dup} RETURNING dux_id`;
+                console.log(p.dup, '->', p.keep, 'profiles repointed:', rows.map((r) => r.dux_id).join(','));
+                console.log(p.dup, 'delete_page:', await gbrain('delete_page', { slug: p.dup }));
+                console.log(p.profile, 'visit:', await duxVisit(p.profile));
+              }
+              await sql.close();
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-ingest-pg-app
+                  key: uri
+            - name: GBRAIN_REMOTE_TOKEN
+              value: "gbrain-mcp"
+            - name: DUXSOUP_USER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-user-id
+                  key: user_id
+            - name: DUXSOUP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-api-key
+                  key: api_key
