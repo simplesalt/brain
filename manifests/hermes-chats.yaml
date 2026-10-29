@@ -124,12 +124,12 @@ data:
     }
 
     const USER_FAIL = /#fail|hard fail|you suck|completely wrong/i;
-    const TOOL_ERR = /^\s*(error\b|traceback|exception\b)|"error"\s*:\s*(?!null)|"success"\s*:\s*false|"status"\s*:\s*"error"|exit code[:= ]+[1-9]|command not found|permission denied/i;
+    const TOOL_ERR = /^\s*(error\b|traceback|exception\b)|"error"\s*:\s*(?![\s]|null)|"success"\s*:\s*false|"status"\s*:\s*"error"|exit code[:= ]+[1-9]|command not found|permission denied/i;
 
     function flagsFor(role, content) {
       const f = [];
       if (role === 'user' && USER_FAIL.test(content)) f.push('user_fail');
-      if (content.includes('HERMES MISS REPORT')) f.push('miss_report');
+      if (role === 'assistant' && content.includes('HERMES MISS REPORT')) f.push('miss_report');
       if (role === 'tool' && TOOL_ERR.test(content.slice(0, 4000))) f.push('tool_error');
       return f;
     }
