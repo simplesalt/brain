@@ -589,9 +589,16 @@ data:
       const msg = parseMcpResponse(text);
       if (!msg) throw new Error(`unparseable MCP response: ${text.slice(0, 200)}`);
       if (msg.error) throw new Error(`rpc: ${JSON.stringify(msg.error).slice(0, 300)}`);
-      const out = (msg.result?.content ?? []).map((c) => c.text ?? '').join('\n');
+      const texts = (msg.result?.content ?? []).map((c) => c.text ?? '');
+      const out = texts.join('\n');
       let parsed;
       try { parsed = JSON.parse(out); } catch { parsed = null; }
+      // gbrain v0.60 search appends plain-text hint items after the JSON rows;
+      // the joined text then fails to parse and callers saw a string, not rows.
+      for (const t of texts) {
+        if (parsed !== null) break;
+        try { parsed = JSON.parse(t); } catch { /* not the JSON item */ }
+      }
       if (msg.result?.isError) {
         const code = typeof parsed?.error === 'string' ? parsed.error : parsed?.write_error;
         const err = new Error(`${code ? `${code}: ` : ''}${(parsed && parsed.message) || out.slice(0, 300) || `${name}: tool error`}`);
@@ -1814,7 +1821,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "10"
+        simplesalt.company/restart-epoch: "11"
     spec:
       serviceAccountName: duxsoup-ingest
       containers:
