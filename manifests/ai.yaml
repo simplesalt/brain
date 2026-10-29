@@ -279,6 +279,11 @@ spec:
                   name: gbrain-reranker-secret
                   key: VOYAGE_API_KEY
                   optional: true
+            # A fixed, non-secret owner credential: gbrain does no access control of
+            # its own here; the cluster governs who reaches it, and admin-gate below
+            # opens the owner dashboard with it.
+            - name: GBRAIN_ADMIN_BOOTSTRAP_TOKEN
+              value: "gbrain-owner-no-secret-cluster-governs-access"
             - name: GBRAIN_REMOTE_TOKEN
               value: "gbrain-mcp"
             - name: GBRAIN_MAIL_TOKEN
@@ -443,12 +448,168 @@ spec:
             - name: google-token
               mountPath: /google
               readOnly: true
+        - name: admin-gate
+          image: python:3.12-alpine
+          command: ["python", "/scripts/admin_gate.py"]
+          env:
+            - name: GBRAIN_ADMIN_BOOTSTRAP_TOKEN
+              value: "gbrain-owner-no-secret-cluster-governs-access"
+          ports:
+            - name: admin
+              containerPort: 3132
+          resources:
+            requests:
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: admin-gate-script
+              mountPath: /scripts
+              readOnly: true
       volumes:
         - name: gbrain-install
           emptyDir: {}
         - name: google-token
           configMap:
             name: gbrain-google-token
+        - name: admin-gate-script
+          configMap:
+            name: gbrain-admin-gate
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gbrain-admin-gate
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  admin_gate.py: |
+    #!/usr/bin/env python3
+    # gbrain's owner dashboard, already signed in. gbrain only knows its own owner
+    # login; this gate logs in with the pod's owner credential and serves the
+    # dashboard to whoever reaches it, so access is the cluster's to govern (Big
+    # AGI's gate publishes it, behind Cloudflare Access, at info.../brain).
+    # The dashboard hard-codes /admin, so it is served under PREFIX and its pages
+    # and scripts are rewritten to match.
+    import http.client, http.server, json, os, threading
+
+    UPSTREAM = ('127.0.0.1', 3131)
+    PORT = int(os.environ.get('PORT', '3132'))
+    PREFIX = os.environ.get('PREFIX', '/brain')
+    TOKEN = os.environ['GBRAIN_ADMIN_BOOTSTRAP_TOKEN']
+    _SKIP_REQ = {'transfer-encoding', 'connection', 'content-length', 'cookie', 'accept-encoding', 'host'}
+    _SKIP_RESP = {'transfer-encoding', 'connection', 'content-length', 'set-cookie'}
+    _TEXT = ('text/html', 'javascript', 'text/css')
+
+    _lock = threading.Lock()
+    _session = None
+
+    def login():
+        global _session
+        conn = http.client.HTTPConnection(*UPSTREAM, timeout=30)
+        try:
+            conn.request('POST', '/admin/login', body=json.dumps({'token': TOKEN}),
+                         headers={'Content-Type': 'application/json'})
+            r = conn.getresponse()
+            r.read()
+            for k, v in r.getheaders():
+                if k.lower() == 'set-cookie' and v.startswith('gbrain_admin='):
+                    _session = v.split(';', 1)[0].split('=', 1)[1]
+                    return _session
+            print(f'admin-gate: login failed: HTTP {r.status}', flush=True)
+        finally:
+            conn.close()
+        return None
+
+    def session(fresh=False):
+        with _lock:
+            return login() if fresh or not _session else _session
+
+    class Gate(http.server.BaseHTTPRequestHandler):
+        timeout = 600
+        def do_GET(self): self._route()
+        def do_HEAD(self): self._route()
+        def do_POST(self): self._route()
+        def do_PUT(self): self._route()
+        def do_PATCH(self): self._route()
+        def do_DELETE(self): self._route()
+        def log_message(self, *a): pass
+
+        def _route(self):
+            if self.path == '/healthz':
+                return self._send(200, b'ok', 'text/plain')
+            if not (self.path == PREFIX or self.path.startswith(PREFIX + '/')):
+                return self._send(404, b'not found', 'text/plain')
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            body = self.rfile.read(n) if n else b''
+            path = '/admin' + self.path[len(PREFIX):]
+            for attempt in (0, 1):
+                sid = session(fresh=attempt == 1)
+                if self._forward(path, body, sid, last=attempt == 1 or sid is None):
+                    return
+
+        # Returns False only on a 401 worth one fresh login and a retry.
+        def _forward(self, path, body, sid, last):
+            fwd = {k: v for k, v in self.headers.items() if k.lower() not in _SKIP_REQ}
+            if sid:
+                fwd['Cookie'] = f'gbrain_admin={sid}'
+            if body or self.command in ('POST', 'PUT', 'PATCH'):
+                fwd['Content-Length'] = str(len(body))
+            conn = http.client.HTTPConnection(*UPSTREAM, timeout=600)
+            try:
+                conn.request(self.command, path, body=body or None, headers=fwd)
+                r = conn.getresponse()
+                if r.status == 401 and not last:
+                    r.read()
+                    return False
+                ctype = r.getheader('Content-Type') or ''
+                headers = [(k, v) for k, v in r.getheaders() if k.lower() not in _SKIP_RESP]
+                headers = [(k, PREFIX + v[len('/admin'):] if k.lower() == 'location' and v.startswith('/admin') else v)
+                           for k, v in headers]
+                if any(t in ctype for t in _TEXT):
+                    out = r.read().replace(b'/admin/', PREFIX.encode() + b'/').replace(b'"/admin"', f'"{PREFIX}"'.encode())
+                    self.send_response_only(r.status, r.reason)
+                    for k, v in headers:
+                        self.send_header(k, v)
+                    self.send_header('Content-Length', str(len(out)))
+                    self.end_headers()
+                    if self.command != 'HEAD':
+                        self.wfile.write(out)
+                    return True
+                self.send_response_only(r.status, r.reason)
+                for k, v in headers:
+                    self.send_header(k, v)
+                self.end_headers()
+                if self.command != 'HEAD':
+                    while True:
+                        chunk = r.read1(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                return True
+            except Exception as e:
+                print(f'admin-gate: gbrain unreachable: {e}', flush=True)
+                try: self._send(502, b'gbrain unreachable', 'text/plain')
+                except Exception: pass
+                return True
+            finally:
+                conn.close()
+
+        def _send(self, status, out, ctype):
+            self.send_response(status)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    if __name__ == '__main__':
+        srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Gate)
+        print(f'admin-gate :{PORT}{PREFIX} → gbrain owner dashboard', flush=True)
+        srv.serve_forever()
 ---
 apiVersion: v1
 kind: Service
@@ -466,6 +627,9 @@ spec:
     - name: mcp
       port: 3131
       targetPort: 3131
+    - name: admin
+      port: 3132
+      targetPort: 3132
 ---
 apiVersion: apps/v1
 kind: Deployment
