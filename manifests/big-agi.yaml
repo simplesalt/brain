@@ -20,6 +20,9 @@ data:
     # button that gets a single-use AssemblyAI pass from /_stt/token and streams
     # audio to AssemblyAI directly. /_stt/token is passed with the Access JWT to
     # stt-proxy, which verifies it and holds the AssemblyAI key; this pod holds none.
+    #
+    # Every page also loads /_ui/nav.js, which trims big-AGI's navigation and
+    # adds a link to the Hermes console.
     import json, os, http.client, http.server
     from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
 
@@ -31,6 +34,8 @@ data:
     STT_PORT = int(os.environ.get('STT_PORT', '8000'))
     MIC_JS_PATH = os.environ.get('MIC_JS_PATH', '/scripts/mic.js')
     MIC_TAG = b'<script src="/_stt/mic.js" defer></script>'
+    NAV_JS_PATH = os.environ.get('NAV_JS_PATH', '/scripts/nav.js')
+    NAV_TAG = b'<script src="/_ui/nav.js" defer></script>'
 
     _SKIP_REQ = {'transfer-encoding', 'connection', 'content-length'}
     _SKIP_RESP = {'transfer-encoding', 'connection'}
@@ -60,7 +65,7 @@ data:
         for marker in (b'</head>', b'</body>'):
             i = html.find(marker)
             if i >= 0:
-                return html[:i] + MIC_TAG + html[i:]
+                return html[:i] + MIC_TAG + NAV_TAG + html[i:]
         return html
 
     class Gate(http.server.BaseHTTPRequestHandler):
@@ -77,7 +82,9 @@ data:
         def _route(self):
             p = self.path.split('?', 1)[0]
             if p == '/_stt/mic.js' and self.command in ('GET', 'HEAD'):
-                self._mic_js()
+                self._script(MIC_JS_PATH)
+            elif p == '/_ui/nav.js' and self.command in ('GET', 'HEAD'):
+                self._script(NAV_JS_PATH)
             elif p == '/_stt/token' and self.command == 'GET':
                 self._token()
             elif p.startswith('/_stt/'):
@@ -94,12 +101,12 @@ data:
             self.end_headers()
             self.wfile.write(out)
 
-        def _mic_js(self):
+        def _script(self, path):
             try:
-                with open(MIC_JS_PATH, 'rb') as f:
+                with open(path, 'rb') as f:
                     js = f.read()
             except OSError:
-                self._reply(404, {'error': 'mic.js missing'})
+                self._reply(404, {'error': f'{os.path.basename(path)} missing'})
                 return
             self.send_response(200)
             self.send_header('Content-Type', 'text/javascript; charset=utf-8')
@@ -490,6 +497,75 @@ data:
       const mount = () => document.body.appendChild(btn);
       if (document.body) mount(); else document.addEventListener('DOMContentLoaded', mount);
     })();
+  nav.js: |
+    // Trims big-AGI's navigation down to chat, and adds a Hermes console link.
+    // Hidden: the Call app, the Apps & Tools menu, and the Discord and GitHub
+    // links. The Hermes link opens hermes.simplesalt.company in a new tab.
+    // big-AGI re-renders its nav freely, so hiding is CSS and the link is
+    // re-added whenever it goes missing.
+    (() => {
+      if (window.__ssNav) return;
+      window.__ssNav = true;
+      const HERMES_URL = 'https://hermes.simplesalt.company/';
+      const ICON = '<path d="M3 13h8V3H3zm0 8h8v-6H3zm10 0h8V11h-8zm0-18v6h8V3z"/>';
+
+      const style = document.createElement('style');
+      style.textContent = `
+        a[href*="discord.gg"],a[href*="github.com/enricoros"],
+        #desktop-nav .NavButton-typeApp:has([data-testid^="Call"]),
+        #desktop-nav .NavButton-typeApp[aria-haspopup],
+        #desktop-nav .MuiDivider-root,
+        #mobile-nav button:not([aria-label^="Chat"]),
+        .ss-nav-hidden{display:none!important}`;
+      document.head.appendChild(style);
+
+      function desktopLink() {
+        const nav = document.getElementById('desktop-nav');
+        if (!nav || nav.querySelector('.ss-hermes')) return;
+        const group = nav.lastElementChild;
+        const like = group && group.querySelector('.NavButton-typeLink:not(a)');
+        if (!like) return;
+        const a = document.createElement('a');
+        a.className = like.className.replace('NavButton-active', '') + ' ss-hermes';
+        a.href = HERMES_URL;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.title = 'Hermes console';
+        a.setAttribute('aria-label', 'Hermes console');
+        const svg = like.querySelector('svg');
+        a.innerHTML = `<svg class="${svg ? svg.getAttribute('class') : ''}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${ICON}</svg>`;
+        group.insertBefore(a, group.firstChild);
+      }
+
+      // Mobile drawer: keep only the Chat app, and put Hermes where Discord was.
+      function mobileItems() {
+        document.querySelectorAll('nav.MuiButtonGroup-root > button').forEach((b) => {
+          if (!b.closest('#desktop-nav') && !/^\s*Chat/.test(b.innerText)) b.classList.add('ss-nav-hidden');
+        });
+        const discord = [...document.querySelectorAll('a[href*="discord.gg"]')].find((d) => !d.closest('#desktop-nav'));
+        if (!discord || discord.parentElement.querySelector('.ss-hermes-m')) return;
+        const a = document.createElement('a');
+        a.className = discord.className + ' ss-hermes-m';
+        a.href = HERMES_URL;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = 'Hermes';
+        discord.parentElement.insertBefore(a, discord);
+      }
+
+      let queued = false;
+      const run = () => {
+        queued = false;
+        try { desktopLink(); mobileItems(); } catch (_) {}
+      };
+      const start = () => {
+        run();
+        new MutationObserver(() => {
+          if (!queued) { queued = true; requestAnimationFrame(run); }
+        }).observe(document.body, { childList: true, subtree: true });
+      };
+      if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+    })();
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -513,7 +589,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        gate-script-sha: 4d720bb9edf42a68
+        gate-script-sha: c177450e4e9ed8aa
     spec:
       containers:
         - name: big-agi
