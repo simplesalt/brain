@@ -3,7 +3,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: grammar-check-1
+  name: grammar-check-2
   namespace: ssint-main-voice
   labels:
     entity: ssint
@@ -26,7 +26,8 @@ spec:
             - python
             - -c
             - |
-              import importlib.util, time
+              import importlib.util, os, time
+              os.environ['FALLBACK_MODELS'] = 'google/gemma-4-26b-a4b-it'
               spec = importlib.util.spec_from_file_location('g', '/scripts/grammar.py')
               m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
               raw = ("It's a while later and it. Should have. Processed your request can you go check. Again to see if. "
@@ -38,6 +39,10 @@ spec:
               print('raw: ', raw, flush=True)
               t0 = time.time()
               print('fix: ', m.fix(raw, ctx), flush=True)
+              print(f'took {time.time() - t0:.2f}s', flush=True)
+              m.MODEL = 'google/no-such-model-for-fallback-test'
+              t0 = time.time()
+              print('fallback fix:', m.fix(raw, ctx), flush=True)
               print(f'took {time.time() - t0:.2f}s', flush=True)
           volumeMounts:
             - name: script
