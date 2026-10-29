@@ -1,0 +1,62 @@
+---
+# One-off check of the dictation grammar pass: runs stt-proxy's own tidy() on a
+# real choppy dictation through AssemblyAI's LLM Gateway and logs the result.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stt-tidy-check-1
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        entity: ssint
+        env: main
+        capability: voice
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: test
+          image: python:3.12-alpine
+          command:
+            - python
+            - -c
+            - |
+              import importlib.util, time
+              spec = importlib.util.spec_from_file_location('stt', '/scripts/stt.py')
+              m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+              raw = ("It's a while later and it. Should have. Processed your request can you go check. Again to see if. "
+                     "Duck Soup has done anything or whether your core people records that were missing. Like pawn and freed and. "
+                     "Judy Johnstone. Now have Fuller. People records with LinkedIn. Profiles complete.")
+              ctx = ("Dylan: Did the LinkedIn invites go out? Hermes: Dux-Soup ran and visited 14 profiles; "
+                     "Judy Johnstone's gbrain people record still has no LinkedIn link.")
+              t0 = time.time()
+              print('model:', m.TIDY_MODEL, flush=True)
+              print('raw:  ', raw, flush=True)
+              print('tidy: ', m.tidy(raw, ctx), flush=True)
+              print(f'took {time.time() - t0:.2f}s', flush=True)
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: aai-key
+              mountPath: /secrets-aai
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: script
+          configMap:
+            name: stt-proxy-script
+        - name: aai-key
+          secret:
+            secretName: assemblyai-api-key
