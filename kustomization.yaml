@@ -12,6 +12,7 @@ resources:
   - manifests/hermes-chats.yaml
   - manifests/big-agi.yaml
   - manifests/stt-proxy.yaml
+  - manifests/stt-context-experiment.yaml
   - manifests/stt-tidy-check.yaml
   - manifests/hermes-proxy.yaml
   - manifests/hermes-connectors.yaml
