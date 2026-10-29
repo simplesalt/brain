@@ -35,7 +35,8 @@ data:
     MIC_JS_PATH = os.environ.get('MIC_JS_PATH', '/scripts/mic.js')
     MIC_TAG = b'<script src="/_stt/mic.js" defer></script>'
     NAV_JS_PATH = os.environ.get('NAV_JS_PATH', '/scripts/nav.js')
-    NAV_TAG = b'<script src="/_ui/nav.js" defer></script>'
+    # Not deferred: it must set big-AGI's stored defaults before the app reads them.
+    NAV_TAG = b'<script src="/_ui/nav.js"></script>'
 
     _SKIP_REQ = {'transfer-encoding', 'connection', 'content-length'}
     _SKIP_RESP = {'transfer-encoding', 'connection'}
@@ -498,16 +499,28 @@ data:
       if (document.body) mount(); else document.addEventListener('DOMContentLoaded', mount);
     })();
   nav.js: |
-    // Trims big-AGI's navigation down to chat, and adds a Hermes console link.
-    // Hidden: the Call app, the Apps & Tools menu, and the Discord and GitHub
-    // links. The Hermes link opens hermes.simplesalt.company in a new tab.
-    // big-AGI re-renders its nav freely, so hiding is CSS and the link is
-    // re-added whenever it goes missing.
+    // Trims big-AGI down to chat, and adds a Hermes console link.
+    // Hidden: the Call app, the Apps & Tools menu, the Discord and GitHub
+    // links, and the Beam and Call buttons by the chat box. The Hermes link
+    // opens hermes.simplesalt.company in a new tab. big-AGI re-renders its nav
+    // freely, so hiding is CSS and the link is re-added whenever it goes missing.
     (() => {
       if (window.__ssNav) return;
       window.__ssNav = true;
       const HERMES_URL = 'https://hermes.simplesalt.company/';
       const ICON = '<path d="M3 13h8V3H3zm0 8h8v-6H3zm10 0h8V11h-8zm0-18v6h8V3z"/>';
+
+      // The shortcuts bar above the chat box starts off, once per browser, so
+      // turning it back on in Settings > Labs sticks. This runs before big-AGI
+      // reads its stored settings.
+      try {
+        if (!localStorage.getItem('ss-defaults-v1')) {
+          const doc = JSON.parse(localStorage.getItem('app-ux-labs') || 'null') || { state: {}, version: 2 };
+          doc.state = { ...(doc.state || {}), labsShowShortcutBar: false };
+          localStorage.setItem('app-ux-labs', JSON.stringify(doc));
+          localStorage.setItem('ss-defaults-v1', '1');
+        }
+      } catch (_) {}
 
       const style = document.createElement('style');
       style.textContent = `
@@ -516,8 +529,9 @@ data:
         #desktop-nav .NavButton-typeApp[aria-haspopup],
         #desktop-nav .MuiDivider-root,
         #mobile-nav button:not([aria-label^="Chat"]),
+        button:has([data-testid="CallIcon"]),button:has(path[d="M 4,12 14,9"]),
         .ss-nav-hidden{display:none!important}`;
-      document.head.appendChild(style);
+      (document.head || document.documentElement).appendChild(style);
 
       function desktopLink() {
         const nav = document.getElementById('desktop-nav');
@@ -589,7 +603,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        gate-script-sha: c177450e4e9ed8aa
+        gate-script-sha: 897bc2491b035f25
     spec:
       containers:
         - name: big-agi
