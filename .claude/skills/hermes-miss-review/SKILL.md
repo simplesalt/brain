@@ -11,24 +11,23 @@ Arguments: an optional UTC date `YYYY-MM-DD`. Default: yesterday (UTC). A run by
 
 ## Where things are
 
-- Chats (primary): every Hermes message, uncut with full reasoning, is in the hermes-chats database, read with curl from the read API `http://hermes-chats.ssint-main-ai:8080` (`manifests/hermes-chats.yaml`):
+- Chats: every Hermes message, uncut with full reasoning, is in the hermes-chats database, read with curl from the read API `http://hermes-chats.ssint-main-ai:8080` (`manifests/hermes-chats.yaml`):
   - `GET /days/YYYY-MM-DD` lists the day's chats with message counts, content/reasoning sizes and flags (`user_fail`, `miss_report`, `tool_error`). Start with flagged chats.
   - `GET /sessions/<id>` gives each message's head/tail of reasoning and content, lengths and flags; enough for most chats.
   - `GET /messages/<session>/<msg>?part=reasoning&offset=0&limit=20000` reads one message's full reasoning in chunks. Reasoning can run to tens of thousands of lines: read it chunk by chunk and keep only the step where it went wrong; never load a whole day's reasoning at once.
   - `GET /search?q=...&from=...&to=...` finds earlier occurrences of a pattern.
   - `POST /notes` with `{"session_id","msg_id","pattern","quote","note"}` caches the where-it-went-wrong quote for each miss you file; do this for every miss.
-- Chats (fallback, until hermes-chats has data for the day): the `hermes-chat-archive` CronJob (`manifests/hermes-chat-archive.yaml`) saves Hermes chats every 15 minutes into ConfigMaps `hermes-chat-archive-0` … `-6` in namespace `ssint-main-ai`. The slot for a date is `(days since 1970-01-01) % 7`. Read it with the flux MCP `get_kubernetes_resources` (apiVersion `v1`, kind `ConfigMap`). Check its `date` key equals the day you are reviewing; otherwise that day was not saved — say so and stop. Each `s.<session>.json` key is one chat: `session` (id, title, source, model) and `messages` (role, ts, content, reasoning, tool_calls, tool_name). Long text is trimmed; `caps` says how far.
 - Tally (Notion, under Team Dashboard › Hermes misses, https://www.notion.so/408e6a5b97798173b662fea97c61c2c5):
   - Failure patterns, data source `collection://76bf44dc-faae-445d-8f28-9c214da52de2`: Pattern (title), Category, Description, Status, Fix effort, Fix shipped, First seen. Importance, Last 7 days, Occurrences, Last seen and the before/after-fix numbers are computed; never write them.
   - Misses, data source `collection://0f38d5c3-5255-46e1-bb32-631995eaabe4`: Miss (title), Pattern (relation), Date, Impact, Cost, What Hermes reasoned, Should have, Chat, Review run.
 
-## Catch-up for days the archive did not save
+## Catch-up for days before the store existed
 
-The archive started on 2026-10-29 at about 12:45 UTC. For earlier chats (or a day whose slot was overwritten), Hindsight's `hermes` bank keeps one document per Hermes API chat, id `api-<hex>`, tag `session:<id>`: `HINDSIGHT_BANK_ID=hermes ~/.claude/scripts/hindsight-get-document.sh <id> --text-only` returns a JSON list of `{role, content, timestamp}`. List them with `hs_request GET "$(hs_bank_path 'documents?limit=500')"` (after `export HINDSIGHT_BANK_ID=hermes; source ~/.claude/scripts/lib-hindsight.sh`) and pick by `updated_at`. These hold only user and assistant text, with no reasoning or tool calls: judge the reasoning from what Hermes said, and say in the summary that these were reviewed from text only. Read only; never write to or delete from the `hermes` bank.
+The hermes-chats store starts on 2026-10-29 at about 12:52 UTC. For earlier chats, Hindsight's `hermes` bank keeps one document per Hermes API chat, id `api-<hex>`, tag `session:<id>`: `HINDSIGHT_BANK_ID=hermes ~/.claude/scripts/hindsight-get-document.sh <id> --text-only` returns a JSON list of `{role, content, timestamp}`. List them with `hs_request GET "$(hs_bank_path 'documents?limit=500')"` (after `export HINDSIGHT_BANK_ID=hermes; source ~/.claude/scripts/lib-hindsight.sh`) and pick by `updated_at`. These hold only user and assistant text, with no reasoning or tool calls: judge the reasoning from what Hermes said, and say in the summary that these were reviewed from text only. Read only; never write to or delete from the `hermes` bank.
 
 ## Steps
 
-1. Load the day's chats. Skip chats that are Hermes's own scheduled jobs only if they show no reasoning.
+1. Load the day's chats from `/days/<date>` (no chats or the API down: say so and stop). Skip chats that are Hermes's own scheduled jobs only if they show no reasoning.
 2. Read each chat focusing on Hermes's reasoning and tool use, not on how polite the answer was. A miss is a point where Hermes's reasoning went wrong in a way a better agent would have avoided, for example:
    - claimed a limit, error or missing access that was not real, or quoted an error and passed on a fix the user should not do (e.g. the phantom Dux-Soup gbrain source error on 2026-10-29);
    - gave up, or asked the user, when another tool, argument or approach was available;
@@ -47,7 +46,7 @@ The archive started on 2026-10-29 at about 12:45 UTC. For earlier chats (or a da
 
 ## Report
 
-End with a short summary, in plain words, for Dylan: how many chats were reviewed, how many misses were filed and under how many patterns (how many new), the top three patterns by Last 7 days, and any pattern with a shipped fix that recurred. Link the Hermes misses page. If the day had no saved chats or the archive slot held another date, say that instead.
+End with a short summary, in plain words, for Dylan: how many chats were reviewed, how many misses were filed and under how many patterns (how many new), the top three patterns by score over the last 7 days (sum Impact x Cost of their Misses dated in the last 7 days; the computed Notion columns are not readable through the API), and any pattern with a shipped fix that recurred. Link the Hermes misses page. If the day had no saved chats or the read API was down, say that instead.
 
 ## Linking dev efforts
 
