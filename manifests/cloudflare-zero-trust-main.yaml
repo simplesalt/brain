@@ -116,16 +116,24 @@ spec:
   deletionPolicy: Orphan
   forProvider:
     accountId: ba92fe12c6c1275f965c7c86e3b392ac
-    name: info-simplesalt-company
+    name: simplesalt-internal
     type: self_hosted
-    # Big AGI and the grammar API share one app, so one sign-in sets the Access
-    # cookie on both hostnames (eager redirects) and Big AGI's page calls the API
-    # directly with it, also from an installed phone app. Only the grammar path:
-    # the rest of api.simplesalt.company is Workers (webhooks, MCP server) that
-    # must stay reachable without Access.
+    # The one Access app for everything internal staff use: every internal web
+    # address is a destination here, behind the same Google sign-in and staff
+    # policy, never an Access app of its own. One sign-in sets the Access cookie
+    # on every address (eager redirects), so a page on one calls another directly
+    # with it, also from an installed phone app. Its tunnel route checks this
+    # app's audience (afcfa282...), as do origins that verify the JWT. Eager
+    # redirects can loop past about five hostnames; prefer paths on existing
+    # hostnames. Public paths go in a bypass app (as info-static below), and
+    # clients that can't sign in (such as MCP's SaaS sign-in) keep their own.
     destinations:
       - type: public
         uri: info.simplesalt.company
+      - type: public
+        uri: hermes.simplesalt.company
+      # Only the grammar path: the rest of api.simplesalt.company is Workers
+      # (webhooks, MCP server) that must stay reachable without Access.
       - type: public
         uri: api.simplesalt.company/45e6451afc312886/grammar
     corsHeaders:
@@ -187,35 +195,6 @@ spec:
     name: ssint-main
 
 ---
-apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
-kind: TrustAccessApplication
-metadata:
-  name: cloudflare-app-hermes-simplesalt-company
-  annotations:
-    crossplane.io/external-name: "1ccc461c-e78b-4478-b867-9e4266244c9c"
-  labels:
-    entity: ssint
-    env: main
-    capability: access
-spec:
-  forProvider:
-    accountId: ba92fe12c6c1275f965c7c86e3b392ac
-    name: hermes-simplesalt-company
-    type: self_hosted
-    destinations:
-      - type: public
-        uri: hermes.simplesalt.company
-    sessionDuration: 24h
-    autoRedirectToIdentity: true
-    allowedIdps:
-      - 42cbdc64-699e-4e17-b470-fb7cda3c0791
-    policies:
-      - id: 79bac8d3-6c82-4ac5-bbdb-f98a3388236c
-        precedence: 1
-  providerConfigRef:
-    name: ssint-main
-
----
 apiVersion: dns.upjet-cloudflare.upbound.io/v1alpha1
 kind: Record
 metadata:
@@ -260,8 +239,9 @@ spec:
             access:
               required: true
               teamName: fqurzlaaagt
+              # The simplesalt-internal app's.
               audTag:
-                - 43d32c8263fb9410781f8bd5571a020bd3358b1177ed6c26560595a720e1e610
+                - afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c
         - hostname: api.simplesalt.company
           path: ^/45e6451afc312886/grammar$
           service: http://grammar.ssint-main-voice.svc.k.famevans.win:8000
@@ -269,7 +249,7 @@ spec:
             access:
               required: true
               teamName: fqurzlaaagt
-              # The info app's, which covers the grammar path.
+              # The simplesalt-internal app's.
               audTag:
                 - afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c
         - hostname: hooks.simplesalt.company
