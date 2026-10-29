@@ -1,11 +1,11 @@
-# One-off (simplesalt/projects#799): Dylan approved clearing the stuck Dux-Soup
-# queue on 2026-10-29 17:07Z. Clears every queued item, then re-queues only the
-# profile visits; the invites and messages are redone by hand. Remove this file
-# once the Job has run.
+# One-off (simplesalt/projects#799): the queue was cleared and the profile visits
+# re-queued 2026-10-29 17:09Z (Job duxsoup-queue-reset-20261029). This sends the
+# extensionReload signal so the extension restarts and picks the queue up again.
+# Remove this file once the Job has run.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: duxsoup-queue-reset-20261029
+  name: duxsoup-extension-reload-20261029
   namespace: ssint-main-msg
   labels:
     entity: ssint
@@ -23,7 +23,7 @@ spec:
     spec:
       restartPolicy: Never
       containers:
-        - name: reset
+        - name: reload
           image: oven/bun:1-alpine
           command: ["bun", "-e"]
           args:
@@ -32,19 +32,6 @@ spec:
               const BASE = 'https://app.dux-soup.com';
               const USER = process.env.DUXSOUP_USER_ID;
               const KEY = process.env.DUXSOUP_API_KEY;
-              const VISITS = [
-                'https://www.linkedin.com/in/jeremy-wong-0051aa9b',
-                'https://www.linkedin.com/in/brian-douglass-1942308a',
-                'https://www.linkedin.com/in/ponangara',
-                'https://www.linkedin.com/in/fseddar',
-                'https://www.linkedin.com/in/geoffroy-morgan-de-rivery-0323458',
-                'https://www.linkedin.com/in/judijohnstone',
-                'https://www.linkedin.com/in/james-smith-b5355314',
-                'https://www.linkedin.com/in/johnbmccaffrey',
-                'https://www.linkedin.com/in/greg-hildenbrand-64330b17/',
-                'https://www.linkedin.com/in/benjamin-opazo-618464234/',
-                'https://www.linkedin.com/in/ben-lawson-bb1267a',
-              ];
               async function post(suffix, extra) {
                 const targeturl = `${BASE}/xapi/remote/control/${USER}${suffix}`;
                 const body = JSON.stringify({ targeturl, timestamp: Date.now(), userid: USER, ...extra });
@@ -60,13 +47,8 @@ spec:
                 const r = await fetch(url, { headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': sig } });
                 return (await r.text()).slice(0, 200);
               }
-              console.log('size before:', await get('/queue/size'));
-              console.log('reset:', await post('/reset', {}));
-              console.log('size after reset:', await get('/queue/size'));
-              for (const profile of VISITS) {
-                console.log('visit', profile, await post('/queue', { command: 'visit', params: { profile } }));
-              }
-              console.log('size after re-queue:', await get('/queue/size'));
+              console.log('queue size:', await get('/queue/size'));
+              console.log('extensionReload:', await post('/signal', { signal: 'extensionReload', params: {} }));
           env:
             - name: DUXSOUP_USER_ID
               valueFrom:
