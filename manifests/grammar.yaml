@@ -280,9 +280,9 @@ spec:
               value: "https://fqurzlaaagt.cloudflareaccess.com"
             - name: BASE_PATH
               value: "/45e6451afc312886/grammar"
-            # The api.simplesalt.company Access app; filled once Cloudflare creates it.
+            # The api.simplesalt.company Access app.
             - name: ACCESS_AUDS
-              value: ""
+              value: "e34b52db64bd0aa15ca566b32082e83d9f79eac25489b491e557045d7824f8bd"
             - name: ALLOWED_ORIGINS
               value: "https://info.simplesalt.company"
           volumeMounts:

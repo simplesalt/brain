@@ -268,6 +268,12 @@ spec:
         - hostname: api.simplesalt.company
           path: ^/45e6451afc312886/grammar$
           service: http://grammar.ssint-main-voice.svc.k.famevans.win:8000
+          originRequest:
+            access:
+              required: true
+              teamName: fqurzlaaagt
+              audTag:
+                - e34b52db64bd0aa15ca566b32082e83d9f79eac25489b491e557045d7824f8bd
         - hostname: hooks.simplesalt.company
           path: ^/duxsoup/events$
           service: http://duxsoup-ingest.ssint-main-msg.svc.k.famevans.win:8080
