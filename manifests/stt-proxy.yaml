@@ -23,6 +23,21 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
+# Filled by a person out of band, key ASSEMBLYAI_API_KEY. Until it is, /token
+# answers 503 and the batch mic keeps working.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: assemblyai-api-key
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -40,6 +55,9 @@ data:
     # here with the caller's Cloudflare Access JWT, which is verified below. The
     # audio goes to Whisper on OpenRouter with the vocabulary list, then terms the
     # mic picked from the open conversation, as a spelling hint.
+    # /token hands a signed-in browser a single-use AssemblyAI streaming pass, so
+    # live dictation streams audio straight to AssemblyAI without the key leaving
+    # the cluster or the audio passing through here.
     # /healthz is unready until the key is filled, so an unfilled key shows up
     # as an unready pod; the key is re-read from the mounted Secret, so the pod
     # turns ready on its own once a person fills it.
@@ -56,6 +74,11 @@ data:
     STT_PROVIDER = os.environ.get('STT_PROVIDER', 'groq')
     STT_LANGUAGE = os.environ.get('STT_LANGUAGE', 'en')
     VOCAB_PATH = os.environ.get('VOCAB_PATH', '/stt/vocabulary.txt')
+    AAI_KEY_PATH = os.environ.get('AAI_KEY_PATH', '/secrets-aai/ASSEMBLYAI_API_KEY')
+    AAI_TOKEN_URL = os.environ.get('AAI_TOKEN_URL', 'https://streaming.assemblyai.com/v3/token')
+    # AssemblyAI caps the unused-pass window at 600 s; the browser refreshes it before then.
+    AAI_PASS_SECONDS = int(os.environ.get('AAI_PASS_SECONDS', '600'))
+    AAI_SESSION_SECONDS = int(os.environ.get('AAI_SESSION_SECONDS', '3600'))
     MAX_AUDIO = 24 * 1024 * 1024
     # Whisper reads at most 224 prompt tokens; ~4 characters a token.
     MAX_PROMPT_CHARS = 800
@@ -70,6 +93,25 @@ data:
                 return f.read().strip()
         except OSError:
             return ''
+
+    def assemblyai_key():
+        """The AssemblyAI key, re-read on each use like the OpenRouter key."""
+        try:
+            with open(AAI_KEY_PATH) as f:
+                return f.read().strip()
+        except OSError:
+            return ''
+
+    def streaming_pass():
+        """Mint a single-use AssemblyAI streaming token, or raise."""
+        url = f'{AAI_TOKEN_URL}?expires_in_seconds={AAI_PASS_SECONDS}&max_session_duration_seconds={AAI_SESSION_SECONDS}'
+        r = urllib.request.Request(url, headers={'Authorization': assemblyai_key()})
+        with urllib.request.urlopen(r, timeout=15) as resp:
+            doc = json.load(resp)
+        token = doc.get('token')
+        if not isinstance(token, str) or not token:
+            raise RuntimeError('no token in AssemblyAI response')
+        return {'token': token, 'pass_seconds': AAI_PASS_SECONDS, 'session_seconds': AAI_SESSION_SECONDS}
 
     _SHA256_PREFIX = bytes.fromhex('3031300d060960864801650304020105000420')
     _keys, _keys_at, _keys_lock = {}, 0.0, threading.Lock()
@@ -195,12 +237,31 @@ data:
             self.wfile.write(out)
 
         def do_GET(self):
-            if self.path != '/healthz':
+            if self.path.split('?', 1)[0] == '/token':
+                self._token()
+            elif self.path != '/healthz':
                 self._reply(404, {'error': 'not found'})
             elif not openrouter_key():
                 self._reply(503, {'ok': False, 'error': 'OpenRouter key not filled'})
             else:
                 self._reply(200, {'ok': True})
+
+        def _token(self):
+            if not verify_access_jwt(self.headers.get(JWT_HEADER, '')):
+                self._reply(401, {'error': 'not signed in'})
+                return
+            if not assemblyai_key():
+                self._reply(503, {'error': 'live dictation key not filled'})
+                return
+            try:
+                self._reply(200, streaming_pass())
+            except urllib.error.HTTPError as e:
+                detail = e.read()[:500].decode('utf-8', 'replace')
+                print(f'stt-proxy: AssemblyAI token HTTP {e.code}: {detail}', flush=True)
+                self._reply(502, {'error': f'live dictation service answered {e.code}'})
+            except Exception as e:
+                print(f'stt-proxy: AssemblyAI token failed: {e}', flush=True)
+                self._reply(502, {'error': 'live dictation pass failed'})
 
         def do_POST(self):
             if self.path.split('?', 1)[0] != '/transcribe':
@@ -324,6 +385,9 @@ spec:
             - name: key
               mountPath: /secrets
               readOnly: true
+            - name: aai-key
+              mountPath: /secrets-aai
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -352,6 +416,10 @@ spec:
         - name: key
           secret:
             secretName: openrouter-api-key
+            optional: true
+        - name: aai-key
+          secret:
+            secretName: assemblyai-api-key
             optional: true
 ---
 apiVersion: v1
