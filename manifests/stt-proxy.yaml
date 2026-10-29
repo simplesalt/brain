@@ -39,6 +39,8 @@ data:
     # through Cloudflare Access (its JWT is verified below) a single-use AssemblyAI
     # streaming pass, so the mic streams audio straight to AssemblyAI; the key
     # never leaves the cluster and no audio passes through here.
+    # /tidy fixes the finished dictation's punctuation and grammar (pauses get
+    # transcribed as full stops) with an LLM on AssemblyAI's LLM Gateway, same key.
     # /healthz is unready until the key is filled; the key is re-read from the
     # mounted Secret, so the pod turns ready on its own once a person fills it.
     import base64, hashlib, hmac, json, os, threading, time, http.server, urllib.error, urllib.request
@@ -52,6 +54,17 @@ data:
     # AssemblyAI caps the unused-pass window at 600 s; the browser refreshes it before then.
     AAI_PASS_SECONDS = int(os.environ.get('AAI_PASS_SECONDS', '600'))
     AAI_SESSION_SECONDS = int(os.environ.get('AAI_SESSION_SECONDS', '3600'))
+    TIDY_URL = os.environ.get('TIDY_URL', 'https://llm-gateway.assemblyai.com/v1/chat/completions')
+    TIDY_MODEL = os.environ.get('TIDY_MODEL', 'gemini-2.5-flash-lite')
+    MAX_TIDY_BYTES = 64 * 1024
+    TIDY_SYSTEM = (
+        'You fix dictated text. The user message gives recent chat context, then a speech-to-text '
+        'transcript of one chat message the speaker dictated. The speaker pauses to think, and pauses '
+        'were often transcribed as full stops. Fix punctuation, capitalization, sentence boundaries and '
+        'grammar so it reads as the speaker meant it. Keep the speaker\'s words, wording and meaning: do '
+        'not add, drop, rephrase, answer or summarize anything. Change a word only when it is clearly a '
+        'mis-hearing of a name or term from the context. Reply with the corrected transcript only.'
+    )
 
     def assemblyai_key():
         """The key, read from the mounted Secret on each use so a fill or rotation applies without a restart."""
@@ -71,6 +84,26 @@ data:
         if not isinstance(token, str) or not token:
             raise RuntimeError('no token in AssemblyAI response')
         return {'token': token, 'pass_seconds': AAI_PASS_SECONDS, 'session_seconds': AAI_SESSION_SECONDS}
+
+    def tidy(text, context):
+        """Return text with punctuation and grammar fixed, or raise."""
+        body = {
+            'model': TIDY_MODEL,
+            'temperature': 0,
+            'max_tokens': 4000,
+            'messages': [
+                {'role': 'system', 'content': TIDY_SYSTEM},
+                {'role': 'user', 'content': f'Context:\n{context[-4000:]}\n\nTranscript:\n{text}'},
+            ],
+        }
+        r = urllib.request.Request(TIDY_URL, data=json.dumps(body).encode(), method='POST',
+                                   headers={'Authorization': assemblyai_key(), 'Content-Type': 'application/json'})
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            doc = json.load(resp)
+        out = ((doc.get('choices') or [{}])[0].get('message') or {}).get('content')
+        if not isinstance(out, str) or not out.strip():
+            raise RuntimeError('no text in LLM Gateway response')
+        return out.strip()
 
     _SHA256_PREFIX = bytes.fromhex('3031300d060960864801650304020105000420')
     _keys, _keys_at, _keys_lock = {}, 0.0, threading.Lock()
@@ -169,6 +202,40 @@ data:
                 print(f'stt-proxy: AssemblyAI token failed: {e}', flush=True)
                 self._reply(502, {'error': 'live dictation pass failed'})
 
+        def do_POST(self):
+            if self.path.split('?', 1)[0] != '/tidy':
+                self._reply(404, {'error': 'not found'})
+                return
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            if n > MAX_TIDY_BYTES:
+                self._reply(413, {'error': 'dictation too long to tidy'})
+                return
+            raw = self.rfile.read(n) if n else b''
+            if not verify_access_jwt(self.headers.get(JWT_HEADER, '')):
+                self._reply(401, {'error': 'not signed in'})
+                return
+            if not assemblyai_key():
+                self._reply(503, {'error': 'live dictation key not filled'})
+                return
+            try:
+                doc = json.loads(raw or b'{}')
+                text, context = str(doc.get('text') or '').strip(), str(doc.get('context') or '')
+            except Exception:
+                self._reply(400, {'error': 'bad request'})
+                return
+            if not text:
+                self._reply(400, {'error': 'no text'})
+                return
+            try:
+                self._reply(200, {'text': tidy(text, context)})
+            except urllib.error.HTTPError as e:
+                detail = e.read()[:500].decode('utf-8', 'replace')
+                print(f'stt-proxy: LLM Gateway HTTP {e.code}: {detail}', flush=True)
+                self._reply(502, {'error': f'grammar pass answered {e.code}'})
+            except Exception as e:
+                print(f'stt-proxy: grammar pass failed: {e}', flush=True)
+                self._reply(502, {'error': 'grammar pass failed'})
+
     if __name__ == '__main__':
         srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
         print(f'stt-proxy :{PORT}' + ('' if assemblyai_key() else
@@ -198,7 +265,7 @@ spec:
         capability: voice
       # The script is read only at start; its hash here restarts the pod when it changes.
       annotations:
-        stt-script-sha: 898cdf7c597f1fb3
+        stt-script-sha: 087b85681276fd82
     spec:
       containers:
         - name: stt-proxy

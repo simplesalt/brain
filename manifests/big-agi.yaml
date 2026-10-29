@@ -88,6 +88,8 @@ data:
                 self._script(NAV_JS_PATH)
             elif p == '/_stt/token' and self.command == 'GET':
                 self._token()
+            elif p == '/_stt/tidy' and self.command == 'POST':
+                self._tidy()
             elif p.startswith('/_stt/'):
                 self._reply(404, {'error': 'not found'})
             else:
@@ -118,10 +120,23 @@ data:
                 self.wfile.write(js)
 
         def _token(self):
+            self._to_stt('GET', '/token', None)
+
+        def _tidy(self):
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            if n > 64 * 1024:
+                self._reply(413, {'error': 'dictation too long to tidy'})
+                return
+            self._to_stt('POST', '/tidy', self.rfile.read(n) if n else b'')
+
+        def _to_stt(self, method, path, body):
             conn = None
             try:
-                conn = http.client.HTTPConnection(STT_HOST, STT_PORT, timeout=20)
-                conn.request('GET', '/token', headers={JWT_HEADER: self.headers.get(JWT_HEADER, '')})
+                conn = http.client.HTTPConnection(STT_HOST, STT_PORT, timeout=40)
+                headers = {JWT_HEADER: self.headers.get(JWT_HEADER, '')}
+                if body is not None:
+                    headers.update({'Content-Type': 'application/json', 'Content-Length': str(len(body))})
+                conn.request(method, path, body=body, headers=headers)
                 r = conn.getresponse()
                 out = r.read()
                 self.send_response(r.status)
@@ -325,10 +340,13 @@ data:
           before = v.slice(0, s); after = v.slice(e);
         };
         anchor();
-        return (textFn) => {
-          if (!ta || !ta.isConnected || (written !== null && ta.value !== written)) { anchor(); written = null; onMoved(); }
+        // strict: write only if the box still holds what was last written here.
+        return (textFn, strict) => {
+          const moved = !ta || !ta.isConnected || (written !== null && ta.value !== written);
+          if (strict && moved) return false;
+          if (moved) { anchor(); written = null; onMoved(); }
           const text = textFn();
-          if (!ta || !text) return;
+          if (!ta || !text) return false;
           const lead = before && !/\s$/.test(before) ? ' ' : '';
           const trail = after && !/^\s/.test(after) ? ' ' : '';
           const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
@@ -337,6 +355,7 @@ data:
           written = ta.value;
           const pos = (before + lead + text).length;
           try { ta.setSelectionRange(pos, pos); } catch (_) {}
+          return true;
         };
       }
 
@@ -363,9 +382,10 @@ data:
         const params = new URLSearchParams({
           token, speech_model: 'universal-3-5-pro', encoding: 'pcm_s16le',
           sample_rate: String(ctx.sampleRate), prompt: conversationContext(),
-          // Dictation pauses mid-sentence; wait longer before ending a phrase so
-          // short pauses don't become full stops.
-          min_turn_silence: '800', max_turn_silence: '3000',
+          // Dictation pauses mid-sentence to think; wait longer before ending a
+          // phrase so fewer pauses become full stops. The grammar pass on stop
+          // fixes the ones that remain.
+          min_turn_silence: '1500', max_turn_silence: '4000',
         });
         const ws = new WebSocket(`${LIVE_URL}?${params}`);
         ws.binaryType = 'arraybuffer';
@@ -384,7 +404,7 @@ data:
             show();
           }
         };
-        live = { ws, ctx, src, node, ending: false };
+        live = { ws, ctx, src, node, write, ending: false, text: () => [...committed, partial].filter(Boolean).join(' ') };
         await new Promise((ok, fail) => {
           ws.onopen = ok;
           ws.onerror = () => fail(new Error('could not reach the live dictation service'));
@@ -392,8 +412,9 @@ data:
         src.connect(node);
         ws.onclose = (e) => {
           const was = live;
+          if (was && was.ending) { finishLive(was); return; }
           endLive();
-          if (was && !was.ending) toast(`Dictation stopped${e.reason ? ` (${e.reason})` : ''}.`);
+          if (was) toast(`Dictation stopped${e.reason ? ` (${e.reason})` : ''}.`);
         };
         live.ctxTimer = setInterval(() => {
           if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'UpdateConfiguration', prompt: conversationContext() }));
@@ -414,6 +435,29 @@ data:
         setState('idle');
       }
 
+      // After the last words arrive: a grammar pass over the whole dictation, so
+      // thinking pauses don't leave stray full stops. The live text stays if the
+      // pass fails or the chat box was edited meanwhile.
+      async function finishLive(l) {
+        if (live !== l) return;
+        endLive();
+        const text = l.text();
+        if (!text) return;
+        setState('busy');
+        try {
+          const r = await fetch('/_stt/tidy', {
+            method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, context: conversationContext() }),
+          });
+          const doc = await r.json().catch(() => ({}));
+          if (!r.ok || !doc.text) throw new Error(doc.error || `HTTP ${r.status}`);
+          if (!l.write(() => doc.text, true)) toast('Chat box changed, so the grammar pass was not applied.');
+        } catch (e) {
+          toast(`Grammar pass failed (${e.message}); kept the live text.`);
+        }
+        setState('idle');
+      }
+
       function stop() {
         const l = live;
         if (!l || l.ending) return;
@@ -422,7 +466,7 @@ data:
         setState('busy');
         // Terminate flushes the last words; the server then closes the socket.
         try { l.ws.send(JSON.stringify({ type: 'Terminate' })); } catch (_) {}
-        setTimeout(() => { if (live === l) endLive(); }, 4000);
+        setTimeout(() => finishLive(l), 4000);
       }
 
       async function start() {
@@ -634,7 +678,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        gate-script-sha: a22dcf0beecfff49
+        gate-script-sha: 448c7888030cd127
     spec:
       containers:
         - name: big-agi
