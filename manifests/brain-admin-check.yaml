@@ -1,0 +1,46 @@
+---
+# One-off check of the gbrain owner dashboard at /brain, from inside the cluster
+# (the public route needs a person's sign-in). Logs what each hop returns.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: brain-admin-check-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: check
+          image: python:3.12-alpine
+          command: ["python", "-c"]
+          args:
+            - |
+              import re, urllib.request, urllib.error
+              def get(url):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(url, headers={'Accept': 'text/html,*/*'}), timeout=30)
+                      return r.status, dict(r.headers), r.read()
+                  except urllib.error.HTTPError as e:
+                      return e.code, dict(e.headers), e.read()
+              for base in ('http://gbrain:3132', 'http://big-agi:3000'):
+                  st, h, b = get(base + '/brain/')
+                  print('==', base, '/brain/', st, {k: v for k, v in h.items() if k.lower() in ('content-type', 'content-security-policy', 'location', 'content-length')})
+                  print(b[:800].decode('utf-8', 'replace'))
+                  for src in re.findall(rb'(?:src|href)="(/[^"]+)"', b):
+                      s2, h2, b2 = get(base + src.decode())
+                      print('  asset', src.decode(), s2, h2.get('Content-Type'), len(b2), 'leftover /admin/:', b2.count(b'/admin/'))
+                  for p in ('/brain/api/stats', '/brain/api/health-indicators'):
+                      s3, h3, b3 = get(base + p)
+                      print('  api', p, s3, b3[:200])
