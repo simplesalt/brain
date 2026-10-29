@@ -130,7 +130,8 @@ Save them there. gbrain holds project knowledge.
   missing — find their `linkedin.com/in/...` URL by web search (name +
   company) and judge the best match yourself. No clear match — tag the page
   `needs-linkedin` and tell Dylan the lookup is pending.
-- With a profile URL, `linkedin_action` visit it (no `campaignid`): the visit
+- With a profile URL, `linkedin_action` visit it (it always runs in the
+  visit-only `lookup-visits` campaign; never pass another): the visit
   lands the profile in gbrain. Check with `linkedin_search_results`, `since` =
   when you queued it. Dux Soup only runs in Dylan's daylight schedule, so
   results may lag a window; report pending, don't wait silently.

@@ -439,6 +439,8 @@ data:
     };
 
 
+    const VISIT_CAMPAIGN_ID = process.env.DUXSOUP_VISIT_CAMPAIGN_ID ?? 'lookup-visits';
+
     function duxSign(payload) {
       return createHmac('sha1', DUXSOUP_API_KEY).update(payload).digest('base64');
     }
@@ -521,6 +523,10 @@ data:
       for (const key of [...spec.required, ...spec.optional]) {
         if (rest[key] !== undefined) params[key] = rest[key];
       }
+      // The extension ignores queued visits with no real campaign (Dux-Soup files them
+      // under 'default', which this account lacks). 'lookup-visits' is Dylan's
+      // single-step Visit campaign, so a visit can never trigger a connect or message.
+      if (command === 'visit') params.campaignid = VISIT_CAMPAIGN_ID;
       const data = await duxPost('/queue', { command, params });
       return { message_id: data.id ?? data.messageid ?? 'queued', command, status: 'queued' };
     }
@@ -761,7 +767,7 @@ data:
             messagetext:    { type: 'string', description: 'Message body (required for message and inmail; optional connection note for connect)' },
             messagesubject: { type: 'string', description: 'InMail subject line (required for inmail)' },
             tags:           { type: 'array', items: { type: 'string' }, description: 'Tag names (required for tag/untag)' },
-            campaignid:     { type: 'string', description: 'Campaign to attribute the action to (required for enroll)' },
+            campaignid:     { type: 'string', description: "Campaign to attribute the action to (required for enroll; ignored for visit, which always uses the visit-only 'lookup-visits' campaign)" },
             force:          { type: 'boolean', description: 'Bypass Dux Soup throttling/dedupe safeguards' },
             runafter:       { type: 'string', description: 'ISO8601 timestamp; do not execute before this time' },
           },
@@ -916,7 +922,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "7"
+        simplesalt.company/restart-epoch: "8"
     spec:
       serviceAccountName: hermes-msg
       initContainers:

@@ -1,11 +1,11 @@
-# One-off test (simplesalt/projects#799): queues one profile visit under Dylan's
-# new visit-only campaign 'lookup-visits' (created 2026-10-29 17:20Z, single Visit
-# step) to see whether the extension picks up campaign-attributed visits when it
-# ignores the 'default' ones. Remove this file once the Job has run.
+# One-off (simplesalt/projects#799): the test visit under 'lookup-visits' ran at
+# 17:22Z while visits filed under 'default' never run. The queue now holds only
+# those 11 'default' visits, so clear it and re-queue them under 'lookup-visits'.
+# Remove this file once the Job has run.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: duxsoup-visit-test-20261029
+  name: duxsoup-visit-requeue-20261029
   namespace: ssint-main-msg
   labels:
     entity: ssint
@@ -41,6 +41,13 @@ spec:
                 if (!r.ok) throw new Error(`${suffix} ${r.status}: ${text.slice(0, 300)}`);
                 return text.slice(0, 200);
               }
+              async function getFull(suffix) {
+                const url = `${BASE}/xapi/remote/control/${USER}${suffix}`;
+                const sig = createHmac('sha1', KEY).update(url).digest('base64');
+                const r = await fetch(url, { headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': sig } });
+                if (!r.ok) throw new Error(`${suffix} ${r.status}`);
+                return r.text();
+              }
               async function get(suffix) {
                 const url = `${BASE}/xapi/remote/control/${USER}${suffix}`;
                 const sig = createHmac('sha1', KEY).update(url).digest('base64');
@@ -48,7 +55,26 @@ spec:
                 return (await r.text()).slice(0, 200);
               }
               console.log('queue size:', await get('/queue/size'));
-              console.log('visit:', await post('/queue', { command: 'visit', params: { profile: 'https://www.linkedin.com/in/judijohnstone', campaignid: 'lookup-visits' } }));
+              const VISITS = [
+                'https://www.linkedin.com/in/jeremy-wong-0051aa9b',
+                'https://www.linkedin.com/in/brian-douglass-1942308a',
+                'https://www.linkedin.com/in/ponangara',
+                'https://www.linkedin.com/in/fseddar',
+                'https://www.linkedin.com/in/geoffroy-morgan-de-rivery-0323458',
+                'https://www.linkedin.com/in/james-smith-b5355314',
+                'https://www.linkedin.com/in/johnbmccaffrey',
+                'https://www.linkedin.com/in/greg-hildenbrand-64330b17/',
+                'https://www.linkedin.com/in/benjamin-opazo-618464234/',
+                'https://www.linkedin.com/in/ben-lawson-bb1267a',
+              ];
+              const items = JSON.parse(await getFull('/queue/items'));
+              const list = Array.isArray(items) ? items : (items.items ?? items.data ?? []);
+              const other = list.filter((i) => i.command !== 'visit');
+              if (other.length) throw new Error(`queue holds non-visit items, not clearing: ${other.map((i) => i.command).join(',')}`);
+              console.log('reset:', await post('/reset', {}));
+              for (const profile of VISITS) {
+                console.log('visit', profile, await post('/queue', { command: 'visit', params: { profile, campaignid: 'lookup-visits' } }));
+              }
               console.log('queue size after:', await get('/queue/size'));
           env:
             - name: DUXSOUP_USER_ID
