@@ -58,9 +58,9 @@ data:
     # /token hands a signed-in browser a single-use AssemblyAI streaming pass, so
     # live dictation streams audio straight to AssemblyAI without the key leaving
     # the cluster or the audio passing through here.
-    # /healthz is unready until the key is filled, so an unfilled key shows up
-    # as an unready pod; the key is re-read from the mounted Secret, so the pod
-    # turns ready on its own once a person fills it.
+    # /healthz is unready until at least one key is filled, so unfilled keys show
+    # up as an unready pod; keys are re-read from the mounted Secrets, so the pod
+    # turns ready on its own once a person fills one.
     import base64, hashlib, hmac, json, os, re, threading, time, http.server, urllib.error, urllib.request
     from urllib.parse import unquote
 
@@ -241,10 +241,10 @@ data:
                 self._token()
             elif self.path != '/healthz':
                 self._reply(404, {'error': 'not found'})
-            elif not openrouter_key():
-                self._reply(503, {'ok': False, 'error': 'OpenRouter key not filled'})
+            elif not (openrouter_key() or assemblyai_key()):
+                self._reply(503, {'ok': False, 'error': 'neither the OpenRouter nor the AssemblyAI key is filled'})
             else:
-                self._reply(200, {'ok': True})
+                self._reply(200, {'ok': True, 'batch': bool(openrouter_key()), 'live': bool(assemblyai_key())})
 
         def _token(self):
             if not verify_access_jwt(self.headers.get(JWT_HEADER, '')):
@@ -364,7 +364,7 @@ spec:
         capability: voice
       # The script is read only at start; its hash here restarts the pod when it changes.
       annotations:
-        stt-script-sha: 42b78587c6ece7d5
+        stt-script-sha: 5d1939c697284c23
     spec:
       containers:
         - name: stt-proxy
