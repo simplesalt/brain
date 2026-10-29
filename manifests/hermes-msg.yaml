@@ -545,6 +545,9 @@ data:
     }
 
     async function linkedinSearch({ name, company, keywords, max_results = 5 }) {
+      // On hold: the 'gbrain lookup' campaign has a connection-request step, so an
+      // enroll would send real invites. Look the person up another way instead.
+      throw new Error('linkedin_search is on hold: Dylan has not yet decided how lookups should work in Dux-Soup; find the profile by web search and linkedin_action visit it instead');
       if (!name) throw new Error('name required');
       const max = Math.min(Math.max(Number(max_results) || 5, 1), 25);
       const q = [name, company, keywords].filter(Boolean).join(' ');
@@ -971,7 +974,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "5"
+        simplesalt.company/restart-epoch: "6"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
