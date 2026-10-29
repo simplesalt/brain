@@ -650,7 +650,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        gate-script-sha: 51c176300e5ef729
+        gate-script-sha: b2a7f30250dc5d09
     spec:
       containers:
         - name: big-agi

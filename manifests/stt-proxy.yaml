@@ -362,6 +362,9 @@ spec:
         entity: ssint
         env: main
         capability: voice
+      # The script is read only at start; its hash here restarts the pod when it changes.
+      annotations:
+        stt-script-sha: 42b78587c6ece7d5
     spec:
       containers:
         - name: stt-proxy
