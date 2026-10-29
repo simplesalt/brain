@@ -1,0 +1,197 @@
+---
+# One-off experiment: which context makes live dictation spell names and jargon
+# best? The same spoken audio is streamed to AssemblyAI four times: no context,
+# the full chat text, the chat with the 2,000 most common English words removed,
+# and those remaining words as AssemblyAI's key-term list. Logs transcripts only.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stt-context-experiment-script
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+data:
+  test.py: |
+    import asyncio, audioop, json, re, subprocess, time, urllib.parse, urllib.request, wave
+    import websockets
+
+    KEY = open('/secrets-aai/ASSEMBLYAI_API_KEY').read().strip()
+    COMMON_URL = 'https://raw.githubusercontent.com/first20hours/google-10000-english/master/google-10000-english-usa.txt'
+    LINES = [
+        'Check again whether Dux Soup has finished, and whether Judy Johnstone and Russell now have fuller people records in gbrain.',
+        'Then ask Hermes to rerun the people scan, save the result to Hindsight, and rotate the OIDC client secret in Cloudflare Access.',
+        'Tell Dylan if the HubSpot import or the Notion sync failed.',
+    ]
+    TERMS = ['Dux Soup', 'Judy Johnstone', 'Russell', 'gbrain', 'Hermes', 'Hindsight', 'OIDC', 'Cloudflare Access', 'Dylan', 'HubSpot', 'Notion']
+    CHAT = (
+        "Dylan: Did the LinkedIn invites go out yesterday? I want to know if Dux-Soup actually ran. "
+        "Hermes: Dux-Soup ran its daylight window and visited 14 profiles. Judy Johnstone and Russell were in the queue, "
+        "but their gbrain people records still have no LinkedIn link. I logged the gap in Hindsight. "
+        "Dylan: Okay, what about the people scan? It failed this morning with a script error. "
+        "Hermes: The cron people scan crashed while saving its state file. I can rerun it once the fix lands. "
+        "The HubSpot import is read only, so nothing changed there, and the Notion sync is healthy. "
+        "Dylan: Also we need to rotate the OIDC client secret in Cloudflare Access after the auth changes. "
+        "Hermes: Understood, I will remind you when the new client is ready and note it in gbrain. "
+    )
+    # A long stretch of later, ordinary conversation, so the terms above fall out of
+    # the last 1,650 characters the mic sends today.
+    LATER = (
+        "Dylan: Okay, switching topics for a while. Can you help me think through the plan for next week? "
+        "Hermes: Sure. What are the main things you want to get done, and which ones have a deadline? "
+        "Dylan: I need to finish the proposal, follow up with a couple of people from the conference, and sort out the travel for the trip in December. "
+        "Hermes: That sounds manageable. I would start with the proposal since it has the closest deadline, then do the follow ups on Tuesday, and leave the travel for Thursday. "
+        "Dylan: That works. For the proposal, I want it to be short and clear, maybe two pages, with a simple timeline and a price range rather than a fixed number. "
+        "Hermes: Good idea. A price range gives you room to adjust once you know more about the scope. Do you want me to draft an outline first? "
+        "Dylan: Yes, please draft an outline, and keep the language plain. Nobody wants to read a wall of text. "
+        "Hermes: Here is a first outline: the problem, what we will do, how long it will take, what it will cost, and what happens next. Each section is a short paragraph. "
+        "Dylan: That is about right. Add a short section on who will do the work and how we will keep them updated each week. "
+        "Hermes: Done. I added a section on the team and a weekly update by email, plus a short call every other week if they want one. "
+        "Dylan: Great. For the travel, I would rather fly out early in the morning and come back the same night if possible, so I do not need a hotel. "
+        "Hermes: I will look for early morning flights and a late return on the same day, and I will check whether a train would be faster door to door. "
+        "Dylan: Thanks. One more thing, remind me on Monday morning to call my sister about the family dinner plans for the holidays. "
+        "Hermes: I will remind you on Monday morning. Is there anything else you want to add to the list for next week, or should I send you the plan now? "
+        "Dylan: Send me the plan now, and we can adjust it tomorrow if something changes. "
+        "Hermes: Sent. The plan is in your inbox with the proposal outline attached, and the travel options will follow by the end of the day."
+    )
+    CHAT = CHAT + LATER
+
+    def speech_pcm16k():
+        out = b''
+        for i, line in enumerate(LINES):
+            subprocess.run(['espeak-ng', '-v', 'en-us', '-s', '155', '-w', f'/tmp/l{i}.wav', line], check=True)
+            with wave.open(f'/tmp/l{i}.wav') as w:
+                pcm, rate, width = w.readframes(w.getnframes()), w.getframerate(), w.getsampwidth()
+            if width != 2:
+                pcm = audioop.lin2lin(pcm, width, 2)
+            pcm, _ = audioop.ratecv(pcm, 2, 1, rate, 16000, None)
+            out += pcm + b'\0' * 16000  # half a second between sentences
+        return out + b'\0' * 64000
+
+    def mint():
+        r = urllib.request.Request('https://streaming.assemblyai.com/v3/token?expires_in_seconds=600&max_session_duration_seconds=600',
+                                   headers={'Authorization': KEY})
+        with urllib.request.urlopen(r, timeout=15) as resp:
+            return json.load(resp)['token']
+
+    async def stream(pcm, extra):
+        q = {'token': mint(), 'speech_model': 'universal-3-5-pro', 'encoding': 'pcm_s16le', 'sample_rate': '16000',
+             'min_turn_silence': '800', 'max_turn_silence': '3000', **extra}
+        finals = []
+        async with websockets.connect('wss://streaming.assemblyai.com/v3/ws?' + urllib.parse.urlencode(q), max_size=None) as ws:
+            async def send():
+                for i in range(0, len(pcm), 3200):
+                    await ws.send(pcm[i:i + 3200])
+                    await asyncio.sleep(0.1)
+                await ws.send(json.dumps({'type': 'Terminate'}))
+            sender = asyncio.create_task(send())
+            async for raw in ws:
+                m = json.loads(raw)
+                if m.get('type') == 'Turn' and m.get('end_of_turn'):
+                    finals.append(m['transcript'])
+                elif m.get('type') == 'Termination':
+                    break
+                elif m.get('type') == 'Error' or m.get('error'):
+                    print('  error:', raw[:300], flush=True)
+            await sender
+        return ' '.join(finals)
+
+    def score(text):
+        norm = re.sub(r'[^a-z0-9 ]', ' ', text.lower())
+        hits = [t for t in TERMS if re.sub(r'[^a-z0-9 ]', ' ', t.lower()) in norm]
+        return hits
+
+    with urllib.request.urlopen(COMMON_URL, timeout=15) as r:
+        common = {w.strip().lower() for w in r.read().decode().split()[:2000]}
+    words = re.findall(r"[A-Za-z][A-Za-z0-9'.+#-]*[A-Za-z0-9+#]|[A-Za-z]", CHAT)
+    seen, unusual = set(), []
+    for w in words:
+        k = w.lower().strip("'")
+        if k in common or len(k) < 2 or k in seen:
+            continue
+        seen.add(k)
+        unusual.append(w)
+    print('unusual words:', ' '.join(unusual), flush=True)
+    print(f'full chat {len(CHAT)} chars; filtered {len(" ".join(unusual))} chars', flush=True)
+
+    pcm = speech_pcm16k()
+    print('said:', ' '.join(LINES), flush=True)
+    # Uncommon words kept in order; each run of common words cut out becomes ' | ',
+    # so words that stood next to each other stay together as a phrase.
+    runs, cur = [], []
+    for tok in re.findall(r"[A-Za-z][A-Za-z0-9'+#-]*[A-Za-z0-9+#]|[A-Za-z]|[.!?]", CHAT):
+        k = tok.lower().strip("'")
+        if tok in '.!?' or k in common or len(k) < 2:
+            if cur:
+                runs.append(' '.join(cur)); cur = []
+            continue
+        cur.append(tok)
+    if cur:
+        runs.append(' '.join(cur))
+    phrases, seenp = [], set()
+    for r in runs:
+        if r.lower() not in seenp:
+            seenp.add(r.lower()); phrases.append(r)
+    phrased = ' | '.join(phrases)
+    print(f'chat {len(CHAT)} chars; last-1650 tail keeps {len(CHAT[-1650:])}; phrase-filtered whole chat {len(phrased)} chars', flush=True)
+    print('phrase-filtered:', phrased[:1650], flush=True)
+    variants = [
+        ('A no context', {}),
+        ('B last 1650 chars of chat (mic today)', {'prompt': 'Chat with an AI assistant. Recent messages: ' + CHAT[-1650:]}),
+        ('E phrase-filtered whole chat', {'prompt': 'Chat with an AI assistant. Uncommon terms and phrases from the chat: ' + phrased[-1650:]}),
+    ]
+    for label, extra in variants:
+        try:
+            text = asyncio.run(stream(pcm, extra))
+        except Exception as e:
+            print(f'{label}: FAILED {e}', flush=True)
+            continue
+        hits = score(text)
+        print(f'{label}: {len(hits)}/{len(TERMS)} terms right; missed {[t for t in TERMS if t not in hits]}', flush=True)
+        print(f'  heard: {text}', flush=True)
+    print('DONE', flush=True)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stt-context-experiment-2
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        entity: ssint
+        env: main
+        capability: voice
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: test
+          image: python:3.12-alpine
+          command: ["sh", "-c", "apk add --no-cache -q espeak-ng && pip install -q websockets && python -W ignore /scripts/test.py"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: aai-key
+              mountPath: /secrets-aai
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+      volumes:
+        - name: script
+          configMap:
+            name: stt-context-experiment-script
+        - name: aai-key
+          secret:
+            secretName: assemblyai-api-key

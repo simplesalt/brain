@@ -246,6 +246,10 @@ data:
         #stt-mic[data-state=busy] svg{animation:stt-spin 1s linear infinite}
         @keyframes stt-pulse{50%{box-shadow:0 0 0 10px rgba(197,48,48,.25)}}
         @keyframes stt-spin{to{transform:rotate(360deg)}}
+        #stt-fix{position:fixed;z-index:2147483000;width:40px;height:40px;border-radius:50%;border:none;
+          cursor:pointer;background:#2c7a7b;color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.35);opacity:.9;
+          -webkit-tap-highlight-color:transparent;user-select:none;font:700 14px system-ui,sans-serif}
+        #stt-fix[data-busy]{background:#4a5568;animation:stt-spin 1s linear infinite}
         #stt-toast{position:fixed;z-index:2147483001;left:50%;bottom:24px;transform:translateX(-50%);
           max-width:calc(100vw - 32px);padding:10px 14px;border-radius:8px;background:#1a202c;color:#fff;
           font:14px system-ui,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.35)}`;
@@ -383,8 +387,8 @@ data:
           token, speech_model: 'universal-3-5-pro', encoding: 'pcm_s16le',
           sample_rate: String(ctx.sampleRate), prompt: conversationContext(),
           // Dictation pauses mid-sentence to think; wait longer before ending a
-          // phrase so fewer pauses become full stops. The grammar pass on stop
-          // fixes the ones that remain.
+          // phrase so fewer pauses become full stops. The grammar button fixes
+          // the ones that remain.
           min_turn_silence: '1500', max_turn_silence: '4000',
         });
         const ws = new WebSocket(`${LIVE_URL}?${params}`);
@@ -435,15 +439,27 @@ data:
         setState('idle');
       }
 
-      // After the last words arrive: a grammar pass over the whole dictation, so
-      // thinking pauses don't leave stray full stops. The live text stays if the
-      // pass fails or the chat box was edited meanwhile.
-      async function finishLive(l) {
-        if (live !== l) return;
-        endLive();
-        const text = l.text();
-        if (!text) return;
-        setState('busy');
+      function finishLive(l) {
+        if (live === l) endLive();
+      }
+
+      // The grammar button: the whole chat box goes through a grammar pass (pauses
+      // transcribed as full stops, missing punctuation, mis-heard names from the
+      // chat) and comes back in place. Nothing changes if the box was edited meanwhile.
+      const fix = document.createElement('button');
+      fix.id = 'stt-fix';
+      fix.type = 'button';
+      fix.textContent = 'Aa';
+      fix.title = 'Fix grammar in the chat box';
+      fix.setAttribute('aria-label', 'Fix grammar in the chat box');
+      fix.addEventListener('pointerdown', (e) => e.preventDefault());
+      fix.addEventListener('click', async (e) => {
+        e.preventDefault();
+        if (fix.dataset.busy) return;
+        const ta = field();
+        const text = ta?.value.trim();
+        if (!text) { toast('Nothing in the chat box to fix.'); return; }
+        fix.dataset.busy = '1';
         try {
           const r = await fetch('/_stt/tidy', {
             method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
@@ -451,12 +467,18 @@ data:
           });
           const doc = await r.json().catch(() => ({}));
           if (!r.ok || !doc.text) throw new Error(doc.error || `HTTP ${r.status}`);
-          if (!l.write(() => doc.text, true)) toast('Chat box changed, so the grammar pass was not applied.');
-        } catch (e) {
-          toast(`Grammar pass failed (${e.message}); kept the live text.`);
+          if (ta.value.trim() !== text) { toast('Chat box changed, so the fix was not applied.'); return; }
+          const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+          setter.call(ta, doc.text);
+          ta.dispatchEvent(new Event('input', { bubbles: true }));
+          ta.focus();
+          try { ta.setSelectionRange(doc.text.length, doc.text.length); } catch (_) {}
+        } catch (err) {
+          toast(`Grammar fix failed (${err.message}).`);
+        } finally {
+          delete fix.dataset.busy;
         }
-        setState('idle');
-      }
+      });
 
       function stop() {
         const l = live;
@@ -516,6 +538,8 @@ data:
         y = Math.min(Math.max(m, y), window.innerHeight - 52 - m);
         btn.style.left = x + 'px';
         btn.style.top = y + 'px';
+        fix.style.left = (x + 6) + 'px';
+        fix.style.top = (y < 56 ? y + 60 : y - 48) + 'px';
         return { x, y };
       }
       let saved = null;
@@ -550,7 +574,7 @@ data:
       btn.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); tap(); } });
 
       setState('idle');
-      const mount = () => document.body.appendChild(btn);
+      const mount = () => { document.body.appendChild(btn); document.body.appendChild(fix); };
       if (document.body) mount(); else document.addEventListener('DOMContentLoaded', mount);
     })();
   nav.js: |
