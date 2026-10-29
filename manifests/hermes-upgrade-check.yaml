@@ -157,15 +157,14 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "duxsoup-read-2026-10-29"
+              value: "miss-report-2026-10-29"
             - name: CHECK_PROMPT
               value: >-
-                Dux-Soup access check. Read only, do not write, send or change anything.
-                1) List the gbrain sources. 2) For the person Naman Shukla in gbrain, read
-                the original Dux-Soup data stored with the page and its timeline, and say
-                what the latest Dux-Soup event is (type and date) and whether any LinkedIn
-                connect invite or accept is recorded. 3) Say whether any call was refused,
-                quoting the exact error if so.
+                #fail This is a test of the miss report, sent by the coding agent, not a real
+                complaint; do not write, send or change anything. Earlier today, asked whether
+                LinkedIn invites had gone out, you said the Dux-Soup data was outside your
+                token grant and told Dylan to run a rescope-token command. I expected you to
+                read the Dux-Soup data from the default source. Severity 4.
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: PROXY_URL
