@@ -489,7 +489,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        simplesalt.company/restart-epoch: "10"
+        simplesalt.company/restart-epoch: "11"
     spec:
       securityContext:
         fsGroup: 10000
@@ -1085,6 +1085,7 @@ data:
     }
     server {
       listen 9119;
+      absolute_redirect off;
       client_max_body_size 100m;
       # Sessions (the console's own landing page) is hidden, so land on Cron.
       location = / {
