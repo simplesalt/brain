@@ -121,12 +121,50 @@ spec:
     destinations:
       - type: public
         uri: info.simplesalt.company
-    sessionDuration: 24h
+    # Long enough that Big AGI installed on a phone home screen rarely asks to sign in again.
+    sessionDuration: 720h
     autoRedirectToIdentity: true
     allowedIdps:
       - 42cbdc64-699e-4e17-b470-fb7cda3c0791
     policies:
       - id: 79bac8d3-6c82-4ac5-bbdb-f98a3388236c
+        precedence: 1
+  providerConfigRef:
+    name: ssint-main
+
+---
+apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
+kind: TrustAccessApplication
+metadata:
+  name: cloudflare-app-info-static-simplesalt-company
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+spec:
+  forProvider:
+    accountId: ba92fe12c6c1275f965c7c86e3b392ac
+    name: info-static-simplesalt-company
+    type: self_hosted
+    # Big AGI's built front end, open so phones can install it as a home-screen
+    # app (browsers fetch the manifest and icons without cookies) and Cloudflare
+    # can cache it. Pages and /api stay behind the info app above.
+    destinations:
+      - type: public
+        uri: info.simplesalt.company/_next/static
+      - type: public
+        uri: info.simplesalt.company/icons
+      - type: public
+        uri: info.simplesalt.company/manifest.json
+      - type: public
+        uri: info.simplesalt.company/apple-touch-icon.png
+      - type: public
+        uri: info.simplesalt.company/favicon.ico
+    policies:
+      - name: Everyone (static front end)
+        decision: bypass
+        include:
+          - everyone: {}
         precedence: 1
   providerConfigRef:
     name: ssint-main
