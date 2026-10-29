@@ -976,7 +976,52 @@ spec:
               mountPath: /opt/hermes/agent/conversation_loop.py
               subPath: conversation_loop.py
               readOnly: true
+        # Copies full chat transcripts out of state.db into hermes-chats-pg so a restart loses nothing.
+        - name: chat-capture
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "/scripts/chat-capture.mjs"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-chats-pg-app
+                  key: uri
+                  optional: true
+            - name: DATA_DIR
+              value: /opt/data
+          securityContext:
+            runAsUser: 10000
+            runAsGroup: 10000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: home
+              mountPath: /opt/data
+            - name: chat-capture-script
+              mountPath: /scripts
+              readOnly: true
+            - name: chat-capture-tmp
+              mountPath: /tmp
       volumes:
+        - name: chat-capture-script
+          configMap:
+            name: hermes-chat-capture-script
+        - name: chat-capture-tmp
+          emptyDir:
+            sizeLimit: 64Mi
         - name: home
           emptyDir:
             sizeLimit: 5Gi
