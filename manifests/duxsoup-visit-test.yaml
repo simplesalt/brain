@@ -1,11 +1,11 @@
-# One-off (simplesalt/projects#799): the queue was cleared and the profile visits
-# re-queued 2026-10-29 17:09Z (Job duxsoup-queue-reset-20261029). This sends the
-# extensionReload signal so the extension restarts and picks the queue up again.
-# Remove this file once the Job has run.
+# One-off test (simplesalt/projects#799): queues one profile visit under Dylan's
+# new visit-only campaign 'lookup-visits' (created 2026-10-29 17:20Z, single Visit
+# step) to see whether the extension picks up campaign-attributed visits when it
+# ignores the 'default' ones. Remove this file once the Job has run.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: duxsoup-extension-reload-20261029
+  name: duxsoup-visit-test-20261029
   namespace: ssint-main-msg
   labels:
     entity: ssint
@@ -23,7 +23,7 @@ spec:
     spec:
       restartPolicy: Never
       containers:
-        - name: reload
+        - name: visit
           image: oven/bun:1-alpine
           command: ["bun", "-e"]
           args:
@@ -48,7 +48,8 @@ spec:
                 return (await r.text()).slice(0, 200);
               }
               console.log('queue size:', await get('/queue/size'));
-              console.log('extensionReload:', await post('/signal', { signal: 'extensionReload', params: {} }));
+              console.log('visit:', await post('/queue', { command: 'visit', params: { profile: 'https://www.linkedin.com/in/judijohnstone', campaignid: 'lookup-visits' } }));
+              console.log('queue size after:', await get('/queue/size'));
           env:
             - name: DUXSOUP_USER_ID
               valueFrom:
