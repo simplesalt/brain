@@ -136,6 +136,8 @@ apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
 kind: TrustAccessApplication
 metadata:
   name: cloudflare-app-hermes-simplesalt-company
+  annotations:
+    crossplane.io/external-name: "1ccc461c-e78b-4478-b867-9e4266244c9c"
   labels:
     entity: ssint
     env: main
@@ -159,6 +161,26 @@ spec:
     name: ssint-main
 
 ---
+apiVersion: dns.upjet-cloudflare.upbound.io/v1alpha1
+kind: Record
+metadata:
+  name: cf-main-dns-hermes-simplesalt-company
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+spec:
+  forProvider:
+    zoneId: 260b251cdb53f8376875a8eb8d03ca0b
+    name: hermes.simplesalt.company
+    type: CNAME
+    content: 83c27a64-4074-474c-9a8f-19448d1c2081.cfargotunnel.com
+    proxied: true
+    ttl: 1
+  providerConfigRef:
+    name: ssint-main
+
+---
 apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
 kind: TrustTunnelCloudflaredConfig
 metadata:
@@ -177,6 +199,8 @@ spec:
       ingress:
         - hostname: info.simplesalt.company
           service: http://big-agi.ssint-main-ai.svc.k.famevans.win:3000
+        - hostname: hermes.simplesalt.company
+          service: http://hermes-agent-web.ssint-main-ai.svc.k.famevans.win:80
         - hostname: hooks.simplesalt.company
           path: ^/duxsoup/events$
           service: http://duxsoup-ingest.ssint-main-msg.svc.k.famevans.win:8080
