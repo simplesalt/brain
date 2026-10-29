@@ -489,7 +489,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        simplesalt.company/restart-epoch: "13"
+        simplesalt.company/restart-epoch: "14"
     spec:
       securityContext:
         fsGroup: 10000
@@ -1100,13 +1100,13 @@ data:
         }
         include /etc/nginx/conf.d/proxy.inc;
       }
-      # Pages get a style that hides the menu entries we don't use.
+      # Pages get a style that hides the menu entries we don't use, with and
+      # without Big AGI's /_hermes prefix (sub_filter can't take a CSS $=).
       location / {
         include /etc/nginx/conf.d/proxy.inc;
         proxy_set_header Accept-Encoding "";
         sub_filter_once on;
-        sub_filter_types text/html;
-        sub_filter '</head>' '<style>a[href$="/chat"],a[href$="/sessions"],a[href$="/files"],a[href$="/models"],a[href$="/logs"],a[href$="/pairing"],a[href$="/profiles"],a[href$="/config"],a[href$="/env"],a[href$="/kanban"],a[href$="/achievements"],a[href$="/plugins"],a[href$="/mcp"],a[href$="/system"]{display:none!important}</style></head>';
+        sub_filter '</head>' '<style>a[href="/chat"],a[href="/_hermes/chat"],a[href="/sessions"],a[href="/_hermes/sessions"],a[href="/files"],a[href="/_hermes/files"],a[href="/models"],a[href="/_hermes/models"],a[href="/logs"],a[href="/_hermes/logs"],a[href="/pairing"],a[href="/_hermes/pairing"],a[href="/profiles"],a[href="/_hermes/profiles"],a[href="/config"],a[href="/_hermes/config"],a[href="/env"],a[href="/_hermes/env"],a[href="/kanban"],a[href="/_hermes/kanban"],a[href="/achievements"],a[href="/_hermes/achievements"],a[href="/plugins"],a[href="/_hermes/plugins"],a[href="/mcp"],a[href="/_hermes/mcp"],a[href="/system"],a[href="/_hermes/system"]{display:none!important}</style></head>';
       }
     }
   proxy.inc: |
