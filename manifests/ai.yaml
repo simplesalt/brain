@@ -466,6 +466,9 @@ spec:
             - name: admin-gate-script
               mountPath: /scripts
               readOnly: true
+            - name: gbrain-install
+              mountPath: /install
+              readOnly: true
       volumes:
         - name: gbrain-install
           emptyDir: {}
@@ -494,7 +497,7 @@ data:
     # AGI's gate publishes it, behind Cloudflare Access, at info.../brain).
     # The dashboard hard-codes /admin, so it is served under PREFIX and its pages
     # and scripts are rewritten to match.
-    import http.client, http.server, json, os, threading
+    import glob, http.client, http.server, json, mimetypes, os, threading
 
     UPSTREAM = ('127.0.0.1', 3131)
     PORT = int(os.environ.get('PORT', '3132'))
@@ -506,6 +509,20 @@ data:
 
     _lock = threading.Lock()
     _session = None
+
+    # The globally installed gbrain answers its own /admin/assets/* with the
+    # dashboard page instead of the files (its embedded asset map is empty), so
+    # the files are served here from the installed package's admin/dist.
+    _assets = None
+    def asset_dir():
+        global _assets
+        if _assets is None:
+            hits = glob.glob('/install/**/gbrain/admin/dist/assets', recursive=True)
+            if not hits:
+                print('admin-gate: no gbrain admin/dist/assets under /install', flush=True)
+                return None
+            _assets = hits[0]
+        return _assets
 
     def login():
         global _session
@@ -543,6 +560,8 @@ data:
                 return self._send(200, b'ok', 'text/plain')
             if not (self.path == PREFIX or self.path.startswith(PREFIX + '/')):
                 return self._send(404, b'not found', 'text/plain')
+            if self.path.startswith(PREFIX + '/assets/') and self.command in ('GET', 'HEAD'):
+                return self._asset(self.path.split('?', 1)[0][len(PREFIX + '/assets/'):])
             n = int(self.headers.get('Content-Length', 0) or 0)
             body = self.rfile.read(n) if n else b''
             path = '/admin' + self.path[len(PREFIX):]
@@ -599,12 +618,28 @@ data:
             finally:
                 conn.close()
 
-        def _send(self, status, out, ctype):
+        def _asset(self, name):
+            base = asset_dir()
+            if not base or '/' in name or name.startswith('.'):
+                return self._send(404, b'not found', 'text/plain')
+            try:
+                with open(os.path.join(base, name), 'rb') as f:
+                    out = f.read()
+            except OSError:
+                return self._send(404, b'not found', 'text/plain')
+            ctype = mimetypes.guess_type(name)[0] or 'application/octet-stream'
+            if ctype in ('text/javascript', 'application/javascript', 'text/css'):
+                out = out.replace(b'/admin/', PREFIX.encode() + b'/')
+            self._send(200, out, ctype, cache='public, max-age=31536000, immutable')
+
+        def _send(self, status, out, ctype, cache='no-store'):
             self.send_response(status)
             self.send_header('Content-Type', ctype)
+            self.send_header('Cache-Control', cache)
             self.send_header('Content-Length', str(len(out)))
             self.end_headers()
-            self.wfile.write(out)
+            if self.command != 'HEAD':
+                self.wfile.write(out)
 
     if __name__ == '__main__':
         srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Gate)
