@@ -299,11 +299,19 @@ data:
       fetchPass();
       setInterval(fetchPass, PASS_REFRESH_MS);
 
-      // Context for the recognizer: the end of the open conversation.
+      // Context for the recognizer: the end of the open conversation, taken from
+      // big-AGI's message elements so buttons and the composer are left out.
+      // The last prompt sent is kept on window.__sttContext to check what went.
       function conversationContext() {
         let tail = '';
-        try { tail = (document.querySelector('main') || document.body).innerText.replace(/\s+/g, ' ').slice(-1500); } catch (_) {}
-        return ('Dictating a chat message to an AI assistant. Recent conversation: ' + tail).slice(0, 1750);
+        try {
+          const msgs = [...document.querySelectorAll('[role="chat-message"]')].slice(-8);
+          const text = msgs.length ? msgs.map((m) => m.innerText).join(' ') : (document.querySelector('main') || document.body).innerText;
+          tail = text.replace(/\s+/g, ' ').trim().slice(-1650);
+        } catch (_) {}
+        const prompt = 'Chat with an AI assistant. Recent messages: ' + tail;
+        window.__sttContext = prompt;
+        return prompt;
       }
 
       // Writes the live text into the chat box, replacing what this session wrote so far.
@@ -355,6 +363,9 @@ data:
         const params = new URLSearchParams({
           token, speech_model: 'universal-3-5-pro', encoding: 'pcm_s16le',
           sample_rate: String(ctx.sampleRate), prompt: conversationContext(),
+          // Dictation pauses mid-sentence; wait longer before ending a phrase so
+          // short pauses don't become full stops.
+          min_turn_silence: '800', max_turn_silence: '3000',
         });
         const ws = new WebSocket(`${LIVE_URL}?${params}`);
         ws.binaryType = 'arraybuffer';
