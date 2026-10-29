@@ -19,7 +19,9 @@ data:
     # It also adds dictation: every big-AGI page loads /_stt/mic.js, a mic
     # button that records audio and posts it to /_stt/transcribe, which is
     # passed with the Access JWT to stt-proxy. stt-proxy verifies the JWT and
-    # holds the OpenRouter key; this pod holds none.
+    # holds the OpenRouter key; this pod holds none. For live dictation the mic
+    # gets a single-use AssemblyAI pass from /_stt/token (also minted by
+    # stt-proxy) and streams audio to AssemblyAI directly.
     import json, os, http.client, http.server
     from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
 
@@ -229,14 +231,19 @@ data:
         print(f'big-agi-gate :{PORT} → {UPSTREAM_HOST}:{UPSTREAM_PORT}', flush=True)
         srv.serve_forever()
   mic.js: |
-    // Dictation for big-AGI: tap the mic, speak, tap again. The recording goes
-    // to /_stt/transcribe (Whisper with the vocabulary list) and the text is
-    // typed into the chat box at the cursor, for review before sending.
-    // Drag the button to move it.
+    // Dictation for big-AGI: tap the mic, speak, tap again. Text goes into the
+    // chat box at the cursor, for review before sending. Drag the button to move it.
+    // Live: with a pass from /_stt/token, audio streams straight from the browser to
+    // AssemblyAI and words appear as you speak; the open conversation is sent as
+    // context so it picks the right word. Without a pass (no key filled), the
+    // recording goes to /_stt/transcribe (Whisper with the vocabulary list) on stop.
     (() => {
       if (window.__sttMic) return;
       window.__sttMic = true;
       const MAX_MS = 10 * 60 * 1000;
+      const LIVE_MAX_MS = 60 * 60 * 1000;
+      const PASS_REFRESH_MS = 8 * 60 * 1000;
+      const LIVE_URL = 'wss://streaming.assemblyai.com/v3/ws';
       const POS_KEY = 'stt-mic-pos';
 
       const style = document.createElement('style');
@@ -370,12 +377,172 @@ data:
         }
       }
 
+      // Live passes: single-use, unusable after 10 minutes, so one is kept fresh
+      // in the background and a tap never waits on the handshake.
+      let pass = null, passAt = 0, liveOff = false, live = null;
+      async function fetchPass() {
+        try {
+          const r = await fetch('/_stt/token', { credentials: 'same-origin', cache: 'no-store' });
+          const doc = await r.json().catch(() => ({}));
+          if (r.ok && doc.token) { pass = doc.token; passAt = Date.now(); liveOff = false; return pass; }
+          if (r.status === 503 || r.status === 404) liveOff = true;
+        } catch (_) {}
+        pass = null;
+        return null;
+      }
+      async function takePass() {
+        const p = pass && Date.now() - passAt < PASS_REFRESH_MS + 60 * 1000 ? pass : await fetchPass();
+        pass = null;
+        setTimeout(fetchPass, 0);
+        return p;
+      }
+      fetchPass();
+      setInterval(fetchPass, PASS_REFRESH_MS);
+
+      // Context for the recognizer: the end of the open conversation.
+      function conversationContext() {
+        let tail = '';
+        try { tail = (document.querySelector('main') || document.body).innerText.replace(/\s+/g, ' ').slice(-1500); } catch (_) {}
+        return ('Dictating a chat message to an AI assistant. Recent conversation: ' + tail).slice(0, 1750);
+      }
+
+      // Writes the live text into the chat box, replacing what this session wrote so far.
+      // If the box changed under us, the next words go at the new cursor instead.
+      function liveWriter(onMoved) {
+        let ta = null, before = '', after = '', written = null;
+        const anchor = () => {
+          ta = field();
+          if (!ta) return;
+          const v = ta.value, s = ta.selectionStart ?? v.length, e = ta.selectionEnd ?? s;
+          before = v.slice(0, s); after = v.slice(e);
+        };
+        anchor();
+        return (textFn) => {
+          if (!ta || !ta.isConnected || (written !== null && ta.value !== written)) { anchor(); written = null; onMoved(); }
+          const text = textFn();
+          if (!ta || !text) return;
+          const lead = before && !/\s$/.test(before) ? ' ' : '';
+          const trail = after && !/^\s/.test(after) ? ' ' : '';
+          const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+          written = before + lead + text + trail + after;
+          setter.call(ta, written);
+          ta.dispatchEvent(new Event('input', { bubbles: true }));
+          written = ta.value;
+          const pos = (before + lead + text).length;
+          try { ta.setSelectionRange(pos, pos); } catch (_) {}
+        };
+      }
+
+      const WORKLET = `registerProcessor('stt-pcm', class extends AudioWorkletProcessor {
+        constructor() { super(); this.buf = []; }
+        process(inputs) {
+          const ch = inputs[0] && inputs[0][0];
+          if (ch) for (let i = 0; i < ch.length; i++) this.buf.push(Math.max(-1, Math.min(1, ch[i])) * 0x7fff);
+          if (this.buf.length >= sampleRate / 10) { this.port.postMessage(Int16Array.from(this.buf).buffer); this.buf = []; }
+          return true;
+        }
+      });`;
+
+      async function startLive(token) {
+        const ctx = new AudioContext({ sampleRate: 16000 });
+        const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
+        try {
+          await ctx.audioWorklet.addModule(url);
+          await ctx.resume();
+        } catch (e) {
+          ctx.close().catch(() => {});
+          throw e;
+        } finally { URL.revokeObjectURL(url); }
+        const params = new URLSearchParams({
+          token, speech_model: 'universal-3-5-pro', encoding: 'pcm_s16le',
+          sample_rate: String(ctx.sampleRate), prompt: conversationContext(),
+        });
+        const ws = new WebSocket(`${LIVE_URL}?${params}`);
+        ws.binaryType = 'arraybuffer';
+        const node = new AudioWorkletNode(ctx, 'stt-pcm');
+        const src = ctx.createMediaStreamSource(stream);
+        let committed = [], partial = '';
+        const write = liveWriter(() => { committed = []; });
+        const show = () => write(() => [...committed, partial].filter(Boolean).join(' '));
+        node.port.onmessage = (e) => { if (ws.readyState === 1) ws.send(e.data); };
+        ws.onmessage = (e) => {
+          let m;
+          try { m = JSON.parse(e.data); } catch (_) { return; }
+          if (m.type === 'Turn') {
+            const text = (m.transcript || '').trim();
+            if (m.end_of_turn) { if (text) committed.push(text); partial = ''; } else partial = text;
+            show();
+          }
+        };
+        live = { ws, ctx, src, node, ending: false };
+        await new Promise((ok, fail) => {
+          ws.onopen = ok;
+          ws.onerror = () => fail(new Error('could not reach the live dictation service'));
+        });
+        src.connect(node);
+        ws.onclose = (e) => {
+          const was = live;
+          endLive();
+          if (was && !was.ending) toast(`Live dictation stopped${e.reason ? ` (${e.reason})` : ''}.`);
+        };
+        let ctxTimer = setInterval(() => {
+          if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'UpdateConfiguration', prompt: conversationContext() }));
+        }, 60 * 1000);
+        live.ctxTimer = ctxTimer;
+      }
+
+      function endLive() {
+        if (!live) return;
+        const l = live;
+        live = null;
+        clearInterval(l.ctxTimer);
+        try { l.src.disconnect(); l.node.disconnect(); } catch (_) {}
+        l.ctx.close().catch(() => {});
+        stream?.getTracks().forEach((t) => t.stop());
+        if (l.ws.readyState <= 1) try { l.ws.close(); } catch (_) {}
+        setState('idle');
+      }
+
+      function stopLive() {
+        const l = live;
+        if (!l || l.ending) return;
+        l.ending = true;
+        try { l.src.disconnect(); } catch (_) {}
+        setState('busy');
+        // Terminate flushes the last words; the server then closes the socket.
+        try { l.ws.send(JSON.stringify({ type: 'Terminate' })); } catch (_) {}
+        setTimeout(endLive, 4000);
+      }
+
       async function start() {
         try {
           stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
         } catch (e) {
           toast('Microphone blocked. Allow it for this site in the browser settings.');
           return;
+        }
+        const token = liveOff ? null : await takePass();
+        if (token) {
+          setState('busy');
+          try {
+            await startLive(token);
+            startedAt = Date.now();
+            setState('rec');
+            const tick = () => {
+              const s = Math.floor((Date.now() - startedAt) / 1000);
+              btn.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+              if (Date.now() - startedAt > LIVE_MAX_MS) stopLive();
+            };
+            tick();
+            timer = setInterval(tick, 500);
+            return;
+          } catch (e) {
+            if (live) { live.ending = true; endLive(); }
+            stream?.getTracks().forEach((t) => t.stop());
+            stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }).catch(() => null);
+            if (!stream) { setState('idle'); return; }
+            toast(`Live dictation unavailable (${e.message}); recording instead.`);
+          }
         }
         const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus']
           .find((m) => window.MediaRecorder?.isTypeSupported?.(m)) || '';
@@ -402,7 +569,8 @@ data:
       }
 
       function stop() {
-        if (rec && rec.state !== 'inactive') rec.stop();
+        if (live) stopLive();
+        else if (rec && rec.state !== 'inactive') rec.stop();
       }
 
       function tap() {
