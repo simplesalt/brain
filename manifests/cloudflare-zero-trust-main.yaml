@@ -133,6 +133,33 @@ spec:
 
 ---
 apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
+kind: TrustAccessApplication
+metadata:
+  name: cloudflare-app-hermes-simplesalt-company
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+spec:
+  forProvider:
+    accountId: ba92fe12c6c1275f965c7c86e3b392ac
+    name: hermes-simplesalt-company
+    type: self_hosted
+    destinations:
+      - type: public
+        uri: hermes.simplesalt.company
+    sessionDuration: 24h
+    autoRedirectToIdentity: true
+    allowedIdps:
+      - 42cbdc64-699e-4e17-b470-fb7cda3c0791
+    policies:
+      - id: 79bac8d3-6c82-4ac5-bbdb-f98a3388236c
+        precedence: 1
+  providerConfigRef:
+    name: ssint-main
+
+---
+apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
 kind: TrustTunnelCloudflaredConfig
 metadata:
   annotations:
