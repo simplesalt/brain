@@ -878,9 +878,79 @@ spec:
                   print('patch-tool-bridge: WARNING cut-off wording not found; left unchanged')
               dst.write_text(text)
               compile(dst.read_text(), str(dst), 'exec')
+              # The image file only exists while it is being described, so the qr-code skill
+              # decodes it right there and its note rides along with the description.
+              src = pathlib.Path('/opt/hermes/agent/vision_message_prep.py')
+              dst = pathlib.Path('/patched/vision_message_prep.py')
+              text = src.read_text()
+              old = '            description = (result.get("analysis") or "").strip()\n'
+              hook = ('            try:\n'
+                      '                import sys as _qr_sys\n'
+                      '                if "/opt/data/qr-lib" not in _qr_sys.path:\n'
+                      '                    _qr_sys.path.append("/opt/data/qr-lib")\n'
+                      '                from qr_decode import note_for\n'
+                      '                description += note_for(vision_source, description)\n'
+                      '            except Exception as qr_error:\n'
+                      '                logger.warning("qr-code skill skipped: %s", qr_error)\n')
+              if text.count(old) == 1:
+                  text = text.replace(old, old + hook)
+                  print('patch-tool-bridge: image descriptions that mention a QR code get it decoded')
+              else:
+                  print('patch-tool-bridge: WARNING image description line not found; QR decoding left off')
+              dst.write_text(text)
+              compile(dst.read_text(), str(dst), 'exec')
           volumeMounts:
             - name: patched-code
               mountPath: /patched
+        # The qr-code skill's decoder (ZXing) and its script, which the patched image
+        # description step imports. A failed install only leaves QR decoding off.
+        - name: install-qr-decoder
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              LIB=/opt/data/qr-lib
+              rm -rf "$LIB" && mkdir -p "$LIB"
+              cat > /tmp/qr-requirements.txt <<'EOF'
+              zxing-cpp==3.1.1 \
+                --hash=sha256:9cf67341949946307d086b302cefd453fb47bc6d6ddc7d088839e9481982757b \
+                --hash=sha256:f4dae01111f323f46736fc21f05c14dcaaac06cea5fdc8fd994ba19f6f918c6e
+              pillow==12.3.0 \
+                --hash=sha256:0847a763afefb695bc912d7c131e7e0632d4edc1d8698f58ddabec8e46b8b6d3 \
+                --hash=sha256:f7401aebd7f581d7f83a439d87d474999317ee099218e5ad25d125290990ba65
+              EOF
+              if uv pip install --quiet --no-cache --require-hashes --only-binary :all: \
+                  --python /opt/hermes/.venv/bin/python --target "$LIB" -r /tmp/qr-requirements.txt; then
+                echo "qr-code: ZXing decoder installed"
+              else
+                echo "ERROR: qr-code decoder install failed; QR codes will not be decoded"
+              fi
+              cp /seed/skill-qr-code--qr_decode.py "$LIB/qr_decode.py"
+              chown -R 10000:10000 "$LIB"
+              cd /tmp && /opt/hermes/.venv/bin/python -c '
+              import sys
+              sys.path.append("/opt/data/qr-lib")
+              from qr_decode import note_for
+              cases = {
+                  "/seed/qr-code-selftest-skewed.jpg": "https://events.example.com/register?id=4471",
+                  "/seed/qr-code-selftest-small.jpg": "WIFI:T:WPA;S:Guest;P:not-a-real-pass;;",
+              }
+              ok = 0
+              for path, want in cases.items():
+                  note = note_for(path, "A poster with a QR code in the corner.")
+                  if want in note:
+                      ok += 1
+                  else:
+                      print("qr-code self-test: FAILED on %s: %s" % (path, note.strip()))
+              print("qr-code self-test: %d of %d test images decoded" % (ok, len(cases)))
+              ' || echo "ERROR: qr-code self-test could not run"
+          volumeMounts:
+            - name: home
+              mountPath: /opt/data
+            - name: config-seed
+              mountPath: /seed
+              readOnly: true
       containers:
         - name: hermes-agent
           image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
@@ -970,6 +1040,10 @@ spec:
             - name: patched-code
               mountPath: /opt/hermes/agent/conversation_loop.py
               subPath: conversation_loop.py
+              readOnly: true
+            - name: patched-code
+              mountPath: /opt/hermes/agent/vision_message_prep.py
+              subPath: vision_message_prep.py
               readOnly: true
         # Publishes the loopback-only dashboard on 9119. Requests are rewritten
         # to look local (Host, Origin), which is what lets Hermes skip its login;

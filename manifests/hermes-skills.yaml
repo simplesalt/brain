@@ -33,5 +33,6 @@ local:
   - note-capture
   - catch-up
   - miss-report
+  - qr-code
 simplesalt:
   - clarify
