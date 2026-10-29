@@ -317,8 +317,18 @@ data:
         webhookprofileflag: s.webhookprofileflag ?? null,
         webhooks_count: webhooks.length,
         webhooks: webhooks.map(redactWebhookEntry),
+        robot: Object.fromEntries(ROBOT_STATE_KEYS.map((k) => [k, robotStateValue(s[k])])),
         setting_keys: Object.keys(s),
       };
+    }
+
+    // Settings that decide whether the extension works its remote-control queue.
+    const ROBOT_STATE_KEYS = ['remotecontrolflag', 'remotecontrolwindowed', 'pauserobot', 'snooze', 'robotscheduleplan', 'backgroundmode', 'linkedinlimitsnooze', 'maxvisits', 'maxenrolls'];
+
+    function robotStateValue(v) {
+      if (v == null || typeof v === 'boolean' || typeof v === 'number') return v ?? null;
+      if (typeof v === 'string') return v.slice(0, 200);
+      try { return JSON.stringify(v).slice(0, 500); } catch { return null; }
     }
 
     function extractQueueSize(resp) {
@@ -363,6 +373,7 @@ data:
         webhookprofileflag: settingsRedacted?.webhookprofileflag ?? null,
         webhooks_count: settingsRedacted?.webhooks_count ?? null,
         webhooks: settingsRedacted?.webhooks ?? null,
+        robot: settingsRedacted?.robot ?? null,
         setting_keys: settingsRedacted?.setting_keys ?? null,
         queue_size: queueSize,
       })}`);
@@ -1803,7 +1814,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "8"
+        simplesalt.company/restart-epoch: "9"
     spec:
       serviceAccountName: duxsoup-ingest
       containers:
