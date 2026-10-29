@@ -10,6 +10,7 @@ resources:
   - manifests/hermes-upgrade-check.yaml
   - manifests/hermes-crm-link-check.yaml
   - manifests/hermes-chat-archive.yaml
+  - manifests/hermes-chats.yaml
   - manifests/big-agi.yaml
   - manifests/stt-proxy.yaml
   - manifests/hermes-proxy.yaml

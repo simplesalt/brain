@@ -1,0 +1,689 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: hermes-chats-pg
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+  bootstrap:
+    initdb:
+      database: hermes_chats
+      owner: hermes_chats
+  storage:
+    size: 5Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-chat-capture-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  chat-capture.mjs: |
+    #!/usr/bin/env bun
+    // Copies full Hermes chat transcripts from the SQLite state.db (emptyDir, wiped on
+    // restart) into Postgres. Read-only on state.db. Fails soft: errors are logged and the
+    // next sweep retries.
+
+    import { SQL } from 'bun';
+    import { Database } from 'bun:sqlite';
+    import { existsSync, watch } from 'fs';
+    import { gzipSync } from 'bun';
+
+    const DATABASE_URL = process.env.DATABASE_URL ?? '';
+    const DATA_DIR = process.env.DATA_DIR ?? '/opt/data';
+    const DB_PATH = `${DATA_DIR}/state.db`;
+    const DEBOUNCE_MS = 2000;
+    const SWEEP_MS = 60_000;
+    const BATCH = 200;
+
+    // This runs inside the Hermes pod: never exit on an error, or the pod goes unready.
+    process.on('uncaughtException', (e) => console.error('chat-capture: uncaught:', e?.message ?? e));
+    process.on('unhandledRejection', (e) => console.error('chat-capture: unhandled rejection:', e?.message ?? e));
+
+    if (!DATABASE_URL) {
+      console.error('chat-capture: DATABASE_URL not set; idling');
+      setInterval(() => {}, 1 << 30);
+    }
+
+    const sql = DATABASE_URL ? new SQL(DATABASE_URL) : null;
+
+    const DDL = [
+      `CREATE TABLE IF NOT EXISTS sessions (
+        session_id text PRIMARY KEY,
+        source text, model text, title text,
+        started_at timestamptz, last_active timestamptz,
+        raw jsonb,
+        first_seen timestamptz DEFAULT now(),
+        updated_at timestamptz DEFAULT now()
+      )`,
+      `CREATE TABLE IF NOT EXISTS messages (
+        session_id text,
+        msg_id bigint,
+        ts timestamptz,
+        role text, tool_name text, finish_reason text,
+        content_chars int, reasoning_chars int,
+        content_head text, reasoning_head text, reasoning_tail text,
+        flags text[] DEFAULT '{}',
+        raw_gz bytea,
+        captured_at timestamptz DEFAULT now(),
+        PRIMARY KEY (session_id, msg_id)
+      )`,
+      `CREATE INDEX IF NOT EXISTS messages_ts_idx ON messages (ts)`,
+      `CREATE TABLE IF NOT EXISTS review_notes (
+        id bigserial PRIMARY KEY,
+        session_id text, msg_id bigint,
+        created_at timestamptz DEFAULT now(),
+        pattern text, quote text, note text
+      )`,
+    ];
+
+    let schemaReady = false;
+    let cursor = 0; // highest messages.id copied; state.db starts empty after a restart
+    const sessionHash = new Map(); // session_id -> last upserted JSON string
+    let sweeping = false;
+    let again = false;
+    let stopping = false;
+
+    function jsonSafe(row) {
+      return JSON.stringify(row, (_k, v) => {
+        if (typeof v === 'bigint') return Number(v);
+        if (v instanceof Uint8Array) return { _blob_b64: Buffer.from(v).toString('base64') };
+        return v;
+      });
+    }
+
+    const clean = (s) => String(s).replace(/\u0000/g, '');
+
+    function toText(v) {
+      if (v === null || v === undefined) return '';
+      if (typeof v === 'string') return clean(v);
+      if (v instanceof Uint8Array) return clean(Buffer.from(v).toString('utf8'));
+      try { return clean(JSON.stringify(v)); } catch { return clean(String(v)); }
+    }
+
+    // epoch seconds (float), epoch millis, or an ISO string -> ISO string or null
+    function toTs(v) {
+      if (v === null || v === undefined || v === '') return null;
+      let d;
+      if (typeof v === 'number' || typeof v === 'bigint' || /^\d+(\.\d+)?$/.test(String(v))) {
+        let n = Number(v);
+        if (n > 1e11) n = n / 1000;
+        d = new Date(n * 1000);
+      } else {
+        d = new Date(String(v));
+      }
+      return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    }
+
+    const USER_FAIL = /#fail|hard fail|you suck|completely wrong/i;
+    const TOOL_ERR = /^\s*(error\b|traceback|exception\b)|"error"\s*:\s*(?!null)|"success"\s*:\s*false|"status"\s*:\s*"error"|exit code[:= ]+[1-9]|command not found|permission denied/i;
+
+    function flagsFor(role, content) {
+      const f = [];
+      if (role === 'user' && USER_FAIL.test(content)) f.push('user_fail');
+      if (content.includes('HERMES MISS REPORT')) f.push('miss_report');
+      if (role === 'tool' && TOOL_ERR.test(content.slice(0, 4000))) f.push('tool_error');
+      return f;
+    }
+
+    async function ensureSchema() {
+      if (schemaReady) return;
+      for (const stmt of DDL) await sql.unsafe(stmt);
+      schemaReady = true;
+      console.log('chat-capture: schema ready');
+    }
+
+    let loggedShape = false;
+    function openDb() {
+      const db = new Database(DB_PATH);
+      db.exec('PRAGMA query_only = 1');
+      db.exec('PRAGMA busy_timeout = 5000');
+      return db;
+    }
+
+    function logShape(db) {
+      if (loggedShape) return;
+      loggedShape = true;
+      try {
+        const tables = db.query(`SELECT name FROM sqlite_master WHERE type = 'table'`).all().map((r) => r.name);
+        console.log(`chat-capture: sqlite tables: ${tables.join(', ')}`);
+        for (const t of ['sessions', 'messages']) {
+          if (tables.includes(t)) {
+            const cols = db.query(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+            console.log(`chat-capture: ${t} columns: ${cols.join(', ')}`);
+          } else {
+            console.error(`chat-capture: WARN table ${t} not found`);
+          }
+        }
+      } catch (e) {
+        console.error('chat-capture: shape discovery failed:', e?.message ?? e);
+      }
+    }
+
+    function hasTable(db, name) {
+      return !!db.query(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name);
+    }
+
+    async function upsertSession(row) {
+      const sid = row.id ?? row.session_id;
+      if (sid === null || sid === undefined) return false;
+      const raw = jsonSafe(row);
+      const key = String(sid);
+      if (sessionHash.get(key) === raw) return false;
+      await sql.unsafe(
+        `INSERT INTO sessions (session_id, source, model, title, started_at, last_active, raw)
+         VALUES ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, $7::jsonb)
+         ON CONFLICT (session_id) DO UPDATE SET
+           source = EXCLUDED.source, model = EXCLUDED.model, title = EXCLUDED.title,
+           started_at = EXCLUDED.started_at, last_active = EXCLUDED.last_active,
+           raw = EXCLUDED.raw, updated_at = now()`,
+        [
+          key,
+          row.source == null ? null : clean(row.source),
+          row.model == null ? null : clean(row.model),
+          row.title == null ? null : clean(row.title),
+          toTs(row.started_at),
+          toTs(row.last_active),
+          clean(raw),
+        ],
+      );
+      sessionHash.set(key, raw);
+      return true;
+    }
+
+    async function insertMessage(row) {
+      const sid = row.session_id;
+      if (sid === null || sid === undefined || row.id === null || row.id === undefined) return { inserted: false, bytes: 0 };
+      const role = row.role == null ? null : clean(row.role);
+      const content = toText(row.content);
+      const reasoning = toText(row.reasoning) || toText(row.reasoning_content);
+      const flags = flagsFor(role ?? '', content);
+      const gz = gzipSync(Buffer.from(jsonSafe(row), 'utf8'));
+      const res = await sql.unsafe(
+        `INSERT INTO messages (session_id, msg_id, ts, role, tool_name, finish_reason,
+           content_chars, reasoning_chars, content_head, reasoning_head, reasoning_tail, flags, raw_gz)
+         VALUES ($1, $2, $3::timestamptz, $4, $5, $6, $7, $8, $9, $10, $11, $12::text[], $13)
+         ON CONFLICT (session_id, msg_id) DO NOTHING
+         RETURNING msg_id`,
+        [
+          String(sid),
+          Number(row.id),
+          toTs(row.timestamp),
+          role,
+          row.tool_name == null ? null : clean(row.tool_name),
+          row.finish_reason == null ? null : clean(row.finish_reason),
+          content.length,
+          reasoning.length,
+          content.slice(0, 2000),
+          reasoning.slice(0, 1500),
+          reasoning.length > 1500 ? reasoning.slice(-1500) : reasoning.slice(0, 1500),
+          `{${flags.join(',')}}`,
+          gz,
+        ],
+      );
+      return { inserted: res.length > 0, bytes: gz.length };
+    }
+
+    async function sweepOnce() {
+      if (!sql) return;
+      if (!existsSync(DB_PATH)) { console.log('chat-capture: state.db not present yet'); return; }
+      await ensureSchema();
+      const db = openDb();
+      let nSess = 0, nMsgs = 0, nBytes = 0, nSeen = 0;
+      try {
+        logShape(db);
+        if (hasTable(db, 'sessions')) {
+          for (const row of db.query('SELECT * FROM sessions').all()) {
+            if (await upsertSession(row)) nSess++;
+          }
+        }
+        if (hasTable(db, 'messages')) {
+          const stmt = db.query('SELECT * FROM messages WHERE id > ? ORDER BY id LIMIT ?');
+          for (;;) {
+            const rows = stmt.all(cursor, BATCH);
+            if (rows.length === 0) break;
+            let maxId = cursor;
+            for (const row of rows) {
+              nSeen++;
+              const r = await insertMessage(row);
+              if (r.inserted) { nMsgs++; nBytes += r.bytes; }
+              if (Number(row.id) > maxId) maxId = Number(row.id);
+            }
+            cursor = maxId; // advance only after the whole batch landed
+          }
+        }
+      } finally {
+        try { db.close(); } catch {}
+      }
+      console.log(`chat-capture: sweep sessions_upserted=${nSess} messages_seen=${nSeen} messages_new=${nMsgs} gz_bytes=${nBytes} cursor=${cursor}`);
+    }
+
+    async function sweep() {
+      if (sweeping) { again = true; return; }
+      sweeping = true;
+      try {
+        do {
+          again = false;
+          try { await sweepOnce(); }
+          catch (e) { console.error('chat-capture: sweep failed (will retry):', e?.message ?? e); }
+        } while (again && !stopping);
+      } finally {
+        sweeping = false;
+      }
+    }
+
+    if (sql) {
+      let timer = null;
+      const kick = () => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { timer = null; sweep(); }, DEBOUNCE_MS);
+      };
+      try {
+        watch(DATA_DIR, (_evt, filename) => {
+          if (filename && String(filename).startsWith('state.db')) kick();
+        });
+      } catch (e) {
+        console.error('chat-capture: fs.watch failed; relying on periodic sweeps:', e?.message ?? e);
+      }
+      setInterval(() => { sweep(); }, SWEEP_MS);
+      sweep();
+
+      const shutdown = async (sig) => {
+        if (stopping) return;
+        stopping = true;
+        console.log(`chat-capture: ${sig}, final sweep`);
+        try {
+          for (let i = 0; i < 100 && sweeping; i++) await Bun.sleep(100);
+          await sweep();
+        } catch {}
+        process.exit(0);
+      };
+      process.on('SIGTERM', () => shutdown('SIGTERM'));
+      process.on('SIGINT', () => shutdown('SIGINT'));
+      console.log(`chat-capture: started, watching ${DATA_DIR}`);
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-chats-api-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  hermes-chats.mjs: |
+    #!/usr/bin/env bun
+    // Read API over the captured Hermes chat transcripts. No auth; reachable only via NetworkPolicy.
+
+    import { SQL, gunzipSync } from 'bun';
+
+    const PORT = Number(process.env.PORT ?? 8080);
+    const DATABASE_URL = process.env.DATABASE_URL ?? '';
+    const RETENTION_DAYS = Number(process.env.RETENTION_DAYS ?? 30);
+
+    if (!DATABASE_URL) {
+      console.error('FATAL: DATABASE_URL must be set');
+      process.exit(1);
+    }
+    const sql = new SQL(DATABASE_URL);
+
+    const DDL = [
+      `CREATE TABLE IF NOT EXISTS sessions (
+        session_id text PRIMARY KEY,
+        source text, model text, title text,
+        started_at timestamptz, last_active timestamptz,
+        raw jsonb,
+        first_seen timestamptz DEFAULT now(),
+        updated_at timestamptz DEFAULT now()
+      )`,
+      `CREATE TABLE IF NOT EXISTS messages (
+        session_id text,
+        msg_id bigint,
+        ts timestamptz,
+        role text, tool_name text, finish_reason text,
+        content_chars int, reasoning_chars int,
+        content_head text, reasoning_head text, reasoning_tail text,
+        flags text[] DEFAULT '{}',
+        raw_gz bytea,
+        captured_at timestamptz DEFAULT now(),
+        PRIMARY KEY (session_id, msg_id)
+      )`,
+      `CREATE INDEX IF NOT EXISTS messages_ts_idx ON messages (ts)`,
+      `CREATE TABLE IF NOT EXISTS review_notes (
+        id bigserial PRIMARY KEY,
+        session_id text, msg_id bigint,
+        created_at timestamptz DEFAULT now(),
+        pattern text, quote text, note text
+      )`,
+    ];
+
+    let schemaReady = false;
+    async function ensureSchema() {
+      if (schemaReady) return;
+      for (const stmt of DDL) await sql.unsafe(stmt);
+      schemaReady = true;
+    }
+    (async function initSchema() {
+      try { await ensureSchema(); console.log('hermes-chats: schema ready'); }
+      catch (e) { console.error('hermes-chats: schema not ready, retrying:', e?.message ?? e); setTimeout(initSchema, 5000); }
+    })();
+
+    async function retention() {
+      try {
+        await ensureSchema();
+        const m = await sql.unsafe(`DELETE FROM messages WHERE ts < now() - ($1 || ' days')::interval RETURNING 1`, [String(RETENTION_DAYS)]);
+        const s = await sql.unsafe(
+          `DELETE FROM sessions WHERE COALESCE(last_active, started_at, updated_at) < now() - ($1 || ' days')::interval RETURNING 1`,
+          [String(RETENTION_DAYS)],
+        );
+        console.log(`hermes-chats: retention deleted messages=${m.length} sessions=${s.length}`);
+      } catch (e) {
+        console.error('hermes-chats: retention failed:', e?.message ?? e);
+      }
+    }
+    setTimeout(retention, 30_000);
+    setInterval(retention, 3600_000);
+
+    const json = (obj, status = 200) =>
+      new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
+    const bad = (msg, status = 400) => json({ error: msg }, status);
+    const int = (v, d, min, max) => {
+      const n = Number.parseInt(v ?? '', 10);
+      if (Number.isNaN(n)) return d;
+      return Math.min(max, Math.max(min, n));
+    };
+    const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s ?? '') && !Number.isNaN(Date.parse(s + 'T00:00:00Z'));
+
+    async function route(req) {
+      const url = new URL(req.url);
+      const p = url.pathname.replace(/\/+$/, '') || '/';
+      const q = url.searchParams;
+      let m;
+
+      if (p === '/health') {
+        await sql.unsafe('SELECT 1');
+        return json({ ok: true });
+      }
+      await ensureSchema();
+
+      if (req.method === 'GET' && (m = p.match(/^\/days\/([^/]+)$/))) {
+        const d = m[1];
+        if (!isDate(d)) return bad('date must be YYYY-MM-DD (UTC)');
+        const lo = d + 'T00:00:00Z';
+        const hi = new Date(Date.parse(lo) + 86400_000).toISOString();
+        const per = await sql.unsafe(
+          `SELECT session_id, role, count(*)::int AS n, COALESCE(sum(content_chars),0)::bigint AS c, COALESCE(sum(reasoning_chars),0)::bigint AS r
+           FROM messages WHERE ts >= $1::timestamptz AND ts < $2::timestamptz GROUP BY session_id, role`,
+          [lo, hi],
+        );
+        const fl = await sql.unsafe(
+          `SELECT session_id, array_agg(DISTINCT f) AS flags
+           FROM messages, unnest(flags) AS f WHERE ts >= $1::timestamptz AND ts < $2::timestamptz GROUP BY session_id`,
+          [lo, hi],
+        );
+        const ids = [...new Set(per.map((r) => r.session_id))];
+        const metaRows = ids.length
+          ? await sql.unsafe(`SELECT session_id, title, source, model, started_at, last_active FROM sessions WHERE session_id = ANY($1::text[])`, [`{${ids.map((i) => '"' + i.replace(/(["\\])/g, '\\$1') + '"').join(',')}}`])
+          : [];
+        const meta = new Map(metaRows.map((r) => [r.session_id, r]));
+        const flags = new Map(fl.map((r) => [r.session_id, r.flags]));
+        const out = new Map();
+        for (const r of per) {
+          let s = out.get(r.session_id);
+          if (!s) {
+            const mt = meta.get(r.session_id) ?? {};
+            s = {
+              session_id: r.session_id, title: mt.title ?? null, source: mt.source ?? null, model: mt.model ?? null,
+              started_at: mt.started_at ?? null, last_active: mt.last_active ?? null,
+              message_counts: {}, content_chars: 0, reasoning_chars: 0, flags: flags.get(r.session_id) ?? [],
+            };
+            out.set(r.session_id, s);
+          }
+          s.message_counts[r.role ?? 'unknown'] = r.n;
+          s.content_chars += Number(r.c);
+          s.reasoning_chars += Number(r.r);
+        }
+        return json({ date: d, sessions: [...out.values()] });
+      }
+
+      if (req.method === 'GET' && (m = p.match(/^\/sessions\/([^/]+)$/))) {
+        const id = decodeURIComponent(m[1]);
+        const [session] = await sql.unsafe(`SELECT * FROM sessions WHERE session_id = $1`, [id]);
+        const messages = await sql.unsafe(
+          `SELECT session_id, msg_id, ts, role, tool_name, finish_reason, content_chars, reasoning_chars,
+                  content_head, reasoning_head, reasoning_tail, flags, octet_length(raw_gz) AS raw_gz_bytes
+           FROM messages WHERE session_id = $1 ORDER BY msg_id`,
+          [id],
+        );
+        if (!session && messages.length === 0) return bad('not found', 404);
+        return json({ session: session ?? null, messages });
+      }
+
+      if (req.method === 'GET' && (m = p.match(/^\/messages\/([^/]+)\/(\d+)$/))) {
+        const part = q.get('part') ?? 'all';
+        if (!['content', 'reasoning', 'tool_calls', 'all'].includes(part)) return bad('part must be content|reasoning|tool_calls|all');
+        const offset = int(q.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
+        const limit = int(q.get('limit'), 20000, 1, 1_000_000);
+        const [row] = await sql.unsafe(`SELECT raw_gz FROM messages WHERE session_id = $1 AND msg_id = $2`, [decodeURIComponent(m[1]), m[2]]);
+        if (!row) return bad('not found', 404);
+        const raw = JSON.parse(Buffer.from(gunzipSync(row.raw_gz)).toString('utf8'));
+        const str = (v) => (v === null || v === undefined ? '' : typeof v === 'string' ? v : JSON.stringify(v));
+        let text;
+        if (part === 'content') text = str(raw.content);
+        else if (part === 'reasoning') text = str(raw.reasoning) || str(raw.reasoning_content);
+        else if (part === 'tool_calls') text = str(raw.tool_calls);
+        else text = JSON.stringify(raw);
+        return json({
+          session_id: decodeURIComponent(m[1]), msg_id: Number(m[2]), part,
+          total_length: text.length, offset, limit,
+          returned: Math.max(0, Math.min(limit, text.length - offset)),
+          text: text.slice(offset, offset + limit),
+        });
+      }
+
+      if (req.method === 'GET' && p === '/search') {
+        const term = q.get('q') ?? '';
+        if (!term) return bad('q is required');
+        const from = q.get('from'), to = q.get('to');
+        if ((from && !isDate(from)) || (to && !isDate(to))) return bad('from/to must be YYYY-MM-DD');
+        const like = '%' + term.replace(/[\\%_]/g, '\\$&') + '%';
+        const rows = await sql.unsafe(
+          `SELECT session_id, msg_id, ts, role, tool_name, flags, content_chars, reasoning_chars,
+                  content_head, reasoning_head, reasoning_tail
+           FROM messages
+           WHERE (content_head ILIKE $1 OR reasoning_head ILIKE $1 OR reasoning_tail ILIKE $1)
+             AND ($2::date IS NULL OR ts >= $2::date)
+             AND ($3::date IS NULL OR ts < $3::date + 1)
+           ORDER BY ts DESC LIMIT 200`,
+          [like, from || null, to || null],
+        );
+        return json({ count: rows.length, results: rows });
+      }
+
+      if (p === '/notes' && req.method === 'POST') {
+        let b;
+        try { b = await req.json(); } catch { return bad('invalid JSON'); }
+        if (!b || typeof b.session_id !== 'string') return bad('session_id is required');
+        const [row] = await sql.unsafe(
+          `INSERT INTO review_notes (session_id, msg_id, pattern, quote, note) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [b.session_id, b.msg_id == null ? null : Number(b.msg_id), b.pattern ?? null, b.quote ?? null, b.note ?? null],
+        );
+        return json(row, 201);
+      }
+      if (p === '/notes' && req.method === 'GET') {
+        const sid = q.get('session_id');
+        const rows = sid
+          ? await sql.unsafe(`SELECT * FROM review_notes WHERE session_id = $1 ORDER BY id`, [sid])
+          : await sql.unsafe(`SELECT * FROM review_notes ORDER BY id DESC LIMIT 200`);
+        return json({ count: rows.length, notes: rows });
+      }
+
+      if (req.method === 'GET' && p === '/stats') {
+        const [tot] = await sql.unsafe(`SELECT count(*)::bigint AS rows, COALESCE(sum(octet_length(raw_gz)),0)::bigint AS raw_gz_bytes FROM messages`);
+        const days = await sql.unsafe(
+          `SELECT to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day, count(*)::int AS messages,
+                  COALESCE(sum(content_chars),0)::bigint AS content_chars,
+                  COALESCE(sum(reasoning_chars),0)::bigint AS reasoning_chars,
+                  COALESCE(sum(octet_length(raw_gz)),0)::bigint AS raw_gz_bytes
+           FROM messages WHERE ts >= now() - interval '7 days' GROUP BY 1 ORDER BY 1 DESC`,
+        );
+        return json({
+          rows: Number(tot.rows), total_raw_gz_bytes: Number(tot.raw_gz_bytes),
+          last_7_days: days.map((r) => ({
+            day: r.day, messages: r.messages, content_chars: Number(r.content_chars),
+            reasoning_chars: Number(r.reasoning_chars), uncompressed_chars: Number(r.content_chars) + Number(r.reasoning_chars),
+            raw_gz_bytes: Number(r.raw_gz_bytes),
+          })),
+        });
+      }
+
+      return bad('not found', 404);
+    }
+
+    Bun.serve({
+      port: PORT,
+      async fetch(req) {
+        try { return await route(req); }
+        catch (e) {
+          console.error('hermes-chats: request failed:', req.method, req.url, e?.message ?? e);
+          return json({ error: 'internal error' }, 500);
+        }
+      },
+    });
+    console.log(`hermes-chats: listening on ${PORT}`);
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-chats
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hermes-chats
+  template:
+    metadata:
+      labels:
+        app: hermes-chats
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hermes-chats
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "/scripts/hermes-chats.mjs"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-chats-pg-app
+                  key: uri
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: script
+          configMap:
+            name: hermes-chats-api-script
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-chats
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  selector:
+    app: hermes-chats
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hermes-chats-allow-readers
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  podSelector:
+    matchLabels:
+      app: hermes-chats
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ssint-main-coding
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ssint-main-ai
+      ports:
+        - port: 8080
