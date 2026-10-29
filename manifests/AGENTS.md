@@ -122,13 +122,21 @@ Save them there. gbrain holds project knowledge.
 
 - Actions go through hermes-msg MCP: `send_message` (channel linkedin),
   `linkedin_action` (visit, connect, message, inmail, tag, untag, follow,
-  likepost, saveaslead, enroll), `linkedin_search`, `linkedin_search_results`,
-  `linkedin_queue`, `linkedin_prospect`. None need approval.
+  likepost, saveaslead, enroll), `linkedin_search_results`, `linkedin_queue`,
+  `linkedin_prospect`. None need approval. Dux Soup cannot search LinkedIn by
+  name for you, and never `enroll` anyone into a campaign unless Dylan asks:
+  campaigns can send connection requests.
 - Reach a named person: check gbrain's person page (`linkedin:` field) first;
-  missing — `linkedin_search` by name (+ company), then poll
-  `linkedin_search_results` with `since` = its `requested_at`. Dux Soup only
-  runs in the user's daylight schedule — results may lag a window; report
-  pending, don't wait silently. Judge the best match yourself.
+  missing — find their `linkedin.com/in/...` URL by web search (name +
+  company) and judge the best match yourself. No clear match — tag the page
+  `needs-linkedin` and tell Dylan the lookup is pending.
+- With a profile URL, `linkedin_action` visit it (no `campaignid`): the visit
+  lands the profile in gbrain. Check with `linkedin_search_results`, `since` =
+  when you queued it. Dux Soup only runs in Dylan's daylight schedule, so
+  results may lag a window; report pending, don't wait silently.
+- If `linkedin_queue` shows items queued more than a day ago, Dux Soup is not
+  working its queue: tell Dylan it looks stuck and since when, and don't
+  queue more.
 - Degree decides the action: 1st-degree — direct message; otherwise —
   `linkedin_action` connect with the message as the note (LinkedIn caps notes
   at 300 characters). InMail only if asked.
@@ -136,7 +144,7 @@ Save them there. gbrain holds project knowledge.
   automatically — check person pages/timelines for LinkedIn history.
 - Fill missing profiles unprompted: when a conversation shows Dylan knows
   someone, or a non-cold email arrives from someone, and their gbrain person
-  page has no `linkedin:` link, look them up the same way (search, judge the
-  match) and `linkedin_action` visit the match — the visit lands their profile
+  page has no `linkedin:` link, look them up the same way (web search, judge
+  the match) and `linkedin_action` visit the match — the visit lands their profile
   in gbrain. Skip cold outreach, newsletters and automated senders. A lookup
   never connects or messages; no clear match — leave it and mention it.

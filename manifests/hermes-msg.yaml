@@ -526,49 +526,6 @@ data:
     }
 
 
-    let _lookupCampaignId = null;
-
-    // The Campaign API documents no visit-only action object, so the Visit campaign
-    // is created by hand in Dux Soup and found here by id or name.
-    async function ensureLookupCampaign() {
-      if (_lookupCampaignId) return _lookupCampaignId;
-      const data = await duxGet('/campaigns');
-      const campaigns = Array.isArray(data) ? data : (data.data ?? data.campaigns ?? []);
-      const found = campaigns
-        .map(c => c.campaign ?? c)
-        .find(c => c.id === 'gbrain-lookup' || /^gbrain lookup/i.test(c.name ?? ''));
-      if (!found) {
-        throw new Error("Lookup campaign not found: create a Visit campaign named 'gbrain lookup' in Dux Soup");
-      }
-      _lookupCampaignId = found.id;
-      return _lookupCampaignId;
-    }
-
-    async function linkedinSearch({ name, company, keywords, max_results = 5 }) {
-      // On hold: the 'gbrain lookup' campaign has a connection-request step, so an
-      // enroll would send real invites. Look the person up another way instead.
-      throw new Error('linkedin_search is on hold: Dylan has not yet decided how lookups should work in Dux-Soup; find the profile by web search and linkedin_action visit it instead');
-      if (!name) throw new Error('name required');
-      const max = Math.min(Math.max(Number(max_results) || 5, 1), 25);
-      const q = [name, company, keywords].filter(Boolean).join(' ');
-      const search_url = `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(q)}`;
-      const campaign_id = await ensureLookupCampaign();
-      const requested_at = new Date().toISOString();
-      // batchEnroll signal: https://support.dux-soup.com/article/229-extension-control-api
-      // target 'local' runs it in Dylan's browser extension; 'cloud' needs a Dux-Soup
-      // Cloud session, which he does not run, so a cloud signal is discarded after 1 minute.
-      await duxPost('/signal', {
-        signal: 'batchEnroll',
-        params: { searchurl: search_url, campaignid: campaign_id, maxenrolls: max, target: 'local' },
-      });
-      return {
-        search_url,
-        requested_at,
-        campaign_id,
-        note: 'profiles arrive as Dux Soup visits them within its active hours; call linkedin_search_results with since=requested_at',
-      };
-    }
-
     async function linkedinSearchResults({ since, q }) {
       if (!since) throw new Error('since (ISO timestamp) required');
       const url = new URL('/profiles/recent', DUXSOUP_INGEST_URL);
@@ -811,27 +768,13 @@ data:
         },
       },
       {
-        name: 'linkedin_search',
-        description: 'Kick off a LinkedIn people search for Dux Soup to visit via its batchEnroll signal. Returns immediately with a request marker; matching profiles arrive asynchronously as Dux Soup visits them (see linkedin_search_results). https://support.dux-soup.com/article/229-extension-control-api',
-        inputSchema: {
-          type: 'object',
-          required: ['name'],
-          properties: {
-            name:        { type: 'string', description: 'Person name to search for' },
-            company:     { type: 'string', description: 'Company name to narrow the search' },
-            keywords:    { type: 'string', description: 'Additional search keywords' },
-            max_results: { type: 'integer', default: 5, minimum: 1, maximum: 25, description: 'Max profiles for Dux Soup to enroll from the search (default 5, max 25)' },
-          },
-        },
-      },
-      {
         name: 'linkedin_search_results',
-        description: 'Fetch profiles Dux Soup has visited from a prior linkedin_search, recorded by the duxsoup-ingest service.',
+        description: 'Fetch profiles Dux Soup has visited (e.g. after a linkedin_action visit), recorded by the duxsoup-ingest service.',
         inputSchema: {
           type: 'object',
           required: ['since'],
           properties: {
-            since: { type: 'string', description: 'ISO8601 timestamp; only profiles visited at/after this time (use requested_at from linkedin_search)' },
+            since: { type: 'string', description: 'ISO8601 timestamp; only profiles visited at/after this time (use the time the visit was queued)' },
             q:     { type: 'string', description: 'Optional free-text filter' },
           },
         },
@@ -893,7 +836,6 @@ data:
           if      (name === 'send_message')           result = await sendMessage(args);
           else if (name === 'get_thread')              result = await getThread(args);
           else if (name === 'linkedin_action')         result = await linkedinAction(args);
-          else if (name === 'linkedin_search')         result = await linkedinSearch(args);
           else if (name === 'linkedin_search_results') result = await linkedinSearchResults(args);
           else if (name === 'linkedin_queue')          result = await linkedinQueue(args);
           else if (name === 'linkedin_prospect')       result = await linkedinProspect(args);
@@ -974,7 +916,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "6"
+        simplesalt.company/restart-epoch: "7"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
