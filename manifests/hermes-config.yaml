@@ -68,6 +68,9 @@ auxiliary:
     fallback_chain:
       - provider: openrouter
         model: qwen/qwen3-vl-235b-a22b-instruct
+  approval:
+    provider: openrouter
+    model: qwen/qwen3-vl-235b-a22b-instruct
   compression:
     provider: main
   session_search:
