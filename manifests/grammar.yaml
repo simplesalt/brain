@@ -1,7 +1,7 @@
 ---
-# Grammar fix service: one POST method, text in, corrected text out. Signed-in
-# callers only (Cloudflare Access), reached publicly at grammar.simplesalt.company
-# and from Big AGI's Aa button through its gate.
+# Grammar fix service: one POST method, text in, corrected text out, at
+# https://api.simplesalt.company/45e6451afc312886/grammar (its authoritative address). Signed-in
+# callers only (Cloudflare Access); Big AGI's Aa button calls it directly.
 # Filled by a person out of band, key OPENROUTER_API_KEY: a dedicated OpenRouter
 # key with a low spending limit. Flux merges so reconciliation never wipes it.
 apiVersion: v1
@@ -29,21 +29,28 @@ metadata:
 data:
   grammar.py: |
     #!/usr/bin/env python3
-    # Grammar fix for dictated text. One method: POST / with the text as the body
+    # Grammar fix for dictated text. One method: POST BASE_PATH with the text as the body
     # (text/plain in, text/plain out), or JSON {"text": ..., "context": ...} in and
     # {"text": ...} out, where context is recent chat that names people and terms.
     # It fixes punctuation, sentence breaks and grammar (pauses get transcribed as
     # full stops) with a small, fast model on OpenRouter, keeping the speaker's words.
-    # Callers must be signed in through Cloudflare Access: the Access JWT is verified
-    # here against the apps allowed to call it (the public grammar app, and Big AGI,
-    # whose gate forwards its users' requests). It owns its OpenRouter key; /healthz
-    # is unready until the key is filled, and the key is re-read on each use.
+    # Its authoritative address is https://api.simplesalt.company<BASE_PATH>, behind
+    # Cloudflare Access; the Access JWT is verified here too. Browser pages on
+    # ALLOWED_ORIGINS (Big AGI's grammar button) call it directly with the Access
+    # cookie; GET BASE_PATH is a sign-in page they open once if that cookie is missing.
+    # It owns its OpenRouter key; /healthz is unready until the key is filled, and the
+    # key is re-read on each use.
     import base64, hashlib, hmac, json, os, threading, time, http.server, urllib.error, urllib.request
 
     PORT = int(os.environ.get('PORT', '8000'))
     JWT_HEADER = 'Cf-Access-Jwt-Assertion'
     ACCESS_TEAM = os.environ.get('ACCESS_TEAM_DOMAIN', '').rstrip('/')
     ACCESS_AUDS = {a.strip() for a in os.environ.get('ACCESS_AUDS', '').split(',') if a.strip()}
+    BASE_PATH = os.environ.get('BASE_PATH', '/grammar')
+    ALLOWED_ORIGINS = {o.strip() for o in os.environ.get('ALLOWED_ORIGINS', '').split(',') if o.strip()}
+    SIGNED_IN_PAGE = (b'<!doctype html><meta charset="utf-8"><title>Grammar fix</title>'
+                      b'<p>Signed in to the grammar fix. You can close this window.</p>'
+                      b'<script>try{opener&&opener.postMessage("grammar-signed-in","*")}catch(e){}setTimeout(()=>close(),800)</script>')
     KEY_PATH = os.environ.get('KEY_PATH', '/secrets/OPENROUTER_API_KEY')
     LLM_URL = os.environ.get('LLM_URL', 'https://openrouter.ai/api/v1/chat/completions')
     MODEL = os.environ.get('MODEL', 'google/gemini-2.5-flash-lite')
@@ -141,8 +148,16 @@ data:
         timeout = 60
         def log_message(self, *a): pass
 
+        def _cors(self):
+            origin = self.headers.get('Origin', '')
+            if origin in ALLOWED_ORIGINS:
+                self.send_header('Access-Control-Allow-Origin', origin)
+                self.send_header('Access-Control-Allow-Credentials', 'true')
+                self.send_header('Vary', 'Origin')
+
         def _send(self, status, body, ctype):
             self.send_response(status)
+            self._cors()
             self.send_header('Content-Type', ctype)
             self.send_header('Cache-Control', 'no-store')
             self.send_header('Content-Length', str(len(body)))
@@ -152,8 +167,22 @@ data:
         def _reply(self, status, doc):
             self._send(status, json.dumps(doc).encode(), 'application/json')
 
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+            self.send_header('Access-Control-Max-Age', '600')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
         def do_GET(self):
-            if self.path != '/healthz':
+            if self.path.split('?', 1)[0] == BASE_PATH:
+                if verify_access_jwt(self.headers.get(JWT_HEADER, '')):
+                    self._send(200, SIGNED_IN_PAGE, 'text/html; charset=utf-8')
+                else:
+                    self._reply(401, {'error': 'not signed in'})
+            elif self.path != '/healthz':
                 self._reply(404, {'error': 'not found'})
             elif not openrouter_key():
                 self._reply(503, {'ok': False, 'error': 'OpenRouter key not filled'})
@@ -161,7 +190,7 @@ data:
                 self._reply(200, {'ok': True, 'model': MODEL})
 
         def do_POST(self):
-            if self.path.split('?', 1)[0] != '/':
+            if self.path.split('?', 1)[0] != BASE_PATH:
                 self._reply(404, {'error': 'not found'})
                 return
             n = int(self.headers.get('Content-Length', 0) or 0)
@@ -233,7 +262,7 @@ spec:
         capability: voice
       # The script is read only at start; its hash here restarts the pod when it changes.
       annotations:
-        grammar-script-sha: e329de2f648017c7
+        grammar-script-sha: da8fc9e5c61b7997
     spec:
       containers:
         - name: grammar
@@ -249,10 +278,13 @@ spec:
               value: google/gemini-2.5-flash-lite
             - name: ACCESS_TEAM_DOMAIN
               value: "https://fqurzlaaagt.cloudflareaccess.com"
-            # Access apps whose signed-in users may call this: Big AGI (info) and
-            # grammar.simplesalt.company.
+            - name: BASE_PATH
+              value: "/45e6451afc312886/grammar"
+            # The api.simplesalt.company Access app; filled once Cloudflare creates it.
             - name: ACCESS_AUDS
-              value: "afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c,95075ad50df2cb373b6870458aaf96b25607795df5edde8fe8bc1da301ccee41"
+              value: ""
+            - name: ALLOWED_ORIGINS
+              value: "https://info.simplesalt.company"
           volumeMounts:
             - name: script
               mountPath: /scripts

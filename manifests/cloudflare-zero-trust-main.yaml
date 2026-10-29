@@ -164,7 +164,7 @@ spec:
 apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
 kind: TrustAccessApplication
 metadata:
-  name: cloudflare-app-grammar-simplesalt-company
+  name: cloudflare-app-api-simplesalt-company
   labels:
     entity: ssint
     env: main
@@ -172,11 +172,22 @@ metadata:
 spec:
   forProvider:
     accountId: ba92fe12c6c1275f965c7c86e3b392ac
-    name: grammar-simplesalt-company
+    name: api-simplesalt-company
     type: self_hosted
     destinations:
       - type: public
-        uri: grammar.simplesalt.company
+        uri: api.simplesalt.company
+    # Pages on info (Big AGI) call APIs here from the browser with the Access cookie.
+    corsHeaders:
+      allowedOrigins:
+        - https://info.simplesalt.company
+      allowedMethods:
+        - GET
+        - POST
+      allowedHeaders:
+        - content-type
+      allowCredentials: true
+      maxAge: 600
     sessionDuration: 24h
     autoRedirectToIdentity: true
     allowedIdps:
@@ -191,7 +202,7 @@ spec:
 apiVersion: dns.upjet-cloudflare.upbound.io/v1alpha1
 kind: Record
 metadata:
-  name: cf-main-dns-grammar-simplesalt-company
+  name: cf-main-dns-api-simplesalt-company
   labels:
     entity: ssint
     env: main
@@ -199,7 +210,7 @@ metadata:
 spec:
   forProvider:
     zoneId: 260b251cdb53f8376875a8eb8d03ca0b
-    name: grammar.simplesalt.company
+    name: api.simplesalt.company
     type: CNAME
     content: 83c27a64-4074-474c-9a8f-19448d1c2081.cfargotunnel.com
     proxied: true
@@ -254,14 +265,9 @@ spec:
               teamName: fqurzlaaagt
               audTag:
                 - 43d32c8263fb9410781f8bd5571a020bd3358b1177ed6c26560595a720e1e610
-        - hostname: grammar.simplesalt.company
+        - hostname: api.simplesalt.company
+          path: ^/45e6451afc312886/grammar$
           service: http://grammar.ssint-main-voice.svc.k.famevans.win:8000
-          originRequest:
-            access:
-              required: true
-              teamName: fqurzlaaagt
-              audTag:
-                - 95075ad50df2cb373b6870458aaf96b25607795df5edde8fe8bc1da301ccee41
         - hostname: hooks.simplesalt.company
           path: ^/duxsoup/events$
           service: http://duxsoup-ingest.ssint-main-msg.svc.k.famevans.win:8080

@@ -20,8 +20,6 @@ data:
     # button that gets a single-use AssemblyAI pass from /_stt/token and streams
     # audio to AssemblyAI directly. /_stt/token is passed with the Access JWT to
     # stt-proxy, which verifies it and holds the AssemblyAI key; this pod holds none.
-    # The mic's Aa button posts the chat box text to /_stt/tidy, forwarded with
-    # the Access JWT to the grammar service, which fixes punctuation and grammar.
     #
     # Every page also loads /_ui/nav.js, which trims big-AGI's navigation and
     # adds a link to the Hermes console.
@@ -34,8 +32,6 @@ data:
     JWT_HEADER = 'Cf-Access-Jwt-Assertion'
     STT_HOST = os.environ.get('STT_HOST', 'stt-proxy.ssint-main-voice')
     STT_PORT = int(os.environ.get('STT_PORT', '8000'))
-    GRAMMAR_HOST = os.environ.get('GRAMMAR_HOST', 'grammar.ssint-main-voice')
-    GRAMMAR_PORT = int(os.environ.get('GRAMMAR_PORT', '8000'))
     HERMES_HOST = os.environ.get('HERMES_HOST', 'hermes-agent-web')
     HERMES_PORT = int(os.environ.get('HERMES_PORT', '80'))
     HERMES_PREFIX = '/_hermes'
@@ -95,8 +91,6 @@ data:
                 self._script(NAV_JS_PATH)
             elif p == '/_stt/token' and self.command == 'GET':
                 self._token()
-            elif p == '/_stt/tidy' and self.command == 'POST':
-                self._tidy()
             elif p.startswith('/_stt/'):
                 self._reply(404, {'error': 'not found'})
             elif p == HERMES_PREFIX or p.startswith(HERMES_PREFIX + '/'):
@@ -174,14 +168,8 @@ data:
         def _token(self):
             self._to_stt('GET', '/token', None)
 
-        def _tidy(self):
-            n = int(self.headers.get('Content-Length', 0) or 0)
-            if n > 64 * 1024:
-                self._reply(413, {'error': 'dictation too long to tidy'})
-                return
-            self._to_stt('POST', '/', self.rfile.read(n) if n else b'', GRAMMAR_HOST, GRAMMAR_PORT)
-
-        def _to_stt(self, method, path, body, host=STT_HOST, port=STT_PORT):
+        def _to_stt(self, method, path, body):
+            host, port = STT_HOST, STT_PORT
             conn = None
             try:
                 conn = http.client.HTTPConnection(host, port, timeout=40)
@@ -284,6 +272,7 @@ data:
       const LIVE_MAX_MS = 60 * 60 * 1000;
       const PASS_REFRESH_MS = 8 * 60 * 1000;
       const LIVE_URL = 'wss://streaming.assemblyai.com/v3/ws';
+      const GRAMMAR_URL = 'https://api.simplesalt.company/45e6451afc312886/grammar';
       const POS_KEY = 'stt-mic-pos';
 
       const style = document.createElement('style');
@@ -645,9 +634,11 @@ data:
         if (live === l) endLive();
       }
 
-      // The grammar button: the whole chat box goes through a grammar pass (pauses
+      // The grammar button: the whole chat box goes to the grammar service (pauses
       // transcribed as full stops, missing punctuation, mis-heard names from the
       // chat) and comes back in place. Nothing changes if the box was edited meanwhile.
+      // The service sits behind Cloudflare Access on its own host; without its
+      // sign-in cookie the call fails, so a small sign-in window opens once.
       const fix = document.createElement('button');
       fix.id = 'stt-fix';
       fix.type = 'button';
@@ -663,10 +654,17 @@ data:
         if (!text) { toast('Nothing in the chat box to fix.'); return; }
         fix.dataset.busy = '1';
         try {
-          const r = await fetch('/_stt/tidy', {
-            method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, context: conversationContext() }),
-          });
+          let r;
+          try {
+            r = await fetch(GRAMMAR_URL, {
+              method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text, context: conversationContext() }),
+            });
+          } catch (_) {
+            window.open(GRAMMAR_URL, 'grammar-sign-in', 'width=420,height=520');
+            toast('Sign in to the grammar fix in the window that opened, then tap Aa again.', 6000);
+            return;
+          }
           const doc = await r.json().catch(() => ({}));
           if (!r.ok || !doc.text) throw new Error(doc.error || `HTTP ${r.status}`);
           if (ta.value.trim() !== text) { toast('Chat box changed, so the fix was not applied.'); return; }
@@ -937,7 +935,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        gate-script-sha: 79755435406df4dc
+        gate-script-sha: 28ff4d2daef638ad
     spec:
       containers:
         - name: big-agi
