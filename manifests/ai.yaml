@@ -489,7 +489,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        simplesalt.company/restart-epoch: "11"
+        simplesalt.company/restart-epoch: "12"
     spec:
       securityContext:
         fsGroup: 10000
@@ -1106,7 +1106,7 @@ data:
         proxy_set_header Accept-Encoding "";
         sub_filter_once on;
         sub_filter_types text/html;
-        sub_filter '</head>' '<style>a[href="/chat"],a[href="/sessions"],a[href="/files"],a[href="/models"],a[href="/logs"],a[href="/pairing"],a[href="/profiles"],a[href="/config"],a[href="/env"],a[href="/kanban"],a[href="/achievements"]{display:none!important}</style></head>';
+        sub_filter '</head>' '<style>a[href="/chat"],a[href="/sessions"],a[href="/files"],a[href="/models"],a[href="/logs"],a[href="/pairing"],a[href="/profiles"],a[href="/config"],a[href="/env"],a[href="/kanban"],a[href="/achievements"],a[href="/plugins"],a[href="/mcp"],a[href="/system"]{display:none!important}</style></head>';
       }
     }
   proxy.inc: |
