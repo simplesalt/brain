@@ -489,7 +489,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        simplesalt.company/restart-epoch: "9"
+        simplesalt.company/restart-epoch: "10"
     spec:
       securityContext:
         fsGroup: 10000
@@ -1076,22 +1076,49 @@ data:
       default upgrade;
       '' close;
     }
+    # Read-only: the console's API only takes reads. /api/auth/me is a POST read.
+    map $request_method $hermes_write {
+      default 1;
+      GET 0;
+      HEAD 0;
+      OPTIONS 0;
+    }
     server {
       listen 9119;
       client_max_body_size 100m;
+      # Sessions (the console's own landing page) is hidden, so land on Cron.
+      location = / {
+        return 302 /cron;
+      }
+      location = /api/auth/me {
+        include /etc/nginx/conf.d/proxy.inc;
+      }
+      location /api/ {
+        if ($hermes_write) {
+          return 403 '{"detail":"This console is read-only."}';
+        }
+        include /etc/nginx/conf.d/proxy.inc;
+      }
+      # Pages get a style that hides the menu entries we don't use.
       location / {
-        proxy_pass http://127.0.0.1:9118;
-        proxy_http_version 1.1;
-        proxy_set_header Host 127.0.0.1:9118;
-        proxy_set_header Origin http://127.0.0.1:9118;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-        proxy_redirect http://127.0.0.1:9118/ /;
-        proxy_buffering off;
-        proxy_read_timeout 1h;
-        proxy_send_timeout 1h;
+        include /etc/nginx/conf.d/proxy.inc;
+        proxy_set_header Accept-Encoding "";
+        sub_filter_once on;
+        sub_filter_types text/html;
+        sub_filter '</head>' '<style>a[href="/chat"],a[href="/sessions"],a[href="/files"],a[href="/models"],a[href="/logs"],a[href="/pairing"],a[href="/profiles"],a[href="/config"],a[href="/env"],a[href="/kanban"],a[href="/achievements"]{display:none!important}</style></head>';
       }
     }
+  proxy.inc: |
+    proxy_pass http://127.0.0.1:9118;
+    proxy_http_version 1.1;
+    proxy_set_header Host 127.0.0.1:9118;
+    proxy_set_header Origin http://127.0.0.1:9118;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_redirect http://127.0.0.1:9118/ /;
+    proxy_buffering off;
+    proxy_read_timeout 1h;
+    proxy_send_timeout 1h;
 ---
 apiVersion: v1
 kind: Service
