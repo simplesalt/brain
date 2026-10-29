@@ -261,11 +261,12 @@ data:
         print(f'big-agi-gate :{PORT} → {UPSTREAM_HOST}:{UPSTREAM_PORT}', flush=True)
         srv.serve_forever()
   mic.js: |
-    // Live dictation for big-AGI: tap the mic, speak, tap again. Audio streams
-    // straight from the browser to AssemblyAI with a single-use pass from
-    // /_stt/token, and words appear in the chat box at the cursor as you speak,
-    // for review before sending. The open conversation is sent as context so the
-    // recognizer picks the right word. Drag the button to move it.
+    // Live dictation for big-AGI. Takes over the composer's own mic button (and
+    // Ctrl+M): tap, speak, tap again. Audio streams straight from the browser to
+    // AssemblyAI with a single-use pass from /_stt/token, and words appear in the
+    // chat box at the cursor as you speak, for review before sending. The open
+    // conversation is sent as context so the recognizer picks the right word.
+    // An Aa button beside the mic sends the chat box to the grammar service.
     (() => {
       if (window.__sttMic) return;
       window.__sttMic = true;
@@ -273,45 +274,40 @@ data:
       const PASS_REFRESH_MS = 8 * 60 * 1000;
       const LIVE_URL = 'wss://streaming.assemblyai.com/v3/ws';
       const GRAMMAR_URL = 'https://api.simplesalt.company/45e6451afc312886/grammar';
-      const POS_KEY = 'stt-mic-pos';
 
       const style = document.createElement('style');
       style.textContent = `
-        #stt-mic{position:fixed;z-index:2147483000;width:52px;height:52px;border-radius:50%;border:none;
-          display:flex;align-items:center;justify-content:center;cursor:pointer;touch-action:none;
-          background:#2b6cb0;color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.35);opacity:.9;
-          -webkit-tap-highlight-color:transparent;user-select:none;font:600 11px system-ui,sans-serif}
-        #stt-mic svg{width:24px;height:24px;fill:currentColor;pointer-events:none}
-        #stt-mic[data-state=rec]{background:#c53030;animation:stt-pulse 1.2s ease-in-out infinite}
-        #stt-mic[data-state=busy]{background:#4a5568}
-        #stt-mic[data-state=busy] svg{animation:stt-spin 1s linear infinite}
         @keyframes stt-pulse{50%{box-shadow:0 0 0 10px rgba(197,48,48,.25)}}
         @keyframes stt-spin{to{transform:rotate(360deg)}}
-        #stt-fix{position:fixed;z-index:2147483000;width:40px;height:40px;border-radius:50%;border:none;
-          cursor:pointer;background:#2c7a7b;color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.35);opacity:.9;
-          -webkit-tap-highlight-color:transparent;user-select:none;font:700 14px system-ui,sans-serif}
-        #stt-fix[data-busy]{background:#4a5568;animation:stt-spin 1s linear infinite}
+        .stt-mic-rec{background:#c53030 !important;color:#fff !important;animation:stt-pulse 1.2s ease-in-out infinite}
+        .stt-mic-busy{background:#4a5568 !important;color:#fff !important}
+        #stt-fix{font:700 14px system-ui,sans-serif}
+        #stt-fix[data-busy]{opacity:.5;animation:stt-spin 1s linear infinite}
         #stt-toast{position:fixed;z-index:2147483001;left:50%;bottom:24px;transform:translateX(-50%);
           max-width:calc(100vw - 32px);padding:10px 14px;border-radius:8px;background:#1a202c;color:#fff;
           font:14px system-ui,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.35)}`;
       document.head.appendChild(style);
 
-      const ICON_MIC = '<svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>';
-      const ICON_BUSY = '<svg viewBox="0 0 24 24"><path d="M12 4V1L8 5l4 4V6a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z"/></svg>';
-
-      const btn = document.createElement('button');
-      btn.id = 'stt-mic';
-      btn.type = 'button';
-      btn.setAttribute('aria-label', 'Dictate');
-
       let state = 'idle', stream = null, timer = null, startedAt = 0;
       let lastField = null, toastTimer = null;
 
+      // The composer's mic buttons (big-AGI renders MUI's MicIcon inside them).
+      const isMic = (b) => !!b && b.id !== 'stt-fix' && !!b.querySelector('svg[data-testid="MicIcon"]');
+      const micButtons = () => [...document.querySelectorAll('button')].filter(isMic);
+
+      // Shows the dictation state on the mic buttons with classes only, never
+      // touching their content, which React owns.
+      function paint() {
+        for (const b of micButtons()) {
+          b.classList.toggle('stt-mic-rec', state === 'rec');
+          b.classList.toggle('stt-mic-busy', state === 'busy');
+          b.title = state === 'rec' ? 'Stop dictating' : 'Dictate';
+        }
+      }
+
       function setState(s) {
         state = s;
-        btn.dataset.state = s;
-        btn.innerHTML = s === 'busy' ? ICON_BUSY : s === 'rec' ? '' : ICON_MIC;
-        btn.setAttribute('aria-label', s === 'rec' ? 'Stop dictating' : 'Dictate');
+        paint();
         if (s !== 'rec') clearInterval(timer);
       }
 
@@ -645,7 +641,7 @@ data:
       fix.textContent = 'Aa';
       fix.title = 'Fix grammar in the chat box';
       fix.setAttribute('aria-label', 'Fix grammar in the chat box');
-      fix.addEventListener('pointerdown', (e) => e.preventDefault());
+      fix.addEventListener('mousedown', (e) => e.preventDefault());
       fix.addEventListener('click', async (e) => {
         e.preventDefault();
         if (fix.dataset.busy) return;
@@ -718,7 +714,7 @@ data:
         setState('rec');
         const tick = () => {
           const s = Math.floor((Date.now() - startedAt) / 1000);
-          btn.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+          for (const b of micButtons()) b.title = `Stop dictating (${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')})`;
           if (Date.now() - startedAt > LIVE_MAX_MS) stop();
         };
         tick();
@@ -730,52 +726,39 @@ data:
         else if (state === 'rec') stop();
       }
 
-      // Position, dragging, and tapping. pointerdown's preventDefault keeps the
-      // chat box focused, so the phone keyboard and cursor stay where they were.
-      function place(x, y) {
-        const m = 8;
-        x = Math.min(Math.max(m, x), window.innerWidth - 52 - m);
-        y = Math.min(Math.max(m, y), window.innerHeight - 52 - m);
-        btn.style.left = x + 'px';
-        btn.style.top = y + 'px';
-        fix.style.left = (x + 6) + 'px';
-        fix.style.top = (y < 56 ? y + 60 : y - 48) + 'px';
-        return { x, y };
-      }
-      let saved = null;
-      try { saved = JSON.parse(localStorage.getItem(POS_KEY) || 'null'); } catch (_) {}
-      const home = () => place(window.innerWidth - 64, window.innerHeight - 190);
-      if (saved && typeof saved.x === 'number') place(saved.x, saved.y); else home();
-      window.addEventListener('resize', () => place(parseFloat(btn.style.left), parseFloat(btn.style.top)));
-
-      let drag = null;
-      btn.addEventListener('pointerdown', (e) => {
+      // Take over big-AGI's mic: its own speech engine never starts. Capture-phase
+      // listeners on document run before React's handlers on the app root.
+      document.addEventListener('click', (e) => {
+        const b = e.target instanceof Element ? e.target.closest('button') : null;
+        if (!isMic(b)) return;
         e.preventDefault();
-        btn.setPointerCapture(e.pointerId);
-        drag = { x: e.clientX, y: e.clientY, ox: parseFloat(btn.style.left), oy: parseFloat(btn.style.top), moved: false };
-      });
-      btn.addEventListener('pointermove', (e) => {
-        if (!drag) return;
-        const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
-        if (!drag.moved && Math.hypot(dx, dy) < 10) return;
-        drag.moved = true;
-        place(drag.ox + dx, drag.oy + dy);
-      });
-      btn.addEventListener('pointerup', () => {
-        if (!drag) return;
-        const moved = drag.moved;
-        drag = null;
-        if (moved) {
-          try { localStorage.setItem(POS_KEY, JSON.stringify({ x: parseFloat(btn.style.left), y: parseFloat(btn.style.top) })); } catch (_) {}
-        } else tap();
-      });
-      btn.addEventListener('pointercancel', () => { drag = null; });
-      btn.addEventListener('click', (e) => e.preventDefault());
-      btn.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); tap(); } });
+        e.stopImmediatePropagation();
+        tap();
+      }, true);
+      document.addEventListener('keydown', (e) => {
+        if (!(e.ctrlKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'm')) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        tap();
+      }, true);
+
+      // Keep the Aa button right after the composer's mic button, styled like it,
+      // and the mic's state shown, as React re-renders the composer.
+      let queued = false;
+      function sync() {
+        queued = false;
+        const mic = micButtons().find((b) => b.offsetParent);
+        if (mic && mic.nextElementSibling !== fix) {
+          fix.className = mic.className.replace(/\bstt-mic-\w+/g, '');
+          mic.after(fix);
+        }
+        paint();
+      }
+      new MutationObserver(() => { if (!queued) { queued = true; requestAnimationFrame(sync); } })
+        .observe(document.documentElement, { childList: true, subtree: true });
 
       setState('idle');
-      const mount = () => { document.body.appendChild(btn); document.body.appendChild(fix); };
-      if (document.body) mount(); else document.addEventListener('DOMContentLoaded', mount);
+      sync();
     })();
   nav.js: |
     // Trims big-AGI down to chat, adds an admin button that shows the Hermes
