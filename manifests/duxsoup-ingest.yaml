@@ -323,7 +323,7 @@ data:
     }
 
     // Settings that decide whether the extension works its remote-control queue.
-    const ROBOT_STATE_KEYS = ['remotecontrolflag', 'remotecontrolwindowed', 'pauserobot', 'snooze', 'robotscheduleplan', 'backgroundmode', 'linkedinlimitsnooze', 'maxvisits', 'maxenrolls'];
+    const ROBOT_STATE_KEYS = ['remotecontrolflag', 'remotecontrolwindowed', 'pauserobot', 'snooze', 'robotscheduleplan', 'backgroundmode', 'linkedinlimitsnooze', 'linkedinlimitalert', 'pauseoninviteerror', 'resumedelayoninviteerror', 'maxvisits', 'maxinvites', 'maxmessages', 'maxenrolls', 'throttletime', 'skipdays', 'waitminutes', 'waitvisits', 'randomrange', 'runautomationsonmanualvisits'];
 
     function robotStateValue(v) {
       if (v == null || typeof v === 'boolean' || typeof v === 'number') return v ?? null;
@@ -1814,7 +1814,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "9"
+        simplesalt.company/restart-epoch: "10"
     spec:
       serviceAccountName: duxsoup-ingest
       containers:
