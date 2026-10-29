@@ -6,7 +6,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: duxsoup-merge-duplicates-20261029
+  name: duxsoup-merge-duplicates-20261029-2
   namespace: ssint-main-msg
   labels:
     entity: ssint
@@ -48,7 +48,7 @@ spec:
                 const m = JSON.parse(line.replace(/^data: /, ''));
                 const out = (m.result?.content ?? []).map((c) => c.text ?? '').join('\n');
                 if (m.error || m.result?.isError) throw new Error(`${name}: ${JSON.stringify(m.error ?? out).slice(0, 300)}`);
-                return out.slice(0, 200);
+                return out;
               }
               async function duxVisit(profile) {
                 const USER = process.env.DUXSOUP_USER_ID;
@@ -61,8 +61,10 @@ spec:
               for (const p of PAIRS) {
                 await gbrain('get_page', { slug: p.keep });
                 const rows = await sql`UPDATE profiles SET gbrain_slug = ${p.keep}, updated_at = now() WHERE gbrain_slug = ${p.dup} RETURNING dux_id`;
-                console.log(p.dup, '->', p.keep, 'profiles repointed:', rows.map((r) => r.dux_id).join(','));
-                console.log(p.dup, 'delete_page:', await gbrain('delete_page', { slug: p.dup }));
+                console.log(p.dup, '->', p.keep, 'profiles repointed:', rows.map((r) => r.dux_id).join(',') || '(already)');
+                const dup = JSON.parse(await gbrain('get_page', { slug: p.dup }));
+                const del = await gbrain('delete_page', { slug: p.dup, expected_revision: dup.revision });
+                console.log(p.dup, 'delete_page:', del.slice(0, 200));
                 console.log(p.profile, 'visit:', await duxVisit(p.profile));
               }
               await sql.close();
