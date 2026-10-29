@@ -865,18 +865,23 @@ data:
       sync();
     })();
   nav.js: |
-    // Trims big-AGI down to chat, adds an admin button that shows the Hermes
-    // console beside it, and brands the tab as SS chat with the Simple Salt mark.
-    // Hidden: the Call app, the Apps & Tools menu, the Discord and GitHub
-    // links, and the Beam and Call buttons by the chat box. On phones an Admin
-    // link in the drawer opens the console at /admin in a new tab. big-AGI
-    // re-renders its nav freely, so hiding is CSS and our buttons are re-added
-    // whenever they go missing.
+    // Trims big-AGI down to chat, adds Admin (the Hermes console) and Brain (the
+    // gbrain dashboard) buttons that show their console in a pane over the chat,
+    // and brands the tab as SS chat with the Simple Salt mark. Hidden: the Call
+    // app, the Apps & Tools menu, the Discord and GitHub links, and the Beam and
+    // Call buttons by the chat box. On phones the drawer gets Admin and Brain
+    // links that open the same pane full screen, with a bar back to the chat.
+    // big-AGI re-renders its nav freely, so hiding is CSS and our buttons are
+    // re-added whenever they go missing.
     (() => {
       if (window.__ssNav) return;
       window.__ssNav = true;
-      const HERMES_URL = '/admin/';
-      const ICON = '<path d="M3 13h8V3H3zm0 8h8v-6H3zm10 0h8V11h-8zm0-18v6h8V3z"/>';
+      const PANES = [
+        { key: 'admin', label: 'Admin', src: '/admin/',
+          icon: '<path d="M3 13h8V3H3zm0 8h8v-6H3zm10 0h8V11h-8zm0-18v6h8V3z"/>' },
+        { key: 'brain', label: 'Brain', src: '/brain/',
+          icon: '<path d="M12 3C7.58 3 4 4.79 4 7v10c0 2.21 3.58 4 8 4s8-1.79 8-4V7c0-2.21-3.58-4-8-4zm0 2c3.87 0 6 1.5 6 2s-2.13 2-6 2-6-1.5-6-2 2.13-2 6-2zm6 12c0 .5-2.13 2-6 2s-6-1.5-6-2v-2.23c1.61.78 3.72 1.23 6 1.23s4.39-.45 6-1.23zm0-5c0 .5-2.13 2-6 2s-6-1.5-6-2V9.77c1.61.78 3.72 1.23 6 1.23s4.39-.45 6-1.23z"/>' },
+      ];
       const TITLE = 'SS chat';
       // The Simple Salt mark: a hollow square in the brand blue, as on simple-salt.com.
       const FAVICON = 'data:image/svg+xml,' + encodeURIComponent(
@@ -903,60 +908,75 @@ data:
         #mobile-nav button:not([aria-label^="Chat"]),
         button:has([data-testid="CallIcon"]),button:has(path[d="M 4,12 14,9"]),
         .ss-nav-hidden{display:none!important}
-        #ss-admin-pane{position:fixed;top:0;right:0;bottom:0;left:var(--ss-nav-w,64px);z-index:1100;background:#fff}
-        #ss-admin-pane[hidden]{display:none}
-        #ss-admin-pane iframe{width:100%;height:100%;border:0;display:block}
-        .ss-admin-open #desktop-nav .NavButton-active:not(.ss-admin){background:transparent!important;color:inherit!important}`;
+        .ss-pane{position:fixed;top:0;right:0;bottom:0;left:var(--ss-nav-w,0px);z-index:1100;background:#fff;display:flex;flex-direction:column}
+        .ss-pane[hidden]{display:none}
+        .ss-pane iframe{flex:1;width:100%;border:0;display:block}
+        .ss-pane-bar{display:none;align-items:center;gap:8px;padding:10px 14px;border:0;border-bottom:1px solid #ddd;background:#f6f7f9;font:600 15px system-ui,sans-serif;color:#1a202c;text-align:left}
+        .ss-mobile .ss-pane-bar{display:flex}
+        .ss-pane-open #desktop-nav .NavButton-active:not(.ss-pane-btn){background:transparent!important;color:inherit!important}`;
       (document.head || document.documentElement).appendChild(style);
 
-      // Admin: a button beside Chat that opens the Hermes console in a pane over
-      // the chat area. The pane stays loaded while hidden; any other nav button
-      // closes it.
-      let pane = null;
-      function setAdmin(open) {
-        if (open && !pane) {
-          pane = document.createElement('div');
-          pane.id = 'ss-admin-pane';
-          pane.innerHTML = '<iframe src="/admin/" title="Admin"></iframe>';
-          document.body.appendChild(pane);
+      // Admin and Brain: buttons beside Chat that open their console in a pane
+      // over the chat area. Panes stay loaded while hidden; any other nav button
+      // closes them. On phones the pane fills the screen under a bar back to chat.
+      const panes = {};
+      let openKey = null;
+      function setPane(key) {
+        openKey = key;
+        for (const p of PANES) {
+          if (p.key === key && !panes[p.key]) {
+            const el = document.createElement('div');
+            el.className = 'ss-pane';
+            el.innerHTML = `<button type="button" class="ss-pane-bar">‹ Back to chat</button><iframe src="${p.src}" title="${p.label}"></iframe>`;
+            el.firstChild.addEventListener('click', () => setPane(null));
+            document.body.appendChild(el);
+            panes[p.key] = el;
+          }
+          if (panes[p.key]) panes[p.key].hidden = p.key !== key;
         }
-        if (pane) pane.hidden = !open;
-        document.documentElement.classList.toggle('ss-admin-open', open);
+        document.documentElement.classList.toggle('ss-pane-open', !!key);
       }
       document.addEventListener('pointerdown', (e) => {
         const b = e.target.closest && e.target.closest('#desktop-nav button, #desktop-nav a');
-        if (b && !b.classList.contains('ss-admin')) setAdmin(false);
+        if (b && !b.classList.contains('ss-pane-btn')) setPane(null);
       }, true);
 
-      function desktopAdmin() {
+      function desktopPanes() {
         const nav = document.getElementById('desktop-nav');
-        if (!nav) return;
+        document.documentElement.classList.toggle('ss-mobile', !nav);
+        if (!nav) {
+          document.documentElement.style.setProperty('--ss-nav-w', '0px');
+          return;
+        }
         document.documentElement.style.setProperty('--ss-nav-w', nav.getBoundingClientRect().right + 'px');
-        const chat = nav.querySelector('.NavButton-typeApp:not(.ss-admin)');
+        const chat = nav.querySelector('.NavButton-typeApp:not(.ss-pane-btn)');
         const gear = nav.lastElementChild && nav.lastElementChild.querySelector('button.NavButton-typeLink:not(.NavButton-active)');
         if (!chat || !gear) return;
-        let btn = nav.querySelector('.ss-admin');
-        if (!btn) {
-          btn = document.createElement('button');
-          btn.type = 'button';
-          btn.title = 'admin';
-          btn.setAttribute('aria-label', 'admin');
-          const svg = chat.querySelector('svg');
-          btn.innerHTML = `<svg class="${svg ? svg.getAttribute('class') : ''}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${ICON}</svg>`;
-          btn.addEventListener('click', () => setAdmin(!document.documentElement.classList.contains('ss-admin-open')));
+        let prev = chat;
+        for (const p of PANES) {
+          let btn = nav.querySelector(`.ss-pane-${p.key}`);
+          if (!btn) {
+            btn = document.createElement('button');
+            btn.type = 'button';
+            btn.title = p.label;
+            btn.setAttribute('aria-label', p.label);
+            const svg = chat.querySelector('svg');
+            btn.innerHTML = `<svg class="${svg ? svg.getAttribute('class') : ''}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${p.icon}</svg>`;
+            btn.addEventListener('click', () => setPane(openKey === p.key ? null : p.key));
+          }
+          if (btn.previousElementSibling !== prev) prev.after(btn);
+          // Open: looks like the active Chat button. Closed: like an idle nav button.
+          const look = openKey === p.key && /NavButton-active/.test(chat.className)
+            ? chat.className
+            : gear.className.replace('NavButton-typeLink', 'NavButton-typeApp');
+          const want = look.replace(/\s*ss-\S+/g, '') + ` ss-pane-btn ss-pane-${p.key}`;
+          if (btn.className !== want) btn.className = want;
+          prev = btn;
         }
-        if (btn.previousElementSibling !== chat) chat.after(btn);
-        // Open: looks like the active Chat button. Closed: like an idle nav button.
-        const open = document.documentElement.classList.contains('ss-admin-open');
-        const look = open && /NavButton-active/.test(chat.className)
-          ? chat.className
-          : gear.className.replace('NavButton-typeLink', 'NavButton-typeApp');
-        const want = look.replace(/\s*ss-\S+/g, '') + ' ss-admin';
-        if (btn.className !== want) btn.className = want;
       }
 
       // Mobile drawer: keep only the Chat app, drop the News and Models buttons
-      // (text only, no other mark), and put Hermes where Discord was.
+      // (text only, no other mark), and put Admin and Brain where Discord was.
       function mobileItems() {
         document.querySelectorAll('nav.MuiButtonGroup-root > button').forEach((b) => {
           if (!b.closest('#desktop-nav') && !/^\s*Chat/.test(b.innerText)) b.classList.add('ss-nav-hidden');
@@ -965,14 +985,20 @@ data:
           if (/^\s*(News|Models)\s*$/.test(b.textContent)) b.classList.add('ss-nav-hidden');
         });
         const discord = [...document.querySelectorAll('a[href*="discord.gg"]')].find((d) => !d.closest('#desktop-nav'));
-        if (!discord || discord.parentElement.querySelector('.ss-hermes-m')) return;
-        const a = document.createElement('a');
-        a.className = discord.className + ' ss-hermes-m';
-        a.href = HERMES_URL;
-        a.target = '_blank';
-        a.rel = 'noopener';
-        a.textContent = 'Admin';
-        discord.parentElement.insertBefore(a, discord);
+        if (!discord || discord.parentElement.querySelector('.ss-pane-m')) return;
+        for (const p of PANES) {
+          const a = document.createElement('a');
+          a.className = discord.className + ' ss-pane-m';
+          a.href = p.src;
+          a.textContent = p.label;
+          a.addEventListener('click', (e) => {
+            e.preventDefault();
+            // Close the drawer (MUI closes on its backdrop), then show the pane.
+            document.querySelector('#mobile-drawer .MuiBackdrop-root, .MuiDrawer-root .MuiBackdrop-root')?.click();
+            setPane(p.key);
+          });
+          discord.parentElement.insertBefore(a, discord);
+        }
       }
 
       // Tab title and icon. big-AGI sets both itself, so they are put back each time.
@@ -991,7 +1017,7 @@ data:
       let queued = false;
       const run = () => {
         queued = false;
-        try { tab(); desktopAdmin(); mobileItems(); } catch (_) {}
+        try { tab(); desktopPanes(); mobileItems(); } catch (_) {}
       };
       const start = () => {
         run();

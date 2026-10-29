@@ -491,7 +491,7 @@ metadata:
 data:
   admin_gate.py: |
     #!/usr/bin/env python3
-    # gbrain's owner dashboard, already signed in. gbrain only knows its own owner
+    # gbrain's owner dashboard, already signed in and read-only. gbrain only knows its own owner
     # login; this gate logs in with the pod's owner credential and serves the
     # dashboard to whoever reaches it, so access is the cluster's to govern (Big
     # AGI's gate publishes it, behind Cloudflare Access, at info.../brain).
@@ -560,6 +560,9 @@ data:
                 return self._send(200, b'ok', 'text/plain')
             if not (self.path == PREFIX or self.path.startswith(PREFIX + '/')):
                 return self._send(404, b'not found', 'text/plain')
+            # Read-only: the dashboard is for looking; changes go through gbrain's CLI.
+            if self.command not in ('GET', 'HEAD'):
+                return self._send(403, b'{"error":"This dashboard is read-only."}', 'application/json')
             if self.path.startswith(PREFIX + '/assets/') and self.command in ('GET', 'HEAD'):
                 return self._asset(self.path.split('?', 1)[0][len(PREFIX + '/assets/'):])
             n = int(self.headers.get('Content-Length', 0) or 0)
@@ -688,7 +691,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        simplesalt.company/restart-epoch: "14"
+        simplesalt.company/restart-epoch: "15"
     spec:
       securityContext:
         fsGroup: 10000
@@ -1374,12 +1377,12 @@ data:
         include /etc/nginx/conf.d/proxy.inc;
       }
       # Pages get a style that hides the menu entries we don't use, with and
-      # without Big AGI's /_hermes prefix (sub_filter can't take a CSS $=).
+      # without Big AGI's /admin prefix (sub_filter can't take a CSS $=).
       location / {
         include /etc/nginx/conf.d/proxy.inc;
         proxy_set_header Accept-Encoding "";
         sub_filter_once on;
-        sub_filter '</head>' '<style>a[href="/chat"],a[href="/_hermes/chat"],a[href="/sessions"],a[href="/_hermes/sessions"],a[href="/files"],a[href="/_hermes/files"],a[href="/models"],a[href="/_hermes/models"],a[href="/logs"],a[href="/_hermes/logs"],a[href="/pairing"],a[href="/_hermes/pairing"],a[href="/profiles"],a[href="/_hermes/profiles"],a[href="/config"],a[href="/_hermes/config"],a[href="/env"],a[href="/_hermes/env"],a[href="/kanban"],a[href="/_hermes/kanban"],a[href="/achievements"],a[href="/_hermes/achievements"],a[href="/plugins"],a[href="/_hermes/plugins"],a[href="/mcp"],a[href="/_hermes/mcp"],a[href="/system"],a[href="/_hermes/system"]{display:none!important}</style></head>';
+        sub_filter '</head>' '<style>a[href="/chat"],a[href="/admin/chat"],a[href="/sessions"],a[href="/admin/sessions"],a[href="/files"],a[href="/admin/files"],a[href="/models"],a[href="/admin/models"],a[href="/logs"],a[href="/admin/logs"],a[href="/pairing"],a[href="/admin/pairing"],a[href="/profiles"],a[href="/admin/profiles"],a[href="/config"],a[href="/admin/config"],a[href="/env"],a[href="/admin/env"],a[href="/kanban"],a[href="/admin/kanban"],a[href="/achievements"],a[href="/admin/achievements"],a[href="/plugins"],a[href="/admin/plugins"],a[href="/mcp"],a[href="/admin/mcp"],a[href="/system"],a[href="/admin/system"]{display:none!important}</style></head>';
       }
     }
   proxy.inc: |
