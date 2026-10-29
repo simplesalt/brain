@@ -1,7 +1,8 @@
 ---
 # Grammar fix service: one POST method, text in, corrected text out, at
 # https://api.simplesalt.company/45e6451afc312886/grammar (its authoritative address). Signed-in
-# callers only (Cloudflare Access); Big AGI's Aa button calls it directly.
+# callers only (Cloudflare Access); Big AGI's Aa button reaches it through Big
+# AGI's gate, on Big AGI's own sign-in.
 # Filled by a person out of band, key OPENROUTER_API_KEY: a dedicated OpenRouter
 # key with a low spending limit. Flux merges so reconciliation never wipes it.
 apiVersion: v1
@@ -287,9 +288,10 @@ spec:
               value: "https://fqurzlaaagt.cloudflareaccess.com"
             - name: BASE_PATH
               value: "/45e6451afc312886/grammar"
-            # The api.simplesalt.company Access app.
+            # The api.simplesalt.company Access app, and info's (Big AGI's gate
+            # forwards its JWT from the Aa button).
             - name: ACCESS_AUDS
-              value: "e34b52db64bd0aa15ca566b32082e83d9f79eac25489b491e557045d7824f8bd"
+              value: "e34b52db64bd0aa15ca566b32082e83d9f79eac25489b491e557045d7824f8bd,afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c"
             - name: ALLOWED_ORIGINS
               value: "https://info.simplesalt.company"
           volumeMounts:
