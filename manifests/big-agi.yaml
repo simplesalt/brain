@@ -34,7 +34,7 @@ data:
     STT_PORT = int(os.environ.get('STT_PORT', '8000'))
     HERMES_HOST = os.environ.get('HERMES_HOST', 'hermes-agent-web')
     HERMES_PORT = int(os.environ.get('HERMES_PORT', '80'))
-    HERMES_PREFIX = '/_hermes'
+    HERMES_PREFIX = '/admin'
     MIC_JS_PATH = os.environ.get('MIC_JS_PATH', '/scripts/mic.js')
     NAV_JS_PATH = os.environ.get('NAV_JS_PATH', '/scripts/nav.js')
 
@@ -152,8 +152,8 @@ data:
             else:
                 self._proxy()
 
-        # The Hermes console, shown in an admin pane inside big-AGI. Served under
-        # this origin so the pane needs no sign-in of its own; Hermes builds its
+        # The Hermes console at /admin, also shown in an admin pane inside big-AGI.
+        # Served under this origin so it needs no sign-in of its own; Hermes builds its
         # links from X-Forwarded-Prefix. No WebSockets: the console pages left
         # in its menu don't use them.
         def _hermes(self):
@@ -830,13 +830,13 @@ data:
     // console beside it, and brands the tab as SS chat with the Simple Salt mark.
     // Hidden: the Call app, the Apps & Tools menu, the Discord and GitHub
     // links, and the Beam and Call buttons by the chat box. On phones an Admin
-    // link in the drawer opens hermes.simplesalt.company in a new tab. big-AGI
+    // link in the drawer opens the console at /admin in a new tab. big-AGI
     // re-renders its nav freely, so hiding is CSS and our buttons are re-added
     // whenever they go missing.
     (() => {
       if (window.__ssNav) return;
       window.__ssNav = true;
-      const HERMES_URL = 'https://hermes.simplesalt.company/';
+      const HERMES_URL = '/admin/';
       const ICON = '<path d="M3 13h8V3H3zm0 8h8v-6H3zm10 0h8V11h-8zm0-18v6h8V3z"/>';
       const TITLE = 'SS chat';
       // The Simple Salt mark: a hollow square in the brand blue, as on simple-salt.com.
@@ -878,7 +878,7 @@ data:
         if (open && !pane) {
           pane = document.createElement('div');
           pane.id = 'ss-admin-pane';
-          pane.innerHTML = '<iframe src="/_hermes/" title="Admin"></iframe>';
+          pane.innerHTML = '<iframe src="/admin/" title="Admin"></iframe>';
           document.body.appendChild(pane);
         }
         if (pane) pane.hidden = !open;
@@ -987,7 +987,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        gate-script-sha: c63da82834872478
+        gate-script-sha: df44403c87e04ad7
     spec:
       containers:
         - name: big-agi
