@@ -118,9 +118,26 @@ spec:
     accountId: ba92fe12c6c1275f965c7c86e3b392ac
     name: info-simplesalt-company
     type: self_hosted
+    # Big AGI and the grammar API share one app, so one sign-in sets the Access
+    # cookie on both hostnames (eager redirects) and Big AGI's page calls the API
+    # directly with it, also from an installed phone app. Only the grammar path:
+    # the rest of api.simplesalt.company is Workers (webhooks, MCP server) that
+    # must stay reachable without Access.
     destinations:
       - type: public
         uri: info.simplesalt.company
+      - type: public
+        uri: api.simplesalt.company/45e6451afc312886/grammar
+    corsHeaders:
+      allowedOrigins:
+        - https://info.simplesalt.company
+      allowedMethods:
+        - GET
+        - POST
+      allowedHeaders:
+        - content-type
+      allowCredentials: true
+      maxAge: 600
     # Long enough that Big AGI installed on a phone home screen rarely asks to sign in again.
     sessionDuration: 720h
     autoRedirectToIdentity: true
@@ -199,47 +216,6 @@ spec:
     name: ssint-main
 
 ---
-apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
-kind: TrustAccessApplication
-metadata:
-  name: cloudflare-app-api-simplesalt-company
-  labels:
-    entity: ssint
-    env: main
-    capability: access
-spec:
-  forProvider:
-    accountId: ba92fe12c6c1275f965c7c86e3b392ac
-    name: api-simplesalt-company
-    type: self_hosted
-    domain: api.simplesalt.company/45e6451afc312886/grammar
-    destinations:
-      # Only the grammar path: the rest of api.simplesalt.company is Workers
-      # (webhooks, MCP server) that must stay reachable without Access.
-      - type: public
-        uri: api.simplesalt.company/45e6451afc312886/grammar
-    # Pages on info (Big AGI) call the grammar API from the browser with the Access cookie.
-    corsHeaders:
-      allowedOrigins:
-        - https://info.simplesalt.company
-      allowedMethods:
-        - GET
-        - POST
-      allowedHeaders:
-        - content-type
-      allowCredentials: true
-      maxAge: 600
-    sessionDuration: 24h
-    autoRedirectToIdentity: true
-    allowedIdps:
-      - 42cbdc64-699e-4e17-b470-fb7cda3c0791
-    policies:
-      - id: 79bac8d3-6c82-4ac5-bbdb-f98a3388236c
-        precedence: 1
-  providerConfigRef:
-    name: ssint-main
-
----
 apiVersion: dns.upjet-cloudflare.upbound.io/v1alpha1
 kind: Record
 metadata:
@@ -293,8 +269,9 @@ spec:
             access:
               required: true
               teamName: fqurzlaaagt
+              # The info app's, which covers the grammar path.
               audTag:
-                - e34b52db64bd0aa15ca566b32082e83d9f79eac25489b491e557045d7824f8bd
+                - afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c
         - hostname: hooks.simplesalt.company
           path: ^/duxsoup/events$
           service: http://duxsoup-ingest.ssint-main-msg.svc.k.famevans.win:8080

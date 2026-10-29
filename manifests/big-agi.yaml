@@ -32,9 +32,6 @@ data:
     JWT_HEADER = 'Cf-Access-Jwt-Assertion'
     STT_HOST = os.environ.get('STT_HOST', 'stt-proxy.ssint-main-voice')
     STT_PORT = int(os.environ.get('STT_PORT', '8000'))
-    GRAMMAR_HOST = os.environ.get('GRAMMAR_HOST', 'grammar.ssint-main-voice')
-    GRAMMAR_PORT = int(os.environ.get('GRAMMAR_PORT', '8000'))
-    GRAMMAR_PATH = os.environ.get('GRAMMAR_PATH', '/45e6451afc312886/grammar')
     HERMES_HOST = os.environ.get('HERMES_HOST', 'hermes-agent-web')
     HERMES_PORT = int(os.environ.get('HERMES_PORT', '80'))
     HERMES_PREFIX = '/_hermes'
@@ -148,8 +145,6 @@ data:
                 self._static(ICONS[p], 'image/png')
             elif p == '/_stt/token' and self.command == 'GET':
                 self._token()
-            elif p == '/_stt/grammar' and self.command == 'POST':
-                self._grammar()
             elif p.startswith('/_stt/'):
                 self._reply(404, {'error': 'not found'})
             elif p == HERMES_PREFIX or p.startswith(HERMES_PREFIX + '/'):
@@ -236,14 +231,8 @@ data:
         def _token(self):
             self._to_stt('GET', '/token', None)
 
-        # The Aa button's grammar fix, on this origin so it rides this site's
-        # sign-in: an installed phone app can't complete a second one for
-        # api.simplesalt.company. The grammar service checks this site's JWT too.
-        def _grammar(self):
-            n = int(self.headers.get('Content-Length', 0) or 0)
-            self._to_stt('POST', GRAMMAR_PATH, self.rfile.read(n) if n else b'', GRAMMAR_HOST, GRAMMAR_PORT)
-
-        def _to_stt(self, method, path, body, host=STT_HOST, port=STT_PORT):
+        def _to_stt(self, method, path, body):
+            host, port = STT_HOST, STT_PORT
             conn = None
             try:
                 conn = http.client.HTTPConnection(host, port, timeout=40)
@@ -347,7 +336,7 @@ data:
       const LIVE_MAX_MS = 60 * 60 * 1000;
       const PASS_REFRESH_MS = 8 * 60 * 1000;
       const LIVE_URL = 'wss://streaming.assemblyai.com/v3/ws';
-      const GRAMMAR_URL = '/_stt/grammar';
+      const GRAMMAR_URL = 'https://api.simplesalt.company/45e6451afc312886/grammar';
 
       const style = document.createElement('style');
       style.textContent = `
@@ -724,10 +713,19 @@ data:
         if (!text) { toast('Nothing in the chat box to fix.'); return; }
         fix.dataset.busy = '1';
         try {
-          const r = await fetch(GRAMMAR_URL, {
-            method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, context: conversationContext() }),
-          });
+          // The grammar API shares this site's Access app, so sign-in sets its
+          // cookie too and the call needs no sign-in of its own. A session from
+          // before that sharing lacks the cookie until the next sign-in.
+          let r;
+          try {
+            r = await fetch(GRAMMAR_URL, {
+              method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text, context: conversationContext() }),
+            });
+          } catch (_) {
+            toast('Grammar fix needs a fresh sign-in: sign out of SS chat and back in once.', 6000);
+            return;
+          }
           const doc = await r.json().catch(() => ({}));
           if (!r.ok || !doc.text) throw new Error(doc.error || `HTTP ${r.status}`);
           if (ta.value.trim() !== text) { toast('Chat box changed, so the fix was not applied.'); return; }
@@ -989,7 +987,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        gate-script-sha: ed75e333e2459294
+        gate-script-sha: c63da82834872478
     spec:
       containers:
         - name: big-agi
