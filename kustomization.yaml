@@ -43,8 +43,8 @@ configMapGenerator:
       - skill-miss-report.md=manifests/hermes-skills/miss-report.md
       - skill-qr-code.md=manifests/hermes-skills/qr-code.md
       - skill-qr-code--qr_decode.py=manifests/hermes-skills/qr-code--qr_decode.py
-      - qr-code-selftest-skewed.jpg=manifests/hermes-skills/qr-code-selftest-skewed.jpg
-      - qr-code-selftest-small.jpg=manifests/hermes-skills/qr-code-selftest-small.jpg
+      - qr-code-selftest-skewed.jpg=manifests/hermes-skills/qr-code-selftest-skewed.img
+      - qr-code-selftest-small.jpg=manifests/hermes-skills/qr-code-selftest-small.img
       - cron-people-scan.py=manifests/hermes-skills/cron-people-scan.py
       - cron-people-scan.md=manifests/hermes-skills/cron-people-scan.md
       - cron-deletion-review.py=manifests/hermes-skills/cron-deletion-review.py
