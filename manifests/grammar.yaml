@@ -249,10 +249,10 @@ spec:
               value: google/gemini-2.5-flash-lite
             - name: ACCESS_TEAM_DOMAIN
               value: "https://fqurzlaaagt.cloudflareaccess.com"
-            # Access apps whose signed-in users may call this: Big AGI (info), and
-            # the grammar app once Cloudflare has created it.
+            # Access apps whose signed-in users may call this: Big AGI (info) and
+            # grammar.simplesalt.company.
             - name: ACCESS_AUDS
-              value: "afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c"
+              value: "afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c,95075ad50df2cb373b6870458aaf96b25607795df5edde8fe8bc1da301ccee41"
           volumeMounts:
             - name: script
               mountPath: /scripts

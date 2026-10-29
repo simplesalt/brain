@@ -256,6 +256,12 @@ spec:
                 - 43d32c8263fb9410781f8bd5571a020bd3358b1177ed6c26560595a720e1e610
         - hostname: grammar.simplesalt.company
           service: http://grammar.ssint-main-voice.svc.k.famevans.win:8000
+          originRequest:
+            access:
+              required: true
+              teamName: fqurzlaaagt
+              audTag:
+                - 95075ad50df2cb373b6870458aaf96b25607795df5edde8fe8bc1da301ccee41
         - hostname: hooks.simplesalt.company
           path: ^/duxsoup/events$
           service: http://duxsoup-ingest.ssint-main-msg.svc.k.famevans.win:8080
