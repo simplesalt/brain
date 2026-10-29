@@ -157,7 +157,7 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "failed-to-fetch-2026-10-29"
+              value: "approvals-off-2026-10-29"
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: PROXY_URL
