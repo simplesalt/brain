@@ -8,23 +8,8 @@ metadata:
     env: main
     capability: voice
 ---
-# Filled by a person out of band (see the secrets-handling skill); Flux merges
-# so reconciliation never wipes the value. stt-proxy stays unready until it is.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: openrouter-api-key
-  namespace: ssint-main-voice
-  labels:
-    entity: ssint
-    env: main
-    capability: voice
-  annotations:
-    kustomize.toolkit.fluxcd.io/ssa: merge
-type: Opaque
----
-# Filled by a person out of band, key ASSEMBLYAI_API_KEY. Until it is, /token
-# answers 503 and the batch mic keeps working.
+# Filled by a person out of band, key ASSEMBLYAI_API_KEY; Flux merges so
+# reconciliation never wipes the value. stt-proxy stays unready until it is.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -50,52 +35,26 @@ metadata:
 data:
   stt.py: |
     #!/usr/bin/env python3
-    # Transcribes dictation from the big-AGI mic button. It owns the OpenRouter
-    # key, so big-AGI's pod holds none: the big-AGI gate forwards each recording
-    # here with the caller's Cloudflare Access JWT, which is verified below. The
-    # audio goes to Whisper on OpenRouter with the vocabulary list, then terms the
-    # mic picked from the open conversation, as a spelling hint.
-    # /token hands a signed-in browser a single-use AssemblyAI streaming pass, so
-    # live dictation streams audio straight to AssemblyAI without the key leaving
-    # the cluster or the audio passing through here.
-    # /healthz is unready until at least one key is filled, so unfilled keys show
-    # up as an unready pod; keys are re-read from the mounted Secrets, so the pod
-    # turns ready on its own once a person fills one.
-    import base64, hashlib, hmac, json, os, re, threading, time, http.server, urllib.error, urllib.request
-    from urllib.parse import unquote
+    # Live dictation passes for the big-AGI mic. /token hands a browser signed in
+    # through Cloudflare Access (its JWT is verified below) a single-use AssemblyAI
+    # streaming pass, so the mic streams audio straight to AssemblyAI; the key
+    # never leaves the cluster and no audio passes through here.
+    # /healthz is unready until the key is filled; the key is re-read from the
+    # mounted Secret, so the pod turns ready on its own once a person fills it.
+    import base64, hashlib, hmac, json, os, threading, time, http.server, urllib.error, urllib.request
 
     PORT = int(os.environ.get('PORT', '8000'))
     JWT_HEADER = 'Cf-Access-Jwt-Assertion'
     ACCESS_TEAM = os.environ.get('ACCESS_TEAM_DOMAIN', '').rstrip('/')
     ACCESS_AUD = os.environ.get('ACCESS_AUD', '')
-    KEY_PATH = os.environ.get('KEY_PATH', '/secrets/OPENROUTER_API_KEY')
-    STT_URL = os.environ.get('STT_URL', 'https://openrouter.ai/api/v1/audio/transcriptions')
-    STT_MODEL = os.environ.get('STT_MODEL', 'openai/whisper-large-v3')
-    STT_PROVIDER = os.environ.get('STT_PROVIDER', 'groq')
-    STT_LANGUAGE = os.environ.get('STT_LANGUAGE', 'en')
-    VOCAB_PATH = os.environ.get('VOCAB_PATH', '/stt/vocabulary.txt')
     AAI_KEY_PATH = os.environ.get('AAI_KEY_PATH', '/secrets-aai/ASSEMBLYAI_API_KEY')
     AAI_TOKEN_URL = os.environ.get('AAI_TOKEN_URL', 'https://streaming.assemblyai.com/v3/token')
     # AssemblyAI caps the unused-pass window at 600 s; the browser refreshes it before then.
     AAI_PASS_SECONDS = int(os.environ.get('AAI_PASS_SECONDS', '600'))
     AAI_SESSION_SECONDS = int(os.environ.get('AAI_SESSION_SECONDS', '3600'))
-    MAX_AUDIO = 24 * 1024 * 1024
-    # Whisper reads at most 224 prompt tokens; ~4 characters a token.
-    MAX_PROMPT_CHARS = 800
-    _FORMATS = {'audio/webm': 'webm', 'video/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a',
-                'audio/x-m4a': 'm4a', 'audio/m4a': 'm4a', 'audio/aac': 'aac', 'audio/mpeg': 'mp3',
-                'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac'}
-
-    def openrouter_key():
-        """The key, read from the mounted Secret on each use so a fill or rotation applies without a restart."""
-        try:
-            with open(KEY_PATH) as f:
-                return f.read().strip()
-        except OSError:
-            return ''
 
     def assemblyai_key():
-        """The AssemblyAI key, re-read on each use like the OpenRouter key."""
+        """The key, read from the mounted Secret on each use so a fill or rotation applies without a restart."""
         try:
             with open(AAI_KEY_PATH) as f:
                 return f.read().strip()
@@ -170,59 +129,6 @@ data:
         except Exception:
             return None
 
-    _TERM_OK = re.compile(r"^[\w][\w .'+#&/-]{0,39}$")
-
-    def conversation_terms(header):
-        """Terms the mic picked from the open conversation, sent URL-encoded and comma-separated."""
-        out = []
-        for t in unquote(header or '').split(','):
-            t = t.strip()
-            if _TERM_OK.match(t) and t not in out:
-                out.append(t)
-        return out[:60]
-
-    def vocabulary_prompt(extra=()):
-        """The vocabulary list, then terms from the conversation, as a Whisper prompt.
-        The list is re-read each call so edits apply without a restart."""
-        try:
-            with open(VOCAB_PATH) as f:
-                terms = [t.strip() for t in f if t.strip() and not t.lstrip().startswith('#')]
-        except OSError:
-            terms = []
-        seen = {t.lower() for t in terms}
-        terms += [t for t in extra if t.lower() not in seen]
-        prompt = 'Glossary:'
-        for t in terms:
-            if len(prompt) + len(t) + 2 > MAX_PROMPT_CHARS:
-                break
-            prompt += (' ' if prompt.endswith(':') else ', ') + t
-        return prompt + '.' if terms else ''
-
-    def transcribe(audio, fmt, extra=()):
-        """Return the transcript of audio (bytes in format fmt), or raise."""
-        req = {
-            'model': STT_MODEL,
-            'input_audio': {'data': base64.b64encode(audio).decode(), 'format': fmt},
-            'response_format': 'json',
-            'temperature': 0,
-            'provider': {'order': [STT_PROVIDER], 'allow_fallbacks': True},
-        }
-        if STT_LANGUAGE:
-            req['language'] = STT_LANGUAGE
-        prompt = vocabulary_prompt(extra)
-        if prompt:
-            req['provider']['options'] = {STT_PROVIDER: {'prompt': prompt}}
-        r = urllib.request.Request(STT_URL, data=json.dumps(req).encode(), method='POST', headers={
-            'Authorization': 'Bearer ' + openrouter_key(), 'Content-Type': 'application/json',
-            'X-Title': 'big-AGI dictation'})
-        with urllib.request.urlopen(r, timeout=120) as resp:
-            doc = json.load(resp)
-        text = doc.get('text')
-        if not isinstance(text, str):
-            raise RuntimeError('no text in transcription response')
-        return text.strip()
-
-
     class Handler(http.server.BaseHTTPRequestHandler):
         timeout = 180
         def log_message(self, *a): pass
@@ -241,10 +147,10 @@ data:
                 self._token()
             elif self.path != '/healthz':
                 self._reply(404, {'error': 'not found'})
-            elif not (openrouter_key() or assemblyai_key()):
-                self._reply(503, {'ok': False, 'error': 'neither the OpenRouter nor the AssemblyAI key is filled'})
+            elif not assemblyai_key():
+                self._reply(503, {'ok': False, 'error': 'AssemblyAI key not filled'})
             else:
-                self._reply(200, {'ok': True, 'batch': bool(openrouter_key()), 'live': bool(assemblyai_key())})
+                self._reply(200, {'ok': True})
 
         def _token(self):
             if not verify_access_jwt(self.headers.get(JWT_HEADER, '')):
@@ -263,83 +169,11 @@ data:
                 print(f'stt-proxy: AssemblyAI token failed: {e}', flush=True)
                 self._reply(502, {'error': 'live dictation pass failed'})
 
-        def do_POST(self):
-            if self.path.split('?', 1)[0] != '/transcribe':
-                self._reply(404, {'error': 'not found'})
-                return
-            n = int(self.headers.get('Content-Length', 0) or 0)
-            if n > MAX_AUDIO:
-                self._reply(413, {'error': 'recording too long'})
-                return
-            audio = self.rfile.read(n) if n else b''
-            if not verify_access_jwt(self.headers.get(JWT_HEADER, '')):
-                self._reply(401, {'error': 'not signed in'})
-                return
-            if not openrouter_key():
-                self._reply(503, {'error': 'voice service key not filled'})
-                return
-            if not audio:
-                self._reply(400, {'error': 'no audio'})
-                return
-            ctype = self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
-            fmt = _FORMATS.get(ctype, 'webm')
-            try:
-                extra = conversation_terms(self.headers.get('X-STT-Terms', ''))
-                self._reply(200, {'text': transcribe(audio, fmt, extra)})
-            except urllib.error.HTTPError as e:
-                detail = e.read()[:500].decode('utf-8', 'replace')
-                print(f'stt-proxy: transcription HTTP {e.code}: {detail}', flush=True)
-                self._reply(502, {'error': f'transcription service answered {e.code}'})
-            except Exception as e:
-                print(f'stt-proxy: transcription failed: {e}', flush=True)
-                self._reply(502, {'error': 'transcription failed'})
-
     if __name__ == '__main__':
         srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
-        print(f'stt-proxy :{PORT}' + ('' if openrouter_key() else
-              ' (unready: secret openrouter-api-key is not filled)'), flush=True)
+        print(f'stt-proxy :{PORT}' + ('' if assemblyai_key() else
+              ' (unready: secret assemblyai-api-key is not filled)'), flush=True)
         srv.serve_forever()
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: stt-vocabulary
-  namespace: ssint-main-voice
-  labels:
-    entity: ssint
-    env: main
-    capability: voice
-data:
-  # Terms dictation should spell this way, one per line, most important first.
-  # Whisper reads only the first ~800 characters; lines starting with # are skipped.
-  vocabulary.txt: |
-    Groq
-    Hermes
-    Hindsight
-    gbrain
-    Big AGI
-    OpenRouter
-    Simple Salt
-    Dylan
-    Russell
-    Claude
-    MiniMax
-    Gemini
-    Whisper
-    Flux
-    k3s
-    Kubernetes
-    kubectl
-    Cloudflare
-    GitHub
-    GitOps
-    Notion
-    HubSpot
-    Dux Soup
-    LinkedIn
-    MCP
-    YAML
-    SSO
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -364,7 +198,7 @@ spec:
         capability: voice
       # The script is read only at start; its hash here restarts the pod when it changes.
       annotations:
-        stt-script-sha: 5d1939c697284c23
+        stt-script-sha: 898cdf7c597f1fb3
     spec:
       containers:
         - name: stt-proxy
@@ -383,11 +217,6 @@ spec:
           volumeMounts:
             - name: script
               mountPath: /scripts
-            - name: vocabulary
-              mountPath: /stt
-            - name: key
-              mountPath: /secrets
-              readOnly: true
             - name: aai-key
               mountPath: /secrets-aai
               readOnly: true
@@ -413,13 +242,6 @@ spec:
         - name: script
           configMap:
             name: stt-proxy-script
-        - name: vocabulary
-          configMap:
-            name: stt-vocabulary
-        - name: key
-          secret:
-            secretName: openrouter-api-key
-            optional: true
         - name: aai-key
           secret:
             secretName: assemblyai-api-key
