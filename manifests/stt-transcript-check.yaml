@@ -1,0 +1,47 @@
+---
+# One-off read of the latest Hermes chats from the archive: the person's own
+# messages from the last two hours, to see what live dictation typed.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stt-transcript-check-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: read
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          command:
+            - sh
+            - -c
+            - |
+              psql "$DATABASE_URL" -X -A -F ' | ' -v ON_ERROR_STOP=1 \
+                -c 'BEGIN READ ONLY' \
+                -c "SELECT s.session_id, s.source, s.title, s.last_active FROM sessions s WHERE s.last_active > now() - interval '2 hours' ORDER BY s.last_active DESC LIMIT 10" \
+                -c "SELECT m.session_id, m.ts, m.content_chars, replace(left(m.content_head, 1500), E'\n', ' / ') FROM messages m WHERE m.role = 'user' AND m.ts > now() - interval '2 hours' ORDER BY m.ts" \
+                -c 'ROLLBACK'
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-chats-pg-app
+                  key: uri
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
