@@ -106,6 +106,8 @@ mcp_servers:
         - list_pages
         - get_timeline
         - add_timeline_entry
+        - get_raw_data
+        - sources_list
         - add_tag
         - remove_tag
         - get_tags
