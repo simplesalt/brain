@@ -134,7 +134,7 @@ spec:
   template:
     metadata:
       annotations:
-        simplesalt.company/restart-epoch: "1"
+        simplesalt.company/restart-epoch: "2"
       labels:
         app: gbrain
         entity: ssint
