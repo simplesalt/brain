@@ -1,0 +1,61 @@
+---
+# One-off check of the grammar service's model call on a real choppy dictation.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: grammar-check-1
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        entity: ssint
+        env: main
+        capability: voice
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: test
+          image: python:3.12-alpine
+          command:
+            - python
+            - -c
+            - |
+              import importlib.util, time
+              spec = importlib.util.spec_from_file_location('g', '/scripts/grammar.py')
+              m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+              raw = ("It's a while later and it. Should have. Processed your request can you go check. Again to see if. "
+                     "Duck Soup has done anything or whether your core people records that were missing. Like pawn and freed and. "
+                     "Judy Johnstone. Now have Fuller. People records with LinkedIn. Profiles complete.")
+              ctx = ("Chat with an AI assistant. Uncommon terms and phrases from the chat: LinkedIn invites | Dux-Soup | "
+                     "Judy Johnstone | gbrain | people records | Hermes")
+              print('model:', m.MODEL, flush=True)
+              print('raw: ', raw, flush=True)
+              t0 = time.time()
+              print('fix: ', m.fix(raw, ctx), flush=True)
+              print(f'took {time.time() - t0:.2f}s', flush=True)
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: key
+              mountPath: /secrets
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: script
+          configMap:
+            name: grammar-script
+        - name: key
+          secret:
+            secretName: grammar-openrouter-api-key
