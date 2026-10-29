@@ -20,6 +20,8 @@ data:
     # button that gets a single-use AssemblyAI pass from /_stt/token and streams
     # audio to AssemblyAI directly. /_stt/token is passed with the Access JWT to
     # stt-proxy, which verifies it and holds the AssemblyAI key; this pod holds none.
+    # The mic's Aa button posts the chat box text to /_stt/tidy, forwarded with
+    # the Access JWT to the grammar service, which fixes punctuation and grammar.
     #
     # Every page also loads /_ui/nav.js, which trims big-AGI's navigation and
     # adds a link to the Hermes console.
@@ -32,6 +34,8 @@ data:
     JWT_HEADER = 'Cf-Access-Jwt-Assertion'
     STT_HOST = os.environ.get('STT_HOST', 'stt-proxy.ssint-main-voice')
     STT_PORT = int(os.environ.get('STT_PORT', '8000'))
+    GRAMMAR_HOST = os.environ.get('GRAMMAR_HOST', 'grammar.ssint-main-voice')
+    GRAMMAR_PORT = int(os.environ.get('GRAMMAR_PORT', '8000'))
     HERMES_HOST = os.environ.get('HERMES_HOST', 'hermes-agent-web')
     HERMES_PORT = int(os.environ.get('HERMES_PORT', '80'))
     HERMES_PREFIX = '/_hermes'
@@ -175,12 +179,12 @@ data:
             if n > 64 * 1024:
                 self._reply(413, {'error': 'dictation too long to tidy'})
                 return
-            self._to_stt('POST', '/tidy', self.rfile.read(n) if n else b'')
+            self._to_stt('POST', '/', self.rfile.read(n) if n else b'', GRAMMAR_HOST, GRAMMAR_PORT)
 
-        def _to_stt(self, method, path, body):
+        def _to_stt(self, method, path, body, host=STT_HOST, port=STT_PORT):
             conn = None
             try:
-                conn = http.client.HTTPConnection(STT_HOST, STT_PORT, timeout=40)
+                conn = http.client.HTTPConnection(host, port, timeout=40)
                 headers = {JWT_HEADER: self.headers.get(JWT_HEADER, '')}
                 if body is not None:
                     headers.update({'Content-Type': 'application/json', 'Content-Length': str(len(body))})
@@ -194,8 +198,8 @@ data:
                 self.end_headers()
                 self.wfile.write(out)
             except Exception as e:
-                print(f'big-agi-gate: stt-proxy unreachable: {e}', flush=True)
-                self._reply(502, {'error': 'live dictation service unreachable'})
+                print(f'big-agi-gate: {host} unreachable: {e}', flush=True)
+                self._reply(502, {'error': 'dictation service unreachable'})
             finally:
                 if conn is not None:
                     try: conn.close()
@@ -933,7 +937,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        gate-script-sha: ae376362c99a765e
+        gate-script-sha: 79755435406df4dc
     spec:
       containers:
         - name: big-agi

@@ -161,6 +161,53 @@ spec:
     name: ssint-main
 
 ---
+apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
+kind: TrustAccessApplication
+metadata:
+  name: cloudflare-app-grammar-simplesalt-company
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+spec:
+  forProvider:
+    accountId: ba92fe12c6c1275f965c7c86e3b392ac
+    name: grammar-simplesalt-company
+    type: self_hosted
+    destinations:
+      - type: public
+        uri: grammar.simplesalt.company
+    sessionDuration: 24h
+    autoRedirectToIdentity: true
+    allowedIdps:
+      - 42cbdc64-699e-4e17-b470-fb7cda3c0791
+    policies:
+      - id: 79bac8d3-6c82-4ac5-bbdb-f98a3388236c
+        precedence: 1
+  providerConfigRef:
+    name: ssint-main
+
+---
+apiVersion: dns.upjet-cloudflare.upbound.io/v1alpha1
+kind: Record
+metadata:
+  name: cf-main-dns-grammar-simplesalt-company
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+spec:
+  forProvider:
+    zoneId: 260b251cdb53f8376875a8eb8d03ca0b
+    name: grammar.simplesalt.company
+    type: CNAME
+    content: 83c27a64-4074-474c-9a8f-19448d1c2081.cfargotunnel.com
+    proxied: true
+    ttl: 1
+  providerConfigRef:
+    name: ssint-main
+
+---
 apiVersion: dns.upjet-cloudflare.upbound.io/v1alpha1
 kind: Record
 metadata:
@@ -207,6 +254,8 @@ spec:
               teamName: fqurzlaaagt
               audTag:
                 - 43d32c8263fb9410781f8bd5571a020bd3358b1177ed6c26560595a720e1e610
+        - hostname: grammar.simplesalt.company
+          service: http://grammar.ssint-main-voice.svc.k.famevans.win:8000
         - hostname: hooks.simplesalt.company
           path: ^/duxsoup/events$
           service: http://duxsoup-ingest.ssint-main-msg.svc.k.famevans.win:8080

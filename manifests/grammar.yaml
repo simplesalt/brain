@@ -1,0 +1,304 @@
+---
+# Grammar fix service: one POST method, text in, corrected text out. Signed-in
+# callers only (Cloudflare Access), reached publicly at grammar.simplesalt.company
+# and from Big AGI's Aa button through its gate.
+# Filled by a person out of band, key OPENROUTER_API_KEY: a dedicated OpenRouter
+# key with a low spending limit. Flux merges so reconciliation never wipes it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grammar-openrouter-api-key
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grammar-script
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+data:
+  grammar.py: |
+    #!/usr/bin/env python3
+    # Grammar fix for dictated text. One method: POST / with the text as the body
+    # (text/plain in, text/plain out), or JSON {"text": ..., "context": ...} in and
+    # {"text": ...} out, where context is recent chat that names people and terms.
+    # It fixes punctuation, sentence breaks and grammar (pauses get transcribed as
+    # full stops) with a small, fast model on OpenRouter, keeping the speaker's words.
+    # Callers must be signed in through Cloudflare Access: the Access JWT is verified
+    # here against the apps allowed to call it (the public grammar app, and Big AGI,
+    # whose gate forwards its users' requests). It owns its OpenRouter key; /healthz
+    # is unready until the key is filled, and the key is re-read on each use.
+    import base64, hashlib, hmac, json, os, threading, time, http.server, urllib.error, urllib.request
+
+    PORT = int(os.environ.get('PORT', '8000'))
+    JWT_HEADER = 'Cf-Access-Jwt-Assertion'
+    ACCESS_TEAM = os.environ.get('ACCESS_TEAM_DOMAIN', '').rstrip('/')
+    ACCESS_AUDS = {a.strip() for a in os.environ.get('ACCESS_AUDS', '').split(',') if a.strip()}
+    KEY_PATH = os.environ.get('KEY_PATH', '/secrets/OPENROUTER_API_KEY')
+    LLM_URL = os.environ.get('LLM_URL', 'https://openrouter.ai/api/v1/chat/completions')
+    MODEL = os.environ.get('MODEL', 'google/gemini-2.5-flash-lite')
+    MAX_BYTES = 64 * 1024
+    SYSTEM = (
+        'You fix dictated text. The user message may give recent chat context, then a speech-to-text '
+        'transcript the speaker dictated. The speaker pauses to think, and pauses were often transcribed '
+        'as full stops. Fix punctuation, capitalization, sentence boundaries and grammar so it reads as the '
+        'speaker meant it. Keep the speaker\'s words, wording and meaning: do not add, drop, rephrase, answer '
+        'or summarize anything. Change a word only when it is clearly a mis-hearing of a name or term from '
+        'the context. Reply with the corrected transcript only.'
+    )
+
+    def openrouter_key():
+        """The key, read from the mounted Secret on each use so a fill or rotation applies without a restart."""
+        try:
+            with open(KEY_PATH) as f:
+                return f.read().strip()
+        except OSError:
+            return ''
+
+    def fix(text, context=''):
+        """Return text with punctuation and grammar fixed, or raise."""
+        user = (f'Context:\n{context[-6000:]}\n\n' if context else '') + f'Transcript:\n{text}'
+        body = {'model': MODEL, 'temperature': 0, 'max_tokens': 4000,
+                'messages': [{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content': user}]}
+        r = urllib.request.Request(LLM_URL, data=json.dumps(body).encode(), method='POST', headers={
+            'Authorization': 'Bearer ' + openrouter_key(), 'Content-Type': 'application/json',
+            'X-Title': 'grammar fix'})
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            doc = json.load(resp)
+        out = ((doc.get('choices') or [{}])[0].get('message') or {}).get('content')
+        if not isinstance(out, str) or not out.strip():
+            raise RuntimeError('no text in model response')
+        return out.strip()
+
+    _SHA256_PREFIX = bytes.fromhex('3031300d060960864801650304020105000420')
+    _keys, _keys_at, _keys_lock = {}, 0.0, threading.Lock()
+
+    def _b64(s):
+        return base64.urlsafe_b64decode(s + '=' * (-len(s) % 4))
+
+    def _jwks(force=False):
+        global _keys, _keys_at
+        with _keys_lock:
+            age = time.time() - _keys_at
+            if age < 60 or (_keys and age < 3600 and not force):
+                return _keys
+            try:
+                with urllib.request.urlopen(ACCESS_TEAM + '/cdn-cgi/access/certs', timeout=10) as r:
+                    doc = json.load(r)
+                _keys = {k['kid']: (int.from_bytes(_b64(k['n']), 'big'), int.from_bytes(_b64(k['e']), 'big'))
+                         for k in doc.get('keys', []) if k.get('kty') == 'RSA'}
+                _keys_at = time.time()
+            except Exception as e:
+                _keys_at = time.time()
+                print(f'grammar: Access certs fetch failed: {e}', flush=True)
+            return _keys
+
+    def _rs256_ok(key, signed, sig):
+        n, e = key
+        k = (n.bit_length() + 7) // 8
+        if len(sig) != k:
+            return False
+        em = pow(int.from_bytes(sig, 'big'), e, n).to_bytes(k, 'big')
+        t = _SHA256_PREFIX + hashlib.sha256(signed).digest()
+        want = b'\x00\x01' + b'\xff' * (k - len(t) - 3) + b'\x00' + t
+        return hmac.compare_digest(em, want)
+
+    def verify_access_jwt(token):
+        """Return the claims of a verified Cloudflare Access JWT that names an email, else None."""
+        if not (token and ACCESS_TEAM and ACCESS_AUDS) or token.count('.') != 2:
+            return None
+        try:
+            h64, p64, s64 = token.split('.')
+            head, claims = json.loads(_b64(h64)), json.loads(_b64(p64))
+            if head.get('alg') != 'RS256':
+                return None
+            key = _jwks().get(head.get('kid')) or _jwks(force=True).get(head.get('kid'))
+            if not key or not _rs256_ok(key, (h64 + '.' + p64).encode(), _b64(s64)):
+                return None
+            now = time.time()
+            aud = claims.get('aud')
+            aud = aud if isinstance(aud, list) else [aud]
+            if claims.get('iss') != ACCESS_TEAM or not ACCESS_AUDS.intersection(aud):
+                return None
+            if claims.get('exp', 0) < now - 30 or claims.get('nbf', 0) > now + 30:
+                return None
+            email = claims.get('email')
+            return claims if isinstance(email, str) and '@' in email else None
+        except Exception:
+            return None
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        timeout = 60
+        def log_message(self, *a): pass
+
+        def _send(self, status, body, ctype):
+            self.send_response(status)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _reply(self, status, doc):
+            self._send(status, json.dumps(doc).encode(), 'application/json')
+
+        def do_GET(self):
+            if self.path != '/healthz':
+                self._reply(404, {'error': 'not found'})
+            elif not openrouter_key():
+                self._reply(503, {'ok': False, 'error': 'OpenRouter key not filled'})
+            else:
+                self._reply(200, {'ok': True, 'model': MODEL})
+
+        def do_POST(self):
+            if self.path.split('?', 1)[0] != '/':
+                self._reply(404, {'error': 'not found'})
+                return
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            if n > MAX_BYTES:
+                self._reply(413, {'error': 'text too long'})
+                return
+            raw = self.rfile.read(n) if n else b''
+            if not verify_access_jwt(self.headers.get(JWT_HEADER, '')):
+                self._reply(401, {'error': 'not signed in'})
+                return
+            if not openrouter_key():
+                self._reply(503, {'error': 'grammar key not filled'})
+                return
+            as_json = self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() == 'application/json'
+            try:
+                if as_json:
+                    doc = json.loads(raw or b'{}')
+                    text, context = str(doc.get('text') or '').strip(), str(doc.get('context') or '')
+                else:
+                    text, context = raw.decode('utf-8').strip(), ''
+            except Exception:
+                self._reply(400, {'error': 'bad request'})
+                return
+            if not text:
+                self._reply(400, {'error': 'no text'})
+                return
+            try:
+                out = fix(text, context)
+            except urllib.error.HTTPError as e:
+                detail = e.read()[:500].decode('utf-8', 'replace')
+                print(f'grammar: OpenRouter HTTP {e.code}: {detail}', flush=True)
+                self._reply(502, {'error': f'grammar model answered {e.code}'})
+                return
+            except Exception as e:
+                print(f'grammar: fix failed: {e}', flush=True)
+                self._reply(502, {'error': 'grammar fix failed'})
+                return
+            if as_json:
+                self._reply(200, {'text': out})
+            else:
+                self._send(200, out.encode(), 'text/plain; charset=utf-8')
+
+    if __name__ == '__main__':
+        srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
+        print(f'grammar :{PORT} model {MODEL}' + ('' if openrouter_key() else
+              ' (unready: secret grammar-openrouter-api-key is not filled)'), flush=True)
+        srv.serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grammar
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grammar
+  template:
+    metadata:
+      labels:
+        app: grammar
+        entity: ssint
+        env: main
+        capability: voice
+      # The script is read only at start; its hash here restarts the pod when it changes.
+      annotations:
+        grammar-script-sha: e329de2f648017c7
+    spec:
+      containers:
+        - name: grammar
+          image: python:3.12-alpine
+          command: ["python", "/scripts/grammar.py"]
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PORT
+              value: "8000"
+            - name: MODEL
+              value: google/gemini-2.5-flash-lite
+            - name: ACCESS_TEAM_DOMAIN
+              value: "https://fqurzlaaagt.cloudflareaccess.com"
+            # Access apps whose signed-in users may call this: Big AGI (info), and
+            # the grammar app once Cloudflare has created it.
+            - name: ACCESS_AUDS
+              value: "afcfa282e581c698462ed0073e0d497979eb6e5d737548dcea72e2e2a643102c"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: key
+              mountPath: /secrets
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+      volumes:
+        - name: script
+          configMap:
+            name: grammar-script
+        - name: key
+          secret:
+            secretName: grammar-openrouter-api-key
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grammar
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
+spec:
+  selector:
+    app: grammar
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
