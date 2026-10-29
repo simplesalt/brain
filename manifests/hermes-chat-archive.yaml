@@ -1,0 +1,420 @@
+# Hermes keeps chat history on an emptyDir that every restart wipes. This
+# CronJob copies each chat (messages, reasoning, tool calls) every 15 minutes
+# into a 7-slot ring of ConfigMaps, one per UTC day, so the daily Hermes miss
+# review (.claude/skills/hermes-miss-review) can read a whole day of chats
+# from the brain builder. Slot = days since epoch % 7; a slot holding an older
+# date is cleared before reuse.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hermes-chat-archive
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-chat-archive-0
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+    app: hermes-chat-archive
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-chat-archive-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+    app: hermes-chat-archive
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-chat-archive-2
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+    app: hermes-chat-archive
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-chat-archive-3
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+    app: hermes-chat-archive
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-chat-archive-4
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+    app: hermes-chat-archive
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-chat-archive-5
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+    app: hermes-chat-archive
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-chat-archive-6
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+    app: hermes-chat-archive
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hermes-chat-archive
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      - hermes-chat-archive-0
+      - hermes-chat-archive-1
+      - hermes-chat-archive-2
+      - hermes-chat-archive-3
+      - hermes-chat-archive-4
+      - hermes-chat-archive-5
+      - hermes-chat-archive-6
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hermes-chat-archive
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hermes-chat-archive
+subjects:
+  - kind: ServiceAccount
+    name: hermes-chat-archive
+    namespace: ssint-main-ai
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-chat-archive-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  archive.py: |
+    import hashlib, json, os, ssl, time, urllib.error, urllib.parse, urllib.request
+    from datetime import datetime, timezone
+
+    HERMES = os.environ.get('HERMES_URL', 'http://hermes-agent-web:8642')
+    KEY = os.environ['API_SERVER_KEY']
+    NS = os.environ.get('NAMESPACE', 'ssint-main-ai')
+    SLOTS = 7
+    LOOKBACK = 26 * 3600
+    BUDGET = 950_000
+    CAPS = [  # (reasoning, content, tool output) per message, tightened until a slot fits
+        (8000, 3000, 1500), (4000, 1500, 800), (2000, 800, 300), (800, 400, 150)]
+
+    SA = '/var/run/secrets/kubernetes.io/serviceaccount'
+    K8S = 'https://kubernetes.default.svc'
+    CTX = ssl.create_default_context(cafile=SA + '/ca.crt')
+
+    def hermes(path):
+        req = urllib.request.Request(HERMES + path, headers={'Authorization': 'Bearer ' + KEY})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read())
+
+    def k8s(method, path, body=None):
+        token = open(SA + '/token').read().strip()
+        req = urllib.request.Request(K8S + path, method=method, headers={
+            'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+        if body is not None:
+            req.data = json.dumps(body).encode()
+        with urllib.request.urlopen(req, timeout=30, context=CTX) as r:
+            return json.loads(r.read())
+
+    def items(doc, *keys):
+        if isinstance(doc, list):
+            return doc
+        for k in keys:
+            if isinstance(doc.get(k), list):
+                return doc[k]
+        return []
+
+    def epoch(v):
+        if v is None or v == '':
+            return None
+        if isinstance(v, (int, float)):
+            return v / 1000 if v > 1e12 else float(v)
+        try:
+            return datetime.fromisoformat(str(v).replace('Z', '+00:00')).timestamp()
+        except ValueError:
+            return None
+
+    def text(v):
+        if v is None:
+            return ''
+        if isinstance(v, str):
+            return v
+        if isinstance(v, list):
+            return '\n'.join(text(p.get('text') if isinstance(p, dict) else p) for p in v)
+        if isinstance(v, dict):
+            return text(v.get('text') or v.get('summary') or json.dumps(v))
+        return str(v)
+
+    def session_time(s):
+        for k in ('last_active', 'updated_at', 'last_message_at', 'ended_at', 'started_at', 'created_at'):
+            t = epoch(s.get(k))
+            if t:
+                return t
+        return None
+
+    def message_record(m):
+        rec = {'role': m.get('role'), 'ts': epoch(m.get('timestamp') or m.get('created_at'))}
+        reasoning = m.get('reasoning') or m.get('reasoning_content') or ''
+        if not reasoning and m.get('reasoning_details'):
+            reasoning = text(m['reasoning_details'])
+        if reasoning:
+            rec['reasoning'] = text(reasoning)
+        content = text(m.get('content'))
+        if content:
+            rec['content'] = content
+        calls = m.get('tool_calls')
+        if isinstance(calls, str):
+            try:
+                calls = json.loads(calls)
+            except ValueError:
+                calls = [{'raw': calls}]
+        if calls:
+            rec['tool_calls'] = [{'name': (c.get('function') or {}).get('name') or c.get('name'),
+                                  'args': text((c.get('function') or {}).get('arguments') or c.get('arguments'))}
+                                 for c in calls if isinstance(c, dict)]
+        for k in ('tool_name', 'name', 'finish_reason'):
+            if m.get(k):
+                rec[k] = m[k]
+        rec['h'] = hashlib.sha1(json.dumps([rec.get('role'), rec.get('ts'), rec.get('content', '')[:500],
+                                            rec.get('reasoning', '')[:500]]).encode()).hexdigest()[:12]
+        return rec
+
+    def trim(rec, caps):
+        r, c, t = caps
+        out = dict(rec)
+        if 'reasoning' in out and len(out['reasoning']) > r:
+            out['reasoning'] = out['reasoning'][:r] + f' …[+{len(rec["reasoning"]) - r} chars]'
+        limit = t if out.get('role') == 'tool' else c
+        if 'content' in out and len(out['content']) > limit:
+            out['content'] = out['content'][:limit] + f' …[+{len(rec["content"]) - limit} chars]'
+        if 'tool_calls' in out:
+            out['tool_calls'] = [dict(x, args=x['args'][:t]) for x in out['tool_calls']]
+        return out
+
+    def day(ts):
+        return datetime.fromtimestamp(ts, timezone.utc).strftime('%Y-%m-%d')
+
+    def slot_name(d):
+        n = int(datetime.strptime(d, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() // 86400)
+        return f'hermes-chat-archive-{n % SLOTS}'
+
+    def key_for(sid):
+        return 's.' + ''.join(ch if ch.isalnum() or ch in '-_.' else '_' for ch in str(sid))[:240] + '.json'
+
+    now = time.time()
+    sessions, offset = [], 0
+    while offset < 1000:
+        page = items(hermes(f'/api/sessions?limit=100&offset={offset}&include_children=true'), 'sessions', 'data', 'items')
+        if not page:
+            break
+        sessions += page
+        t = [session_time(s) for s in page]
+        if all(x is not None and x < now - LOOKBACK for x in t):
+            break
+        offset += len(page)
+    print(f'sessions listed: {len(sessions)}')
+    if sessions:
+        print('session fields:', sorted(sessions[0].keys()))
+
+    by_day, seen_fields, with_reasoning, total_msgs = {}, set(), 0, 0
+    for s in sessions:
+        sid = s.get('id') or s.get('session_id')
+        st = session_time(s)
+        if not sid or (st is not None and st < now - LOOKBACK):
+            continue
+        q = urllib.parse.urlencode({'include_compacted': 'true', 'inline_images': 'false'})
+        try:
+            msgs = items(hermes(f'/api/sessions/{urllib.parse.quote(str(sid), safe="")}/messages?{q}'), 'messages', 'data', 'items')
+        except urllib.error.HTTPError as e:
+            print(f'session {sid}: messages -> HTTP {e.code}')
+            continue
+        meta = {k: s.get(k) for k in ('id', 'title', 'source', 'model', 'parent_session_id', 'started_at', 'end_reason') if s.get(k) is not None}
+        for m in msgs:
+            seen_fields |= set(m.keys())
+            rec = message_record(m)
+            total_msgs += 1
+            with_reasoning += 1 if rec.get('reasoning') else 0
+            d = day(rec['ts'] or st or now)
+            by_day.setdefault(d, {}).setdefault(sid, {'session': meta, 'messages': []})['messages'].append(rec)
+    print('message fields:', sorted(seen_fields))
+    print(f'messages read: {total_msgs}, with reasoning: {with_reasoning}')
+
+    for d, chats in sorted(by_day.items()):
+        name = slot_name(d)
+        cm = k8s('GET', f'/api/v1/namespaces/{NS}/configmaps/{name}')
+        data = cm.get('data') or {}
+        if data.get('date') != d:
+            print(f'{name}: reset from {data.get("date")} to {d}')
+            data = {'date': d}
+        full = {}
+        for k, v in data.items():
+            if k.startswith('s.'):
+                try:
+                    full[k] = json.loads(v)
+                except ValueError:
+                    pass
+        for sid, chat in chats.items():
+            k = key_for(sid)
+            old = full.get(k, {'session': chat['session'], 'messages': []})
+            have = {m['h'] for m in old['messages']}
+            old['messages'] += [m for m in chat['messages'] if m['h'] not in have]
+            old['messages'].sort(key=lambda m: m.get('ts') or 0)
+            old['session'] = {**old.get('session', {}), **chat['session']}
+            full[k] = old
+        for caps in CAPS:
+            out = {'date': d, 'caps': json.dumps(caps), 'updated': datetime.now(timezone.utc).isoformat(timespec='seconds')}
+            for k, chat in full.items():
+                out[k] = json.dumps({'session': chat['session'], 'messages': [trim(m, caps) for m in chat['messages']]},
+                                    ensure_ascii=False, separators=(',', ':'))
+            size = sum(len(k) + len(v.encode()) for k, v in out.items())
+            if size <= BUDGET:
+                break
+        else:
+            print(f'{name}: OVERFLOW {size} bytes for {d} even at tightest caps; dropping oldest chats')
+            for k in sorted((k for k in out if k.startswith('s.')),
+                            key=lambda k: json.loads(out[k])['messages'][0].get('ts') or 0 if json.loads(out[k])['messages'] else 0):
+                if size <= BUDGET:
+                    break
+                size -= len(k) + len(out.pop(k).encode())
+        cm['data'] = out
+        k8s('PUT', f'/api/v1/namespaces/{NS}/configmaps/{name}', cm)
+        print(f'{name}: {d} holds {sum(1 for k in out if k.startswith("s."))} chats, {size} bytes, caps {out["caps"]}')
+    print('== hermes-chat-archive done')
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hermes-chat-archive
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 600
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hermes-chat-archive
+            entity: ssint
+            env: main
+            capability: ai
+            scheduling.simplesalt.company/class: work
+        spec:
+          serviceAccountName: hermes-chat-archive
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: archive
+              image: python:3.12-alpine
+              command: ["python3", "/script/archive.py"]
+              env:
+                - name: HERMES_URL
+                  value: "http://hermes-agent-web:8642"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: API_SERVER_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: hermes-secrets
+                      key: HERMES_BEARER_TOKEN
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 64Mi
+                limits:
+                  memory: 256Mi
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+          volumes:
+            - name: script
+              configMap:
+                name: hermes-chat-archive-script
