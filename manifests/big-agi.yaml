@@ -499,7 +499,8 @@ data:
       if (document.body) mount(); else document.addEventListener('DOMContentLoaded', mount);
     })();
   nav.js: |
-    // Trims big-AGI down to chat, and adds a Hermes console link.
+    // Trims big-AGI down to chat, adds a Hermes console link, and brands the
+    // tab as SS chat with the Simple Salt mark.
     // Hidden: the Call app, the Apps & Tools menu, the Discord and GitHub
     // links, and the Beam and Call buttons by the chat box. The Hermes link
     // opens hermes.simplesalt.company in a new tab. big-AGI re-renders its nav
@@ -509,6 +510,10 @@ data:
       window.__ssNav = true;
       const HERMES_URL = 'https://hermes.simplesalt.company/';
       const ICON = '<path d="M3 13h8V3H3zm0 8h8v-6H3zm10 0h8V11h-8zm0-18v6h8V3z"/>';
+      const TITLE = 'SS chat';
+      // The Simple Salt mark: a hollow square in the brand blue, as on simple-salt.com.
+      const FAVICON = 'data:image/svg+xml,' + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect x="9" y="9" width="82" height="82" fill="none" stroke="#5c99ad" stroke-width="18"/></svg>');
 
       // The shortcuts bar above the chat box starts off, once per browser, so
       // turning it back on in Settings > Labs sticks. This runs before big-AGI
@@ -567,16 +572,31 @@ data:
         discord.parentElement.insertBefore(a, discord);
       }
 
+      // Tab title and icon. big-AGI sets both itself, so they are put back each time.
+      function tab() {
+        if (document.title !== TITLE) document.title = TITLE;
+        const icons = document.querySelectorAll('link[rel~="icon"]');
+        if (icons.length === 1 && icons[0].getAttribute('href') === FAVICON) return;
+        icons.forEach((l) => l.remove());
+        const l = document.createElement('link');
+        l.rel = 'icon';
+        l.type = 'image/svg+xml';
+        l.href = FAVICON;
+        document.head.appendChild(l);
+      }
+
       let queued = false;
       const run = () => {
         queued = false;
-        try { desktopLink(); mobileItems(); } catch (_) {}
+        try { tab(); desktopLink(); mobileItems(); } catch (_) {}
       };
       const start = () => {
         run();
-        new MutationObserver(() => {
+        const mo = new MutationObserver(() => {
           if (!queued) { queued = true; requestAnimationFrame(run); }
-        }).observe(document.body, { childList: true, subtree: true });
+        });
+        mo.observe(document.body, { childList: true, subtree: true });
+        mo.observe(document.head, { childList: true, subtree: true, characterData: true });
       };
       if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
     })();
@@ -603,7 +623,7 @@ spec:
         env: main
         capability: ai
       annotations:
-        gate-script-sha: 897bc2491b035f25
+        gate-script-sha: a22dcf0beecfff49
     spec:
       containers:
         - name: big-agi
