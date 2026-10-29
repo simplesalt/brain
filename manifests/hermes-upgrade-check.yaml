@@ -71,7 +71,7 @@ data:
         model = 'hermes-agent'
     print(f'== model: {model}')
 
-    prompt = (
+    prompt = os.environ.get('CHECK_PROMPT') or (
         'Upgrade health check. Make exactly these read-only tool calls, one each, and then reply with one line per call '
         'in the form "<tool>: OK" or "<tool>: FAILED <reason>": '
         '1) hindsight recall for "gbrain upgrade"; '
@@ -157,13 +157,21 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "approvals-off-2026-10-29"
+              value: "duxsoup-read-2026-10-29"
+            - name: CHECK_PROMPT
+              value: >-
+                Dux-Soup access check. Read only, do not write, send or change anything.
+                1) List the gbrain sources. 2) For the person Naman Shukla in gbrain, read
+                the original Dux-Soup data stored with the page and its timeline, and say
+                what the latest Dux-Soup event is (type and date) and whether any LinkedIn
+                connect invite or accept is recorded. 3) Say whether any call was refused,
+                quoting the exact error if so.
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: PROXY_URL
               value: "http://hermes-proxy:8000"
             - name: CHECK_DELAY
-              value: "0"
+              value: "120"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: API_SERVER_KEY
