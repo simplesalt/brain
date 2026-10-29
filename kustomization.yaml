@@ -39,6 +39,7 @@ configMapGenerator:
       - skill-github-projects--gh_projects.py=manifests/hermes-skills/github-projects--gh_projects.py
       - skill-note-capture.md=manifests/hermes-skills/note-capture.md
       - skill-catch-up.md=manifests/hermes-skills/catch-up.md
+      - skill-miss-report.md=manifests/hermes-skills/miss-report.md
       - cron-people-scan.py=manifests/hermes-skills/cron-people-scan.py
       - cron-people-scan.md=manifests/hermes-skills/cron-people-scan.md
       - cron-deletion-review.py=manifests/hermes-skills/cron-deletion-review.py
