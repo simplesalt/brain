@@ -56,6 +56,8 @@ memory:
   provider: hindsight
   memory_enabled: false
   user_profile_enabled: false
+approvals:
+  mode: "off"
 skills:
   write_approval: true
   creation_nudge_interval: 0
