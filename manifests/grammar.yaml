@@ -2,8 +2,7 @@
 # Grammar fix service: one POST method, text in, corrected text out, at
 # https://api.simplesalt.company/45e6451afc312886/grammar (its authoritative address). Signed-in
 # callers only (Cloudflare Access, in the same app as Big AGI); Big AGI's Aa
-# button reaches it in-cluster through Big AGI's gate, which passes on the
-# chat's Access JWT, so a separate cookie for this host is never needed.
+# button calls it directly with that one sign-in.
 # Filled by a person out of band, key OPENROUTER_API_KEY: a dedicated OpenRouter
 # key with a low spending limit. Flux merges so reconciliation never wipes it.
 apiVersion: v1
