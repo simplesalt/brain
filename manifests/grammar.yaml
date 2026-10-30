@@ -38,10 +38,11 @@ data:
     # Its authoritative address is https://api.simplesalt.company<BASE_PATH>, behind
     # Cloudflare Access; the Access JWT is verified here too. Browser pages on
     # ALLOWED_ORIGINS (Big AGI's grammar button) call it directly with the Access
-    # cookie; GET BASE_PATH is a sign-in page they open once if that cookie is missing.
+    # cookie; GET BASE_PATH is a sign-in page they open once if that cookie is missing,
+    # and GET BASE_PATH?return=<url on ALLOWED_ORIGINS> sends the browser back there.
     # It owns its OpenRouter key; /healthz is unready until the key is filled, and the
     # key is re-read on each use.
-    import base64, hashlib, hmac, json, os, threading, time, http.server, urllib.error, urllib.request
+    import base64, hashlib, hmac, json, os, threading, time, http.server, urllib.error, urllib.parse, urllib.request
 
     PORT = int(os.environ.get('PORT', '8000'))
     JWT_HEADER = 'Cf-Access-Jwt-Assertion'
@@ -181,9 +182,26 @@ data:
             self.send_header('Content-Length', '0')
             self.end_headers()
 
+        def _return_to(self):
+            """The ?return= URL when it is on an allowed origin, else None."""
+            q = urllib.parse.urlsplit(self.path).query
+            url = (urllib.parse.parse_qs(q).get('return') or [''])[0]
+            if any(ord(c) < 0x21 or ord(c) == 0x7f for c in url):
+                return None
+            u = urllib.parse.urlsplit(url)
+            return url if u.scheme == 'https' and f'https://{u.netloc}' in ALLOWED_ORIGINS else None
+
         def do_GET(self):
             if self.path.split('?', 1)[0] == BASE_PATH:
                 if verify_access_jwt(self.headers.get(JWT_HEADER, '')):
+                    back = self._return_to()
+                    if back:
+                        self.send_response(302)
+                        self.send_header('Location', back)
+                        self.send_header('Cache-Control', 'no-store')
+                        self.send_header('Content-Length', '0')
+                        self.end_headers()
+                        return
                     self._send(200, SIGNED_IN_PAGE, 'text/html; charset=utf-8')
                 else:
                     self._reply(401, {'error': 'not signed in'})
@@ -267,7 +285,7 @@ spec:
         capability: voice
       # The script is read only at start; its hash here restarts the pod when it changes.
       annotations:
-        grammar-script-sha: 2f20df28a166781d
+        grammar-script-sha: c41998ba13e59ad1
     spec:
       containers:
         - name: grammar
