@@ -128,6 +128,9 @@ new leaves it in gbrain:
   links and `expected_revision`.
 - Never leave placeholder text such as "Unknown relationship" or
   "[To be filled]". A page's first line should say who the person is.
+- After you create or update several person pages at once (a meeting, an
+  email thread, a list Dylan pasted), run steps 1–3 for each one you touched
+  and fill its role, company and how Dylan knows them before you finish.
 
 ## Anti-patterns
 
