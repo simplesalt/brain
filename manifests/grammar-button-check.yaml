@@ -7,7 +7,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: grammar-button-check-6
+  name: grammar-button-check-7
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -29,7 +29,7 @@ spec:
           image: mcr.microsoft.com/playwright/python:v1.48.0-jammy
           # The image carries the browsers but not the Python package; the wait lets
           # the new scripts reach big-AGI's pod first.
-          command: ["sh", "-c", "pip install -q --root-user-action=ignore playwright==1.48.0 && sleep 30 && python -c \"$CHECK\""]
+          command: ["sh", "-c", "pip install -q --root-user-action=ignore playwright==1.48.0 && sleep 120 && python -c \"$CHECK\""]
           env:
             - name: CHECK
               value: |

@@ -1027,10 +1027,10 @@ data:
       }
 
       // Refresh sign-in, last in the chat list's View options menu (the same menu
-      // on desktop and in the phone drawer), recognized by its Group by items.
+      // on desktop and in the phone drawer), recognized by its Group By section.
       function refreshItem() {
         for (const menu of document.querySelectorAll('[role="menu"]')) {
-          if (menu.querySelector('.ss-refresh') || !/Group by date/.test(menu.textContent)) continue;
+          if (menu.querySelector('.ss-refresh') || !/Group By/.test(menu.textContent)) continue;
           const like = menu.querySelector('[role="menuitem"]');
           const li = document.createElement('li');
           li.setAttribute('role', 'menuitem');
