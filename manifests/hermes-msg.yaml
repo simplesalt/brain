@@ -420,6 +420,7 @@ data:
 
 
     const VISIT_CAMPAIGN_ID = process.env.DUXSOUP_VISIT_CAMPAIGN_ID ?? 'lookup-visits';
+    const ACTION_CAMPAIGN_ID = process.env.DUXSOUP_ACTION_CAMPAIGN_ID ?? 'integrated';
     const LINKEDIN_PROFILE_RE = /^https:\/\/([a-z]{2,3}\.)?linkedin\.com\/(in|sales\/lead|sales\/people)\/[^\s/?#]+/i;
 
     function duxSign(payload) {
@@ -513,10 +514,11 @@ data:
         if (rest[key] !== undefined) params[key] = rest[key];
       }
       // The extension skips queued commands with no real campaign (Dux-Soup files them
-      // under 'default', which this account lacks). 'lookup-visits' is Dylan's
-      // single-step Visit campaign, so it adds nothing beyond the queued command;
-      // every command but enroll runs under it.
-      if (command !== 'enroll') params.campaignid = VISIT_CAMPAIGN_ID;
+      // under 'default', which this account lacks). Visits run in 'lookup-visits',
+      // Dylan's single-step Visit campaign; everything else but enroll runs in
+      // 'integrated', the campaign Hermes's test messages to Russ went out under.
+      if (command === 'visit') params.campaignid = VISIT_CAMPAIGN_ID;
+      else if (command !== 'enroll') params.campaignid = ACTION_CAMPAIGN_ID;
       const data = await duxPost('/queue', { command, params });
       return { message_id: data.id ?? data.messageid ?? 'queued', command, status: 'queued' };
     }
@@ -757,7 +759,7 @@ data:
             messagetext:    { type: 'string', description: 'Message body (required for message and inmail; optional connection note for connect)' },
             messagesubject: { type: 'string', description: 'InMail subject line (required for inmail)' },
             tags:           { type: 'array', items: { type: 'string' }, description: 'Tag names (required for tag/untag)' },
-            campaignid:     { type: 'string', description: "Campaign to enroll into (enroll only; every other command always runs under the visit-only 'lookup-visits' campaign)" },
+            campaignid:     { type: 'string', description: "Campaign to enroll into (enroll only; visit always runs under 'lookup-visits', every other command under 'integrated')" },
             force:          { type: 'boolean', description: 'Bypass Dux Soup throttling/dedupe safeguards' },
             runafter:       { type: 'string', description: 'ISO8601 timestamp; do not execute before this time' },
           },
@@ -912,7 +914,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "9"
+        simplesalt.company/restart-epoch: "10"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
