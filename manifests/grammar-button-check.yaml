@@ -6,7 +6,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: grammar-button-check-1
+  name: grammar-button-check-2
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -26,7 +26,8 @@ spec:
       containers:
         - name: check
           image: mcr.microsoft.com/playwright/python:v1.48.0-jammy
-          command: ["python", "-c", "$(CHECK)"]
+          # The image carries the browsers but not the Python package.
+          command: ["sh", "-c", "pip install -q playwright==1.48.0 && python -c \"$CHECK\""]
           env:
             - name: CHECK
               value: |
