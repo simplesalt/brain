@@ -1,0 +1,103 @@
+---
+# One-off check of SS chat's grammar button and Sign out in a browser with no
+# cookies, at a phone and a desktop screen size. Cloudflare is not in this path,
+# so the API host is stood in for: the first call fails as it does without the
+# API host's cookie, the sign-in pass-through returns as a signed-in one would,
+# and the retry answers.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: grammar-button-check-3
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: check
+          image: mcr.microsoft.com/playwright/python:v1.48.0-jammy
+          # The image carries the browsers but not the Python package.
+          command: ["sh", "-c", "pip install -q playwright==1.48.0 && python -c \"$CHECK\""]
+          env:
+            - name: CHECK
+              value: |
+                import json, urllib.parse
+                from playwright.sync_api import sync_playwright
+                BASE = 'http://big-agi:3000'
+                API = 'https://api.simplesalt.company/45e6451afc312886/grammar'
+                TEXT = 'hello. this is a test. of the grammar button'
+                FIXED = 'Hello, this is a test of the grammar button.'
+                ok = True
+                with sync_playwright() as p:
+                    b = p.chromium.launch()
+                    for name, opts in (('phone', dict(viewport={'width': 390, 'height': 844}, is_mobile=True, has_touch=True)),
+                                       ('desktop', dict(viewport={'width': 1280, 'height': 800}))):
+                        ctx = b.new_context(**opts)
+                        print(name, 'cookies at start:', ctx.cookies())
+                        seen = {'post': 0, 'hop': None, 'logout': 0}
+                        def api(route, req):
+                            if req.method == 'OPTIONS':
+                                return route.fulfill(status=204, headers={'Access-Control-Allow-Origin': BASE, 'Access-Control-Allow-Credentials': 'true',
+                                                                          'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'content-type'})
+                            if req.method == 'POST':
+                                seen['post'] += 1
+                                if seen['post'] == 1:
+                                    return route.abort('failed')
+                                return route.fulfill(status=200, content_type='application/json', body=json.dumps({'text': FIXED}),
+                                                     headers={'Access-Control-Allow-Origin': BASE, 'Access-Control-Allow-Credentials': 'true'})
+                            back = urllib.parse.parse_qs(urllib.parse.urlsplit(req.url).query).get('return', [''])[0]
+                            seen['hop'] = back
+                            return route.fulfill(status=302, headers={'Location': back})
+                        ctx.route(API + '*', api)
+                        def logout(route, req):
+                            seen['logout'] += 1
+                            route.fulfill(status=200, body='')
+                        ctx.route('**/cdn-cgi/access/logout*', logout)
+                        page = ctx.new_page()
+                        page.goto(BASE + '/', wait_until='networkidle', timeout=90000)
+                        page.wait_for_selector('#stt-fix', state='visible', timeout=60000)
+                        page.locator('textarea:visible').last.fill(TEXT)
+                        btn = page.locator('#stt-fix')
+                        btn.tap() if name == 'phone' else btn.click()
+                        page.wait_for_function('t => [...document.querySelectorAll("textarea")].some(x => x.value === t)', arg=FIXED, timeout=60000)
+                        box = page.locator('textarea:visible').last.input_value()
+                        print(name, 'calls:', seen['post'], 'returned to:', seen['hop'], 'chat box:', box)
+                        fixed = seen['post'] == 2 and (seen['hop'] or '').startswith(BASE) and box == FIXED
+                        # Sign out: desktop rail button, or the phone drawer's link.
+                        if name == 'phone':
+                            labels = page.eval_on_selector_all('button', 'bs => bs.filter(b => b.offsetParent).map(b => b.getAttribute("aria-label") || b.innerText.slice(0, 20))')
+                            print(name, 'visible buttons:', labels)
+                            opener = page.locator('button[aria-label*="enu" i], button[aria-label*="drawer" i], button[aria-label*="navigation" i]').first
+                            opener.click()
+                            item = page.locator('a.ss-pane-m', has_text='Sign out')
+                        else:
+                            item = page.locator('#desktop-nav button.ss-signout')
+                        item.wait_for(state='visible', timeout=15000)
+                        with page.expect_event('load', timeout=30000):
+                            item.click()
+                        print(name, 'sign out called logout:', seen['logout'], 'and reloaded')
+                        passed = fixed and seen['logout'] == 1
+                        print(name, 'PASS' if passed else 'FAIL')
+                        ok = ok and passed
+                        ctx.close()
+                    b.close()
+                print('RESULT', 'PASS' if ok else 'FAIL')
+                raise SystemExit(0 if ok else 1)
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
