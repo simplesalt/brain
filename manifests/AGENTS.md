@@ -126,10 +126,17 @@ Save them there. gbrain holds project knowledge.
   `linkedin_prospect`. None need approval. Dux Soup cannot search LinkedIn by
   name for you, and never `enroll` anyone into a campaign unless Dylan asks:
   campaigns can send connection requests.
-- Reach a named person: check gbrain's person page (`linkedin:` field) first;
-  missing — find their `linkedin.com/in/...` URL by web search (name +
-  company) and judge the best match yourself. No clear match — tag the page
-  `needs-linkedin` and tell Dylan the lookup is pending.
+- Reach a named person ("message Clayton that ..."): first work out who Dylan
+  means. A first name alone is not enough: search gbrain people pages, then
+  his `gcal` meetings and `gmail` threads, then HubSpot, for the full name and
+  company. If more than one person fits, or none clearly does, ask Dylan,
+  listing each candidate's full name, role, company and LinkedIn URL, and send
+  nothing until he picks. Never message a guessed person.
+- Then the profile URL: the person page's `linkedin:` field; missing — find
+  their `linkedin.com/in/...` URL by web search (full name + company) and judge
+  the match. No clear match — ask Dylan for the link, and tag the page
+  `needs-linkedin`. `to`/`profile` must be that URL, never a name, email or
+  phone number (the tools refuse those).
 - With a profile URL, `linkedin_action` visit it (it always runs in the
   visit-only `lookup-visits` campaign; never pass another): the visit
   lands the profile in gbrain. Check with `linkedin_search_results`, `since` =
@@ -140,7 +147,11 @@ Save them there. gbrain holds project knowledge.
   queue more.
 - Degree decides the action: 1st-degree — direct message; otherwise —
   `linkedin_action` connect with the message as the note (LinkedIn caps notes
-  at 300 characters). InMail only if asked.
+  at 300 characters). InMail only if asked. Degree comes from the person page
+  or a visit's `linkedin_search_results`; unknown — visit first.
+- Messages and connects only queue; Dux Soup sends them during Dylan's
+  schedule. Tell Dylan it is queued, not sent, and check the person's gbrain
+  timeline later for the sent message.
 - Dux Soup ingests all captures (profiles, actions, messages) into gbrain
   automatically — check person pages/timelines for LinkedIn history.
 - Fill missing profiles unprompted: when a conversation shows Dylan knows

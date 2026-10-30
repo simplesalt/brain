@@ -413,33 +413,14 @@ data:
         if (verb === 'reply') {
           console.warn(`linkedin verb=reply: conversation_id=${conversation_id} noted; Dux Soup sends as new DM to ${to}`);
         }
-        const targeturl = `${DUXSOUP_BASE_URL}/xapi/remote/control/${DUXSOUP_USER_ID}/queue`;
-        const body = JSON.stringify({
-          targeturl,
-          timestamp: Date.now(),
-          userid: DUXSOUP_USER_ID,
-          command: 'message',
-          params: { profile: to, messagetext: message, campaignid: 'integrated' },
-        });
-        const signature = createHmac('sha1', DUXSOUP_API_KEY).update(body).digest('base64');
-        const r = await fetch(targeturl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Dux-Signature': signature },
-          body,
-        });
-        if (!r.ok) throw new Error(`Dux Soup ${r.status}: ${await r.text()}`);
-        const data = await r.json().catch(() => ({}));
-        return {
-          message_id: data.id ?? data.messageid ?? 'queued',
-          channel: 'linkedin',
-          status: 'queued',
-          url: to,
-        };
+        const res = await linkedinAction({ command: 'message', profile: to, messagetext: message });
+        return { message_id: res.message_id, channel: 'linkedin', status: 'queued', url: to };
       },
     };
 
 
     const VISIT_CAMPAIGN_ID = process.env.DUXSOUP_VISIT_CAMPAIGN_ID ?? 'lookup-visits';
+    const LINKEDIN_PROFILE_RE = /^https:\/\/([a-z]{2,3}\.)?linkedin\.com\/(in|sales\/lead|sales\/people)\/[^\s/?#]+/i;
 
     function duxSign(payload) {
       return createHmac('sha1', DUXSOUP_API_KEY).update(payload).digest('base64');
@@ -514,19 +495,28 @@ data:
       const spec = LINKEDIN_ACTION_COMMANDS[command];
       if (!spec) throw new Error(`Unsupported linkedin_action command: ${command}`);
       if (!profile) throw new Error('profile (LinkedIn profile URL) required');
+      // A phone number or bare name queues fine but can never run, and only a reset
+      // (which drops the whole queue) removes it.
+      if (!LINKEDIN_PROFILE_RE.test(profile)) {
+        throw new Error(`profile must be a LinkedIn profile URL (https://www.linkedin.com/in/...), got: ${profile}`);
+      }
       for (const key of spec.required) {
         const v = rest[key];
         const missing = key === 'tags' ? (!Array.isArray(v) || !v.length) : (v === undefined || v === null || v === '');
         if (missing) throw new Error(`${key} required for command=${command}`);
       }
+      if (command === 'connect' && (rest.messagetext ?? '').length > 300) {
+        throw new Error(`connect note is ${rest.messagetext.length} characters; LinkedIn allows 300`);
+      }
       const params = { profile };
       for (const key of [...spec.required, ...spec.optional]) {
         if (rest[key] !== undefined) params[key] = rest[key];
       }
-      // The extension ignores queued visits with no real campaign (Dux-Soup files them
+      // The extension skips queued commands with no real campaign (Dux-Soup files them
       // under 'default', which this account lacks). 'lookup-visits' is Dylan's
-      // single-step Visit campaign, so a visit can never trigger a connect or message.
-      if (command === 'visit') params.campaignid = VISIT_CAMPAIGN_ID;
+      // single-step Visit campaign, so it adds nothing beyond the queued command;
+      // every command but enroll runs under it.
+      if (command !== 'enroll') params.campaignid = VISIT_CAMPAIGN_ID;
       const data = await duxPost('/queue', { command, params });
       return { message_id: data.id ?? data.messageid ?? 'queued', command, status: 'queued' };
     }
@@ -767,7 +757,7 @@ data:
             messagetext:    { type: 'string', description: 'Message body (required for message and inmail; optional connection note for connect)' },
             messagesubject: { type: 'string', description: 'InMail subject line (required for inmail)' },
             tags:           { type: 'array', items: { type: 'string' }, description: 'Tag names (required for tag/untag)' },
-            campaignid:     { type: 'string', description: "Campaign to attribute the action to (required for enroll; ignored for visit, which always uses the visit-only 'lookup-visits' campaign)" },
+            campaignid:     { type: 'string', description: "Campaign to enroll into (enroll only; every other command always runs under the visit-only 'lookup-visits' campaign)" },
             force:          { type: 'boolean', description: 'Bypass Dux Soup throttling/dedupe safeguards' },
             runafter:       { type: 'string', description: 'ISO8601 timestamp; do not execute before this time' },
           },
@@ -922,7 +912,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "8"
+        simplesalt.company/restart-epoch: "9"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
