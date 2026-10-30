@@ -7,7 +7,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: grammar-button-check-5
+  name: grammar-button-check-6
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -29,7 +29,7 @@ spec:
           image: mcr.microsoft.com/playwright/python:v1.48.0-jammy
           # The image carries the browsers but not the Python package; the wait lets
           # the new scripts reach big-AGI's pod first.
-          command: ["sh", "-c", "pip install -q --root-user-action=ignore playwright==1.48.0 && sleep 120 && python -c \"$CHECK\""]
+          command: ["sh", "-c", "pip install -q --root-user-action=ignore playwright==1.48.0 && sleep 30 && python -c \"$CHECK\""]
           env:
             - name: CHECK
               value: |
@@ -80,7 +80,18 @@ spec:
                         fixed = seen['post'] == 2 and (seen['hop'] or '').startswith(BASE) and FIXED in box
                         # Refresh sign-in: in the chat list's View options menu, not on screen.
                         on_screen = page.evaluate('[...document.querySelectorAll("button,a")].filter(e => e.offsetParent).some(e => /Refresh sign-in|Sign out/.test(e.innerText + (e.getAttribute("aria-label") || "")))')
-                        page.evaluate('document.querySelector(\'button[aria-label="View options"]\').click()')
+                        view = page.locator('button[aria-label="View options"]:visible')
+                        if name == 'phone' and not view.count():
+                            # The phone's chat list is in the drawer, opened by the top bar's first button.
+                            page.locator('button:visible').first.click()
+                            page.wait_for_timeout(1000)
+                        print(name, 'View options visible:', view.count(), flush=True)
+                        try:
+                            view.first.click(timeout=10000)
+                        except Exception as e:
+                            print(name, 'View options click failed:', str(e)[:100], flush=True)
+                        page.wait_for_timeout(1000)
+                        print(name, 'menus:', page.evaluate('[...document.querySelectorAll(\'[role="menu"]\')].map(m => m.textContent.slice(0, 80))'), flush=True)
                         item = page.locator('[role="menu"] .ss-refresh')
                         found = True
                         try:
