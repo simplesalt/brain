@@ -752,7 +752,7 @@ data:
         let hopped = 0;
         try { hopped = +sessionStorage.getItem(HOPPED_KEY) || 0; } catch (_) {}
         if (Date.now() - hopped < 2 * 60 * 1000) {
-          toast('Grammar fix still needs a sign-in. Use Sign out in the menu, then sign back in.', 8000);
+          toast('Grammar fix still needs a sign-in. Pick Refresh sign-in in the chat list\'s View options menu.', 8000);
           return;
         }
         try {
@@ -762,17 +762,22 @@ data:
         toast('Signing in to the grammar fix…', 0);
         location.href = GRAMMAR_URL + '?return=' + encodeURIComponent(location.href);
       }
-      // Back from that sign-in: put the text back and retry once.
+      // Back from that sign-in: put the text back and retry once. big-AGI restores
+      // its own (empty) draft as the chat loads, so this waits for that to settle.
+      let resuming = false;
       function resumeHop() {
+        if (resuming) return;
         let hop = null;
         try { hop = JSON.parse(sessionStorage.getItem(HOP_KEY) || 'null'); } catch (_) {}
-        if (!hop) return;
-        const ta = field();
-        if (!ta) return;
-        try { sessionStorage.removeItem(HOP_KEY); } catch (_) {}
-        if (Date.now() - hop.at > 5 * 60 * 1000 || !hop.text) return;
-        if (!ta.value.trim()) setText(ta, hop.text);
-        setTimeout(() => fix.click(), 300);
+        if (!hop || !field()) return;
+        resuming = true;
+        setTimeout(() => {
+          try { sessionStorage.removeItem(HOP_KEY); } catch (_) {}
+          const ta = field();
+          if (!ta || Date.now() - hop.at > 5 * 60 * 1000 || !hop.text) return;
+          if (!ta.value.trim()) setText(ta, hop.text);
+          fix.click();
+        }, 1500);
       }
       const fix = document.createElement('button');
       fix.id = 'stt-fix';
@@ -907,7 +912,7 @@ data:
     // app, the Apps & Tools menu, the Discord and GitHub links, and the Beam and
     // Call buttons by the chat box. On phones the drawer gets Admin and Brain
     // links that open the same pane full screen, with a bar back to the chat.
-    // Both layouts also get Sign out.
+    // The chat list's View options menu also gets Refresh sign-in.
     // big-AGI re-renders its nav freely, so hiding is CSS and our buttons are
     // re-added whenever they go missing.
     (() => {
@@ -978,10 +983,10 @@ data:
         if (b && !b.classList.contains('ss-pane-btn')) setPane(null);
       }, true);
 
-      // Sign out: ends this site's Access session, then reloads, so the next load
-      // signs in again and Access re-sets its cookie on every host in the app.
-      const SIGN_OUT_ICON = '<path d="M10.09 15.59 11.5 17l5-5-5-5-1.41 1.41L12.67 11H3v2h9.67zM19 3H5c-1.11 0-2 .9-2 2v4h2V5h14v14H5v-4H3v4c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2"/>';
-      async function signOut(e) {
+      // Refresh sign-in: drops this site's cached Access sign-in and reloads, so the
+      // load signs in again and Access re-sets its cookie on every host in the app.
+      // A stopgap, to be removed once sign-in is clean (simplesalt/projects#809).
+      async function refreshSignIn(e) {
         e?.preventDefault();
         try { await fetch('/cdn-cgi/access/logout', { credentials: 'same-origin', redirect: 'manual', cache: 'no-store' }); } catch (_) {}
         location.reload();
@@ -996,7 +1001,7 @@ data:
         }
         document.documentElement.style.setProperty('--ss-nav-w', nav.getBoundingClientRect().right + 'px');
         const chat = nav.querySelector('.NavButton-typeApp:not(.ss-pane-btn)');
-        const gear = nav.lastElementChild && nav.lastElementChild.querySelector('button.NavButton-typeLink:not(.NavButton-active):not(.ss-signout)');
+        const gear = nav.lastElementChild && nav.lastElementChild.querySelector('button.NavButton-typeLink:not(.NavButton-active)');
         if (!chat || !gear) return;
         let prev = chat;
         for (const p of PANES) {
@@ -1019,24 +1024,26 @@ data:
           if (btn.className !== want) btn.className = want;
           prev = btn;
         }
-        // Sign out sits just above the settings gear.
-        let out = nav.querySelector('.ss-signout');
-        if (!out) {
-          out = document.createElement('button');
-          out.type = 'button';
-          out.title = 'Sign out';
-          out.setAttribute('aria-label', 'Sign out');
-          const svg = gear.querySelector('svg');
-          out.innerHTML = `<svg class="${svg ? svg.getAttribute('class') : ''}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${SIGN_OUT_ICON}</svg>`;
-          out.addEventListener('click', signOut);
+      }
+
+      // Refresh sign-in, last in the chat list's View options menu (the same menu
+      // on desktop and in the phone drawer), recognized by its Group by items.
+      function refreshItem() {
+        for (const menu of document.querySelectorAll('[role="menu"]')) {
+          if (menu.querySelector('.ss-refresh') || !/Group by date/.test(menu.textContent)) continue;
+          const like = menu.querySelector('[role="menuitem"]');
+          const li = document.createElement('li');
+          li.setAttribute('role', 'menuitem');
+          li.tabIndex = -1;
+          li.className = (like ? like.className.replace(/\s*Mui-\S+/g, '') : '') + ' ss-refresh';
+          li.textContent = 'Refresh sign-in';
+          li.addEventListener('click', refreshSignIn);
+          menu.appendChild(li);
         }
-        if (out.nextElementSibling !== gear) gear.before(out);
-        const outLook = gear.className.replace(/\s*ss-\S+/g, '') + ' ss-signout';
-        if (out.className !== outLook) out.className = outLook;
       }
 
       // Mobile drawer: keep only the Chat app, drop the News and Models buttons
-      // (text only, no other mark), and put Admin, Brain and Sign out where Discord was.
+      // (text only, no other mark), and put Admin and Brain where Discord was.
       function mobileItems() {
         document.querySelectorAll('nav.MuiButtonGroup-root > button').forEach((b) => {
           if (!b.closest('#desktop-nav') && !/^\s*Chat/.test(b.innerText)) b.classList.add('ss-nav-hidden');
@@ -1059,12 +1066,6 @@ data:
           });
           discord.parentElement.insertBefore(a, discord);
         }
-        const out = document.createElement('a');
-        out.className = discord.className + ' ss-pane-m';
-        out.href = '/cdn-cgi/access/logout';
-        out.textContent = 'Sign out';
-        out.addEventListener('click', signOut);
-        discord.parentElement.insertBefore(out, discord);
       }
 
       // Tab title and icon. big-AGI sets both itself, so they are put back each time.
@@ -1083,7 +1084,7 @@ data:
       let queued = false;
       const run = () => {
         queued = false;
-        try { tab(); desktopPanes(); mobileItems(); } catch (_) {}
+        try { tab(); desktopPanes(); mobileItems(); refreshItem(); } catch (_) {}
       };
       const start = () => {
         run();

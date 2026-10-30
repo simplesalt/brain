@@ -1,13 +1,13 @@
 ---
-# One-off check of SS chat's grammar button in a browser with no cookies, at a
-# phone and a desktop screen size, plus a look at the page's menus. Cloudflare
-# is not in this path, so the API host is stood in for: the first call fails as
-# it does without the API host's cookie, the sign-in pass-through returns as a
-# signed-in one would, and the retry answers.
+# One-off check of SS chat's grammar button and Refresh sign-in in a browser with
+# no cookies, at a phone and a desktop screen size. Cloudflare is not in this
+# path, so the API host is stood in for: the first call fails as it does without
+# the API host's cookie, the sign-in pass-through returns as a signed-in one
+# would, and the retry answers.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: grammar-button-check-4
+  name: grammar-button-check-5
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -27,8 +27,9 @@ spec:
       containers:
         - name: check
           image: mcr.microsoft.com/playwright/python:v1.48.0-jammy
-          # The image carries the browsers but not the Python package.
-          command: ["sh", "-c", "pip install -q --root-user-action=ignore playwright==1.48.0 && python -c \"$CHECK\""]
+          # The image carries the browsers but not the Python package; the wait lets
+          # the new scripts reach big-AGI's pod first.
+          command: ["sh", "-c", "pip install -q --root-user-action=ignore playwright==1.48.0 && sleep 120 && python -c \"$CHECK\""]
           env:
             - name: CHECK
               value: |
@@ -38,8 +39,6 @@ spec:
                 API = 'https://api.simplesalt.company/45e6451afc312886/grammar'
                 TEXT = 'hello. this is a test. of the grammar button'
                 FIXED = 'Hello, this is a test of the grammar button.'
-                VISIBLE = '''sel => [...document.querySelectorAll(sel)].filter(e => e.offsetParent || e.getClientRects().length)
-                  .map(e => (e.getAttribute('aria-label') || e.getAttribute('title') || e.innerText || '').trim().slice(0, 30))'''
                 ok = True
                 with sync_playwright() as p:
                     b = p.chromium.launch()
@@ -47,7 +46,7 @@ spec:
                                        ('desktop', dict(viewport={'width': 1280, 'height': 800}))):
                         ctx = b.new_context(**opts)
                         print(name, 'cookies at start:', ctx.cookies(), flush=True)
-                        seen = {'post': 0, 'hop': None}
+                        seen = {'post': 0, 'hop': None, 'logout': 0}
                         cors = {'Access-Control-Allow-Origin': BASE, 'Access-Control-Allow-Credentials': 'true'}
                         def api(route, req):
                             if req.method == 'OPTIONS':
@@ -61,11 +60,12 @@ spec:
                             seen['hop'] = back
                             return route.fulfill(status=302, headers={'Location': back})
                         ctx.route(API + '*', api)
+                        def logout(route, req):
+                            seen['logout'] += 1
+                            route.fulfill(status=200, body='')
+                        ctx.route('**/cdn-cgi/access/logout*', logout)
                         page = ctx.new_page()
-                        page.on('console', lambda m: print(name, 'console:', m.type, m.text[:200], flush=True) if m.type in ('error', 'warning') else None)
                         page.goto(BASE + '/', wait_until='networkidle', timeout=90000)
-                        mic = page.evaluate('fetch([...document.scripts].find(s => s.src.includes("mic.js")).src).then(r => r.text())')
-                        print(name, 'button has sign-in pass-through:', 'signInAndRetry' in mic, flush=True)
                         page.wait_for_selector('#stt-fix', state='visible', timeout=60000)
                         page.locator('textarea:visible').last.fill(TEXT)
                         btn = page.locator('#stt-fix')
@@ -76,19 +76,23 @@ spec:
                             print(name, 'no fix landed:', str(e)[:100], flush=True)
                         toast = page.evaluate('document.getElementById("stt-toast")?.innerText || ""')
                         box = page.evaluate('[...document.querySelectorAll("textarea")].map(t => t.value)')
-                        print(name, 'calls:', seen['post'], 'returned to:', seen['hop'], 'url:', page.url, 'toast:', toast, 'boxes:', box, flush=True)
-                        passed = seen['post'] == 2 and (seen['hop'] or '').startswith(BASE) and FIXED in box
-                        # Menus on this layout, to pick where Refresh sign-in goes.
-                        print(name, 'visible buttons:', page.evaluate(VISIBLE, 'button'), flush=True)
-                        for label in page.evaluate(VISIBLE, 'button[aria-haspopup], button[aria-label*="enu" i], button[aria-label*="ption" i]'):
-                            try:
-                                page.locator(f'button[aria-label="{label}"]').first.click(timeout=5000)
-                                page.wait_for_timeout(800)
-                                print(name, 'menu', repr(label), '->', page.evaluate(VISIBLE, '[role="menu"] [role="menuitem"], [role="menu"] li, .MuiDrawer-root a, .MuiDrawer-root button'), flush=True)
-                                page.keyboard.press('Escape')
-                                page.wait_for_timeout(400)
-                            except Exception as e:
-                                print(name, 'menu', repr(label), 'not opened:', str(e)[:80], flush=True)
+                        print(name, 'grammar calls:', seen['post'], 'sign-in pass-through returned to:', seen['hop'], 'toast:', repr(toast), 'chat box:', box, flush=True)
+                        fixed = seen['post'] == 2 and (seen['hop'] or '').startswith(BASE) and FIXED in box
+                        # Refresh sign-in: in the chat list's View options menu, not on screen.
+                        on_screen = page.evaluate('[...document.querySelectorAll("button,a")].filter(e => e.offsetParent).some(e => /Refresh sign-in|Sign out/.test(e.innerText + (e.getAttribute("aria-label") || "")))')
+                        page.evaluate('document.querySelector(\'button[aria-label="View options"]\').click()')
+                        item = page.locator('[role="menu"] .ss-refresh')
+                        found = True
+                        try:
+                            item.wait_for(state='attached', timeout=10000)
+                            print(name, 'menu items:', page.evaluate('[...document.querySelectorAll(\'[role="menu"] [role="menuitem"]\')].map(e => e.innerText.trim()).slice(-4)'), flush=True)
+                            with page.expect_event('load', timeout=30000):
+                                page.evaluate('document.querySelector(\'[role="menu"] .ss-refresh\').click()')
+                        except Exception as e:
+                            found = False
+                            print(name, 'Refresh sign-in not found or did not reload:', str(e)[:100], flush=True)
+                        print(name, 'Refresh sign-in button on screen:', on_screen, 'in menu:', found, 'cleared sign-in:', seen['logout'], flush=True)
+                        passed = fixed and found and not on_screen and seen['logout'] == 1
                         print(name, 'PASS' if passed else 'FAIL', flush=True)
                         ok = ok and passed
                         ctx.close()
