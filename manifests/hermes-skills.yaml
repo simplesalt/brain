@@ -2,7 +2,6 @@ gbrain:
   - query
   - briefing
   - daily-task-prep
-  - resolve-before-asking
   - idea-lineage
   - repo-architecture
   - fact-check
@@ -34,5 +33,6 @@ local:
   - catch-up
   - miss-report
   - qr-code
+  - find-person
 simplesalt:
   - clarify

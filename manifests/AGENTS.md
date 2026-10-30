@@ -126,16 +126,11 @@ Save them there. gbrain holds project knowledge.
   `linkedin_prospect`. None need approval. Dux Soup cannot search LinkedIn by
   name for you, and never `enroll` anyone into a campaign unless Dylan asks:
   campaigns can send connection requests.
-- Reach a named person ("message Clayton that ..."): first work out who Dylan
-  means. A first name alone is not enough: search gbrain people pages, then
-  his `gcal` meetings and `gmail` threads, then HubSpot, for the full name and
-  company. If more than one person fits, or none clearly does, ask Dylan,
-  listing each candidate's full name, role, company and LinkedIn URL, and send
-  nothing until he picks. Never message a guessed person.
-- Then the profile URL: the person page's `linkedin:` field; missing — find
-  their `linkedin.com/in/...` URL by web search (full name + company) and judge
-  the match. No clear match — ask Dylan for the link, and tag the page
-  `needs-linkedin`. `to`/`profile` must be that URL, never a name, email or
+- Identifying or reaching anyone ("who is X?", "message Clayton that ...",
+  "tell X that ..."): load the `find-person` skill first. It finds who Dylan
+  means (gbrain, his mail and calendar, HubSpot, LinkedIn), asks him when more
+  than one person fits, and picks the channel. Never message a guessed person.
+  `to`/`profile` must be a `linkedin.com/in/...` URL, never a name, email or
   phone number (the tools refuse those).
 - With a profile URL, `linkedin_action` visit it (it always runs in the
   visit-only `lookup-visits` campaign; never pass another): the visit
