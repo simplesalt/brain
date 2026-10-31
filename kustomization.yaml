@@ -19,7 +19,7 @@ resources:
   - manifests/gbrain-reranker-secret.yaml
   - manifests/email-collector.yaml
   - manifests/calendar-collector.yaml
-  - manifests/fireflies-collector.yaml
+  - manifests/fireflies-ingest.yaml
   - manifests/lease-sweep.yaml
   - manifests/discovery-to-notion.yaml
   - manifests/hermes-msg.yaml

@@ -255,6 +255,9 @@ spec:
         - hostname: hooks.simplesalt.company
           path: ^/duxsoup/events$
           service: http://duxsoup-ingest.ssint-main-msg.svc.k.famevans.win:8080
+        - hostname: hooks.simplesalt.company
+          path: ^/fireflies/events$
+          service: http://fireflies-ingest.ssint-main-msg.svc.k.famevans.win:8080
         - service: http_status:404
   providerConfigRef:
     name: ssint-main

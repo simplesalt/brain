@@ -1,0 +1,1169 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fireflies-api-key
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fireflies-webhook-secret
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fireflies-ingest
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: fireflies-ingest-heartbeat
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+spec:
+  leaseDurationSeconds: 120
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fireflies-ingest-heartbeat
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["fireflies-ingest-heartbeat"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fireflies-ingest-heartbeat
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fireflies-ingest-heartbeat
+subjects:
+  - kind: ServiceAccount
+    name: fireflies-ingest
+    namespace: ssint-main-msg
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: fireflies-ingest-pg
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+  bootstrap:
+    initdb:
+      database: fireflies
+      owner: fireflies
+  storage:
+    size: 1Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fireflies-ingest-script
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+data:
+  fireflies-ingest.mjs: |
+    #!/usr/bin/env bun
+
+    import { SQL } from 'bun';
+    import { createHash, createHmac, timingSafeEqual } from 'crypto';
+    import { readFileSync } from 'fs';
+    import { join } from 'path';
+
+    const PORT = Number(process.env.PORT ?? 8080);
+    const DATABASE_URL = process.env.DATABASE_URL ?? '';
+
+    const API_KEY = (process.env.FIREFLIES_API_KEY ?? '').trim();
+    const SIGNING_SECRET = (process.env.FIREFLIES_WEBHOOK_SECRET ?? '').trim();
+    const FIREFLIES_URL = process.env.FIREFLIES_URL ?? 'https://api.fireflies.ai/graphql';
+
+    const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain.ssint-main-ai:3131/mcp';
+    const GBRAIN_TOKEN = process.env.GBRAIN_REMOTE_TOKEN ?? '';
+
+    const POD_NAME = process.env.POD_NAME ?? 'unknown';
+    const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 120);
+    const PROCESS_INTERVAL_MS = Number(process.env.PROCESS_INTERVAL_MS ?? 10_000);
+    const PROCESS_BATCH = Number(process.env.PROCESS_BATCH ?? 10);
+    // An event that keeps failing is retried (backoff 10s, 20s ... 1h, see claimBatch)
+    // until it has failed this many times, then dead-lettered: left unprocessed in the
+    // table, never retried again, and logged once.
+    const MAX_EVENT_ATTEMPTS = Math.max(1, Math.floor(Number(process.env.MAX_EVENT_ATTEMPTS ?? 12)) || 12);
+    const HEALTH_MAX_EVENT_AGE_H = Number(process.env.HEALTH_MAX_EVENT_AGE_H ?? 168);
+    const HEALTH_MAX_BACKLOG_MIN = Number(process.env.HEALTH_MAX_BACKLOG_MIN ?? 30);
+
+    // Reconcile: hourly list-since-checkpoint to catch webhooks missed after Fireflies' retries.
+    const RECONCILE_INTERVAL_MS = Number(process.env.RECONCILE_INTERVAL_MS ?? 3_600_000);
+    const RECONCILE_START_DELAY_MS = Number(process.env.RECONCILE_START_DELAY_MS ?? 120_000);
+    const MAX_API_CALLS = 200;       // hard budget per reconcile run (Free plan: 500/day, 30/min)
+    const CALL_SPACING_MS = 2500;    // >= 2.5s between Fireflies calls
+    const PAGE_SIZE = 50;
+    const FIRST_RUN_DAYS = 30;
+    const OVERLAP_MS = 86_400_000;   // re-list one day before the checkpoint; the meetings table dedupes
+    const FALLBACK_MAX_CHARS = 100_000;   // only used if gbrain rejects the full transcript
+
+    // Dylan's own addresses are never linked as attendees.
+    const OWN_EMAILS = new Set(['dylan@simple-salt.com', 'dylan.evans@simplesalt.company']);
+
+    const PROCESSED_EVENTS = new Set(['meeting.summarized', 'meeting.transcribed']);
+    const NO_KEY_ERROR = 'FIREFLIES_API_KEY not set (secret fireflies-api-key missing or empty); event left unprocessed, will retry once the key is present and the pod restarts';
+
+    // `healthcheck` only reads the heartbeat Lease: no database, no server, no
+    // Fireflies access, so it needs none of the env below.
+    const HEALTHCHECK = process.argv[2] === 'healthcheck';
+
+    if (!HEALTHCHECK) {
+      if (!DATABASE_URL) {
+        console.error('FATAL: DATABASE_URL must be set');
+        process.exit(1);
+      }
+      if (!SIGNING_SECRET) {
+        console.error('WARN: FIREFLIES_WEBHOOK_SECRET not set - /fireflies/events will reject every request with 401');
+      }
+      if (!API_KEY) {
+        console.error('WARN: FIREFLIES_API_KEY not set - events are stored but not processed, and the hourly reconcile is skipped');
+      }
+    }
+
+    const sql = HEALTHCHECK ? null : new SQL(DATABASE_URL);
+
+    // ---------------------------------------------------------------------------
+    // Schema (idempotent; re-run safely on every startup)
+    // ---------------------------------------------------------------------------
+
+    const DDL = [
+      `CREATE TABLE IF NOT EXISTS events (
+        id bigserial PRIMARY KEY,
+        received_at timestamptz NOT NULL DEFAULT now(),
+        event text,
+        meeting_id text,
+        dedupe_key text,
+        payload jsonb NOT NULL,
+        processed_at timestamptz,
+        attempts int NOT NULL DEFAULT 0,
+        last_error text,
+        last_attempt_at timestamptz
+      )`,
+      `CREATE INDEX IF NOT EXISTS events_unprocessed_idx ON events (received_at) WHERE processed_at IS NULL`,
+      `CREATE INDEX IF NOT EXISTS events_dedupe_idx ON events (dedupe_key)`,
+      `CREATE TABLE IF NOT EXISTS meetings (
+        meeting_id text PRIMARY KEY,
+        gbrain_slug text,
+        meeting_date timestamptz,
+        processed_at timestamptz NOT NULL DEFAULT now()
+      )`,
+      `CREATE TABLE IF NOT EXISTS kv (
+        key text PRIMARY KEY,
+        value text,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      )`,
+      `COMMENT ON TABLE events IS 'Every Fireflies webhook event with a valid signature, stored verbatim before processing; the durability boundary for the ingest endpoint.'`,
+      `COMMENT ON COLUMN events.event IS 'Fireflies event name, as sent (e.g. meeting.summarized).'`,
+      `COMMENT ON COLUMN events.dedupe_key IS 'meeting_id|event|reprocessed_at; a later event with the same key as an already-processed one is skipped.'`,
+      `COMMENT ON COLUMN events.payload IS 'Full raw webhook JSON body, verbatim.'`,
+      `COMMENT ON COLUMN events.processed_at IS 'When this event was successfully applied to gbrain (or skipped as duplicate/uninteresting); NULL while pending or retrying.'`,
+      `COMMENT ON COLUMN events.attempts IS 'Number of failed processing attempts so far; an unprocessed event whose attempts reach MAX_EVENT_ATTEMPTS is dead-lettered.'`,
+      `COMMENT ON TABLE meetings IS 'Fireflies meetings already written to gbrain (by webhook or reconcile); the reconcile skips these.'`,
+      `COMMENT ON TABLE kv IS 'Small state: reconcile checkpoint.'`,
+    ];
+
+    async function migrate() {
+      for (const stmt of DDL) await sql.unsafe(stmt);
+    }
+
+    async function migrateWithRetry() {
+      const attempts = Number(process.env.MIGRATE_ATTEMPTS ?? 12);
+      for (let i = 1; i <= attempts; i++) {
+        try {
+          await migrate();
+          return;
+        } catch (e) {
+          console.error(`migrate: attempt ${i}/${attempts} failed: ${e.message}`);
+          if (i === attempts) {
+            console.error('FATAL: could not migrate schema; exiting for restart');
+            process.exit(1);
+          }
+          await new Promise((r) => setTimeout(r, 10_000));
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Auth: X-Hub-Signature: sha256=<hex HMAC-SHA256 of the raw body, signing secret>
+    // ---------------------------------------------------------------------------
+
+    function verifySignature(rawBody, header) {
+      if (!SIGNING_SECRET) return false;
+      const h = String(header ?? '').trim();
+      const m = /^sha256=([0-9a-fA-F]{64})$/.exec(h);
+      if (!m) return false;
+      const got = Buffer.from(m[1], 'hex');
+      const want = createHmac('sha256', SIGNING_SECRET).update(rawBody).digest();
+      return got.length === want.length && timingSafeEqual(got, want);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Kubernetes: heartbeat Lease
+    // ---------------------------------------------------------------------------
+
+    const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
+    const K8S_HOST = 'https://kubernetes.default.svc';
+    const NAMESPACE = (() => {
+      try { return readFileSync(join(SA_DIR, 'namespace'), 'utf8').trim(); }
+      catch { return 'ssint-main-msg'; }
+    })();
+    const LEASE_NAME = 'fireflies-ingest-heartbeat';
+    const LEASE_PATH = `/apis/coordination.k8s.io/v1/namespaces/${NAMESPACE}/leases/${LEASE_NAME}`;
+    const ANN = 'ingestion.simplesalt.company';
+
+    let _k8sToken, _k8sCa;
+    function k8sAuth() {
+      if (!_k8sToken) _k8sToken = readFileSync(join(SA_DIR, 'token'), 'utf8').trim();
+      if (!_k8sCa) _k8sCa = readFileSync(join(SA_DIR, 'ca.crt'), 'utf8');
+      return { token: _k8sToken, ca: _k8sCa };
+    }
+
+    async function k8sGet(path) {
+      const { token, ca } = k8sAuth();
+      const r = await fetch(`${K8S_HOST}${path}`, {
+        tls: { ca },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!r.ok) throw new Error(`k8s GET ${path} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      return r.json();
+    }
+
+    async function k8sPatch(path, body) {
+      const { token, ca } = k8sAuth();
+      const r = await fetch(`${K8S_HOST}${path}`, {
+        method: 'PATCH',
+        tls: { ca },
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/merge-patch+json',
+        },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`k8s PATCH ${path} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      return r.json();
+    }
+
+    function microNow() { return new Date().toISOString().replace('Z', '000Z'); }
+
+    let lastReconcileAt = null;
+
+    // Dead-lettered events (unprocessed, attempts at the cap) are counted apart
+    // and kept out of pending / oldest_unprocessed_at.
+    async function computeStats() {
+      const [agg] = await sql`
+        SELECT
+          count(*)::int AS received_total,
+          count(*) FILTER (WHERE processed_at IS NOT NULL)::int AS ingested_total,
+          count(*) FILTER (WHERE processed_at IS NULL AND attempts > 0)::int AS failed_total,
+          count(*) FILTER (WHERE processed_at IS NULL AND attempts < ${MAX_EVENT_ATTEMPTS})::int AS pending,
+          count(*) FILTER (WHERE processed_at IS NULL AND attempts >= ${MAX_EVENT_ATTEMPTS})::int AS dead_lettered_total,
+          max(received_at) AS last_event_at,
+          min(received_at) FILTER (WHERE processed_at IS NULL AND attempts < ${MAX_EVENT_ATTEMPTS} AND (last_error IS NULL OR last_error <> ${NO_KEY_ERROR})) AS oldest_unprocessed_at
+        FROM events
+      `;
+      return agg;
+    }
+
+    async function writeHeartbeat() {
+      let stats = null;
+      try { stats = await computeStats(); }
+      catch (e) { console.error(`heartbeat: stats query failed: ${e.message}`); }
+      const ann = {
+        [`${ANN}/received-total`]: String(stats?.received_total ?? ''),
+        [`${ANN}/ingested-total`]: String(stats?.ingested_total ?? ''),
+        [`${ANN}/failed-total`]: String(stats?.failed_total ?? ''),
+        [`${ANN}/pending`]: String(stats?.pending ?? ''),
+        [`${ANN}/dead-lettered-total`]: String(stats?.dead_lettered_total ?? ''),
+        [`${ANN}/last-event-at`]: stats?.last_event_at ? new Date(stats.last_event_at).toISOString() : '',
+        [`${ANN}/oldest-unprocessed-at`]: stats?.oldest_unprocessed_at ? new Date(stats.oldest_unprocessed_at).toISOString() : '',
+        [`${ANN}/last-reconcile-at`]: lastReconcileAt ?? '',
+      };
+      const body = {
+        spec: { holderIdentity: POD_NAME, leaseDurationSeconds: HEARTBEAT_MAX_AGE_SEC, renewTime: microNow() },
+        metadata: { annotations: ann },
+      };
+      try { await k8sPatch(LEASE_PATH, body); }
+      catch (e) { console.error(`heartbeat: Lease PATCH failed: ${e.message}`); }
+    }
+
+    // Staleness is judged here, not in /readyz: a NotReady pod is dropped from its
+    // Service, and the webhooks that would clear it arrive through that Service.
+    function evaluateHealth(lease, {
+      now = Date.now(),
+      maxEventAgeH = HEALTH_MAX_EVENT_AGE_H,
+      maxBacklogMin = HEALTH_MAX_BACKLOG_MIN,
+    } = {}) {
+      const renewTime = lease?.spec?.renewTime;
+      if (!renewTime) return { ok: false, message: 'no heartbeat yet (Lease has no renewTime - ingest has not reported)' };
+      const maxAgeSec = lease.spec?.leaseDurationSeconds ?? HEARTBEAT_MAX_AGE_SEC;
+      const hbAgeSec = (now - new Date(renewTime).getTime()) / 1000;
+      if (!Number.isFinite(hbAgeSec) || hbAgeSec > maxAgeSec) {
+        return { ok: false, message: `heartbeat stale (${Math.round(hbAgeSec)}s > ${maxAgeSec}s max) - ingest is not heartbeating` };
+      }
+      const ann = lease.metadata?.annotations ?? {};
+      if (!ann[`${ANN}/received-total`]) {
+        return { ok: false, message: 'ingest could not read its event stats (database unreachable?)' };
+      }
+      const lastEventAt = ann[`${ANN}/last-event-at`] ?? '';
+      const oldestAt = ann[`${ANN}/oldest-unprocessed-at`] ?? '';
+
+      let eventAge = 'none yet';
+      if (lastEventAt) {
+        const ageH = (now - new Date(lastEventAt).getTime()) / 3_600_000;
+        if (!Number.isFinite(ageH)) return { ok: false, message: `last-event-at is not a valid timestamp: ${lastEventAt}` };
+        if (ageH > maxEventAgeH) {
+          return { ok: false, message: `no Fireflies event received in ${ageH.toFixed(1)}h (max ${maxEventAgeH}h)` };
+        }
+        eventAge = `${ageH.toFixed(1)}h`;
+      }
+      if (oldestAt) {
+        const ageMin = (now - new Date(oldestAt).getTime()) / 60_000;
+        if (!Number.isFinite(ageMin)) return { ok: false, message: `oldest-unprocessed-at is not a valid timestamp: ${oldestAt}` };
+        if (ageMin > maxBacklogMin) {
+          return { ok: false, message: `oldest unprocessed event is ${ageMin.toFixed(1)}m old (max ${maxBacklogMin}m)` };
+        }
+      }
+      return {
+        ok: true,
+        message: `received=${ann[`${ANN}/received-total`] ?? '?'} ingested=${ann[`${ANN}/ingested-total`] ?? '?'} pending=${ann[`${ANN}/pending`] ?? '?'} dead_lettered=${ann[`${ANN}/dead-lettered-total`] ?? '?'} last_event_age=${eventAge}`,
+      };
+    }
+
+    // Run as `bun fireflies-ingest.mjs healthcheck` by the fireflies-ingest-health
+    // pod's readiness probe; reads only the heartbeat Lease.
+    async function healthcheck() {
+      let lease;
+      try { lease = await k8sGet(LEASE_PATH); }
+      catch (e) {
+        console.error(`UNHEALTHY: Lease GET failed: ${e.message}`);
+        process.exit(1);
+      }
+      const verdict = evaluateHealth(lease);
+      if (!verdict.ok) {
+        console.error(`UNHEALTHY: ${verdict.message}`);
+        process.exit(1);
+      }
+      console.log(`OK: ${verdict.message}`);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Fireflies GraphQL client (serialized, >= 2.5s spacing, per-run budget, stops on 429)
+    // ---------------------------------------------------------------------------
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    class RateLimited extends Error {}
+    class BudgetExhausted extends Error {}
+    class MissingKey extends Error {}
+
+    let lastCallAt = 0;
+    let ffChain = Promise.resolve();
+
+    async function doFirefliesQuery(query, variables, budget) {
+      if (!API_KEY) throw new MissingKey(NO_KEY_ERROR);
+      if (budget && budget.used >= budget.max) throw new BudgetExhausted(`Fireflies call budget of ${budget.max} reached`);
+      const wait = lastCallAt + CALL_SPACING_MS - Date.now();
+      if (wait > 0) await sleep(wait);
+      if (budget) budget.used++;
+      lastCallAt = Date.now();
+      const r = await fetch(FIREFLIES_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${API_KEY}` },
+        body: JSON.stringify({ query, variables }),
+      });
+      if (r.status === 429) throw new RateLimited('HTTP 429 from Fireflies');
+      const text = await r.text();
+      if (!r.ok) throw new Error(`Fireflies HTTP ${r.status}: ${text.slice(0, 200)}`);
+      let body;
+      try { body = JSON.parse(text); } catch { throw new Error(`Fireflies unparseable response: ${text.slice(0, 200)}`); }
+      if (body.errors?.length) {
+        const codes = body.errors.map((e) => `${e.code ?? ''} ${e.message ?? ''}`).join('; ');
+        if (/too_many_requests|rate.?limit/i.test(codes)) throw new RateLimited(codes.slice(0, 200));
+        throw new Error(`Fireflies GraphQL error: ${codes.slice(0, 300)}`);
+      }
+      return body.data;
+    }
+
+    function firefliesQuery(query, variables, budget = null) {
+      const run = ffChain.then(() => doFirefliesQuery(query, variables, budget));
+      ffChain = run.catch(() => {});
+      return run;
+    }
+
+    const LIST_QUERY = `query List($fromDate: DateTime, $limit: Int, $skip: Int) {
+      transcripts(fromDate: $fromDate, mine: true, limit: $limit, skip: $skip) { id title date }
+    }`;
+
+    const DETAIL_QUERY = `query Detail($id: String!) {
+      transcript(id: $id) {
+        id title date duration organizer_email cal_id transcript_url
+        meeting_attendees { displayName email name }
+        speakers { id name }
+        sentences { speaker_name text start_time }
+        summary { overview action_items keywords short_summary }
+      }
+    }`;
+
+    function toMs(d) {
+      if (d === null || d === undefined || d === '') return NaN;
+      if (typeof d === 'number') return d;
+      if (/^\d+(\.\d+)?$/.test(String(d))) return Number(d);
+      return Date.parse(d);
+    }
+
+    // ---------------------------------------------------------------------------
+    // gbrain MCP client (same shape as email-collector)
+    // ---------------------------------------------------------------------------
+
+    function parseMcpResponse(text) {
+      let msg = null;
+      for (const block of text.split('\n\n')) {
+        const data = block.split('\n')
+          .filter((l) => l.startsWith('data:'))
+          .map((l) => l.slice(5).trim())
+          .join('\n');
+        if (!data) continue;
+        try { const o = JSON.parse(data); if (o.result || o.error) msg = o; } catch { /* keep scanning */ }
+      }
+      if (msg) return msg;
+      try { return JSON.parse(text); } catch { return null; }
+    }
+
+    // Pages under calls/ belong wholly to this ingest, so every write deliberately overwrites (force).
+    // The request_id is a UUID derived from slug+content: a replay of the same write reuses gbrain's
+    // original receipt instead of spending a new write, and changed content gets a fresh id.
+    function putRequestId(slug, content) {
+      const h = createHash('sha256').update(`fireflies-ingest:put_page:${slug}:${content}`).digest('hex');
+      const variant = ((parseInt(h[16], 16) & 0x3) | 0x8).toString(16);
+      return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+    }
+
+    async function gbrainCall(name, args) {
+      const r = await fetch(GBRAIN_MCP_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          'Authorization': `Bearer ${GBRAIN_TOKEN}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name, arguments: args },
+        }),
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0, 160)}`);
+      const msg = parseMcpResponse(text);
+      if (!msg) throw new Error(`unparseable MCP response: ${text.slice(0, 160)}`);
+      if (msg.error) throw new Error(`rpc: ${JSON.stringify(msg.error).slice(0, 160)}`);
+      const texts = (msg.result?.content ?? []).map((c) => c.text ?? '');
+      if (msg.result?.isError) throw new Error(`tool: ${texts.join(' ').slice(0, 200)}`);
+      // search appends plain-text hint items after the JSON rows, so try each item on its own too.
+      let parsed = null;
+      try { parsed = JSON.parse(texts.join('\n')); } catch { /* try items */ }
+      for (const t of texts) {
+        if (parsed !== null) break;
+        try { parsed = JSON.parse(t); } catch { /* not the JSON item */ }
+      }
+      return parsed;
+    }
+
+    async function gbrainPutPage(slug, content) {
+      const receipt = await gbrainCall('put_page', { slug, content, force: true, request_id: putRequestId(slug, content) });
+      if (receipt?.state && receipt.state !== 'committed') {
+        throw new Error(`write not committed: state=${receipt.state} request_id=${receipt.request_id}`);
+      }
+      return receipt;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Page building
+    // ---------------------------------------------------------------------------
+
+    function kebab(s) {
+      return String(s ?? '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
+        .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, '') || 'untitled';
+    }
+
+    function callSlug(t, dayIso) {
+      return `calls/${dayIso}-${kebab(t.title)}-${String(t.id).slice(0, 8)}`;
+    }
+
+    const q = (s) => String(s ?? '').replace(/"/g, "'").replace(/\s+/g, ' ').trim();
+
+    function mmss(sec) {
+      const s = Math.max(0, Math.floor(Number(sec) || 0));
+      return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+    }
+
+    function attendeeList(t) {
+      const out = [];
+      const seen = new Set();
+      for (const a of t.meeting_attendees ?? []) {
+        const email = String(a?.email ?? '').trim().toLowerCase();
+        const name = a?.displayName || a?.name || '';
+        const key = email || name.toLowerCase();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push({ name, email });
+      }
+      return out;
+    }
+
+    function asLines(v) {
+      if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+      return String(v ?? '').split('\n').map((x) => x.replace(/^\s*[-*•]\s*/, '').trim()).filter(Boolean);
+    }
+
+    function callToMarkdown(t, dayIso, attendees, maxTranscriptChars) {
+      const durationMin = Math.round(Number(t.duration) || 0);
+      const s = t.summary ?? {};
+      const actions = asLines(s.action_items);
+      const keywords = asLines(Array.isArray(s.keywords) ? s.keywords : String(s.keywords ?? '').split(','));
+      let transcript = (t.sentences ?? [])
+        .filter((x) => x && x.text)
+        .map((x) => `**${x.speaker_name || 'Unknown'}** [${mmss(x.start_time)}]: ${String(x.text).trim()}`)
+        .join('\n');
+      if (maxTranscriptChars && transcript.length > maxTranscriptChars) {
+        transcript = `${transcript.slice(0, maxTranscriptChars)}\n\n[... transcript truncated; full text in Fireflies]`;
+      }
+      return [
+        '---',
+        'type: call',
+        `title: "${q(t.title || 'Untitled call').slice(0, 160)}"`,
+        `date: "${dayIso}"`,
+        `duration_min: ${durationMin}`,
+        `fireflies_id: "${t.id}"`,
+        `transcript_url: "${q(t.transcript_url)}"`,
+        'attendees:',
+        ...(attendees.length
+          ? attendees.map((a) => `  - name: "${q(a.name)}"\n    email: "${q(a.email)}"`)
+          : ['  []']),
+        'tags: [call, fireflies]',
+        '---',
+        '',
+        `# ${t.title || 'Untitled call'}`,
+        '',
+        '## Summary',
+        '',
+        String(s.overview || s.short_summary || '_No summary._').trim(),
+        '',
+        '## Action items',
+        '',
+        actions.length ? actions.map((a) => `- ${a}`).join('\n') : '_None._',
+        '',
+        '## Keywords',
+        '',
+        keywords.length ? keywords.join(', ') : '_None._',
+        '',
+        '## Attendees',
+        '',
+        attendees.length ? attendees.map((a) => `- ${a.name || a.email}${a.email ? ` <${a.email}>` : ''}`).join('\n') : '_None recorded._',
+        '',
+        '## Transcript',
+        '',
+        transcript || '_No transcript text._',
+        '',
+      ].join('\n');
+    }
+
+    // ---------------------------------------------------------------------------
+    // People linking
+    // ---------------------------------------------------------------------------
+
+    function pageText(p) {
+      if (!p) return '';
+      return [p.content, p.compiled_truth, p.frontmatter ? JSON.stringify(p.frontmatter) : '', JSON.stringify(p)].join('\n').toLowerCase();
+    }
+
+    const PERSON_CACHE_TTL_MS = 10 * 60_000;
+    const personCache = new Map();   // email -> { slug, at }
+
+    // A people/ page matches only if the address is really on the page (search alone is fuzzy).
+    async function findPerson(email) {
+      const hit = personCache.get(email);
+      if (hit && Date.now() - hit.at < PERSON_CACHE_TTL_MS) return hit.slug;
+      let slug = null;
+      const res = await gbrainCall('search', { query: email, limit: 5, types: ['person'] });
+      const rows = Array.isArray(res) ? res : (res?.results ?? []);
+      for (const row of rows) {
+        if (!row?.slug || !String(row.slug).startsWith('people/')) continue;
+        const page = await gbrainCall('get_page', { slug: row.slug, include_content: true });
+        if (pageText(page).includes(email)) { slug = row.slug; break; }
+      }
+      personCache.set(email, { slug, at: Date.now() });
+      return slug;
+    }
+
+    async function linkAttendees(callSlugStr, t, attendees) {
+      const organizer = String(t.organizer_email ?? '').trim().toLowerCase();
+      let linked = 0;
+      for (const a of attendees) {
+        if (!a.email || OWN_EMAILS.has(a.email)) continue;
+        if (a.email === organizer && OWN_EMAILS.has(organizer)) continue;
+        let personSlug;
+        try { personSlug = await findPerson(a.email); }
+        catch (e) { console.error(`WARN: person lookup failed for ${a.email}: ${e.message}`); continue; }
+        if (!personSlug) { console.log(`unmatched attendee (no people/ page): ${a.email}`); continue; }
+        // add_link is an upsert on (from, to, type, source), so re-runs do not duplicate. Both pages exist by now.
+        const args = { from: callSlugStr, to: personSlug, context: 'attended', link_source: 'fireflies' };
+        try {
+          await gbrainCall('add_link', { ...args, link_type: 'attended' });
+          linked++;
+        } catch (e) {
+          if (!/invalid_params/.test(e.message)) { console.error(`WARN: add_link ${callSlugStr} -> ${personSlug}: ${e.message}`); continue; }
+          try { await gbrainCall('add_link', args); linked++; }
+          catch (e2) { console.error(`WARN: untyped add_link ${callSlugStr} -> ${personSlug}: ${e2.message}`); }
+        }
+      }
+      return linked;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Meeting ingest: fetch the transcript, write the calls/ page, link attendees.
+    // Idempotent: same slug (overwritten), same request_id for same content, upserted links.
+    // ---------------------------------------------------------------------------
+
+    async function ingestMeeting(meetingId, { hintDate = null, budget = null } = {}) {
+      const d = await firefliesQuery(DETAIL_QUERY, { id: meetingId }, budget);
+      const t = d?.transcript;
+      if (!t?.id) throw new Error(`transcript ${meetingId} not returned`);
+      const ms = toMs(t.date ?? hintDate);
+      if (!Number.isFinite(ms)) throw new Error(`transcript ${meetingId} has no usable date`);
+      const dayIso = new Date(ms).toISOString().slice(0, 10);
+      const attendees = attendeeList(t);
+      const slug = callSlug(t, dayIso);
+
+      try {
+        await gbrainPutPage(slug, callToMarkdown(t, dayIso, attendees, 0));
+      } catch (e) {
+        if (!/size|large|too long|limit|413/i.test(e.message)) throw e;
+        console.error(`WARN: ${slug} rejected at full size (${e.message}); retrying with a truncated transcript`);
+        await gbrainPutPage(slug, callToMarkdown(t, dayIso, attendees, FALLBACK_MAX_CHARS));
+      }
+      let linked = 0;
+      try { linked = await linkAttendees(slug, t, attendees); }
+      catch (e) { console.error(`WARN: linking failed for ${slug}: ${e.message}`); }
+
+      await sql`
+        INSERT INTO meetings (meeting_id, gbrain_slug, meeting_date)
+        VALUES (${String(t.id)}, ${slug}, ${new Date(ms)})
+        ON CONFLICT (meeting_id) DO UPDATE SET gbrain_slug = EXCLUDED.gbrain_slug, meeting_date = EXCLUDED.meeting_date, processed_at = now()
+      `;
+      return { slug, ms, linked };
+    }
+
+    // ---------------------------------------------------------------------------
+    // Event processing
+    // ---------------------------------------------------------------------------
+
+    function normalizePayload(p) {
+      if (p == null) return null;
+      return typeof p === 'string' ? JSON.parse(p) : p;
+    }
+
+    // Returns a short note stored in last_error when the event was skipped (not an error).
+    async function processEvent(rawRow) {
+      const payload = normalizePayload(rawRow.payload) ?? {};
+      const event = String(rawRow.event ?? payload.event ?? '');
+      if (!PROCESSED_EVENTS.has(event)) {
+        console.log(`process: event ${rawRow.id} "${event}" is not processed, stored only`);
+        return null;
+      }
+      if (rawRow.dedupe_key) {
+        const dup = await sql`
+          SELECT id FROM events
+          WHERE dedupe_key = ${rawRow.dedupe_key} AND processed_at IS NOT NULL AND id <> ${rawRow.id}
+          ORDER BY id LIMIT 1
+        `;
+        if (dup.length) return `duplicate of event ${dup[0].id}; skipped`;
+      }
+      const meetingId = String(rawRow.meeting_id ?? payload.meeting_id ?? '');
+      if (!meetingId) throw new Error('event has no meeting_id');
+      const res = await ingestMeeting(meetingId);
+      console.log(`process: event ${rawRow.id} ${event} meeting ${meetingId} -> ${res.slug}, links ${res.linked}`);
+      return null;
+    }
+
+    // Retries back off 10s, 20s, 40s ... up to 1h; events at MAX_EVENT_ATTEMPTS
+    // attempts are dead-lettered and never claimed again.
+    async function claimBatch() {
+      return sql`
+        SELECT * FROM events
+        WHERE processed_at IS NULL
+          AND attempts < ${MAX_EVENT_ATTEMPTS}
+          AND (
+            attempts = 0
+            OR last_attempt_at IS NULL
+            OR last_attempt_at <= now() - (LEAST(POWER(2, attempts) * 5, 3600) || ' seconds')::interval
+          )
+        ORDER BY received_at ASC
+        LIMIT ${PROCESS_BATCH}
+      `;
+    }
+
+    async function reportDeadLetters() {
+      const [{ n }] = await sql`SELECT count(*)::int AS n FROM events WHERE processed_at IS NULL AND attempts >= ${MAX_EVENT_ATTEMPTS}`;
+      if (!n) return;
+      const ids = await sql`SELECT id FROM events WHERE processed_at IS NULL AND attempts >= ${MAX_EVENT_ATTEMPTS} ORDER BY id LIMIT 50`;
+      console.error(`dead-letter: ${n} event(s) at or over ${MAX_EVENT_ATTEMPTS} attempts at startup, not retried: ids ${ids.map((r) => r.id).join(', ')}${n > ids.length ? ', ...' : ''}`);
+    }
+
+    let processing = false;
+    async function processBatch() {
+      if (processing) return 0;
+      processing = true;
+      try {
+        if (!API_KEY) {
+          // Missing key is not the event's fault: record why, leave attempts untouched, retry later.
+          try {
+            await sql`UPDATE events SET last_error = ${NO_KEY_ERROR} WHERE processed_at IS NULL AND last_error IS DISTINCT FROM ${NO_KEY_ERROR}`;
+          } catch (e) { console.error(`processBatch: could not record missing-key error: ${e.message}`); }
+          return 0;
+        }
+        let rows;
+        try { rows = await claimBatch(); }
+        catch (e) { console.error(`processBatch: claim failed: ${e.message}`); return 0; }
+        for (const row of rows) {
+          try {
+            const note = await processEvent(row);
+            await sql`UPDATE events SET processed_at = now(), last_attempt_at = now(), last_error = ${note} WHERE id = ${row.id}`;
+          } catch (e) {
+            const msg = String(e?.message ?? e).slice(0, 800);
+            console.error(`processBatch: event ${row.id} (${row.event}) failed (attempt ${row.attempts + 1}): ${msg}`);
+            try {
+              const [upd] = await sql`UPDATE events SET attempts = attempts + 1, last_attempt_at = now(), last_error = ${msg} WHERE id = ${row.id} RETURNING attempts`;
+              if (upd && upd.attempts >= MAX_EVENT_ATTEMPTS) {
+                console.error(`dead-letter: event ${row.id} (${row.event}) gave up after ${upd.attempts} attempts: ${msg.replace(/\s+/g, ' ')}`);
+              }
+            } catch (e2) {
+              console.error(`processBatch: could not record failure for event ${row.id}: ${e2.message}`);
+            }
+            if (e instanceof RateLimited) break;   // stop the batch; the backoff retries later
+          }
+        }
+        return rows.length;
+      } finally {
+        processing = false;
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Hourly reconcile: list transcripts since the checkpoint (mine: true) and ingest any
+    // not yet in the meetings table. Catches webhooks missed after Fireflies' retries.
+    // ---------------------------------------------------------------------------
+
+    async function getCheckpoint() {
+      const rows = await sql`SELECT value FROM kv WHERE key = 'checkpoint'`;
+      const v = rows[0]?.value;
+      return v && Number.isFinite(Date.parse(v)) ? v : null;
+    }
+
+    async function setCheckpoint(iso) {
+      await sql`
+        INSERT INTO kv (key, value) VALUES ('checkpoint', ${iso})
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+      `;
+    }
+
+    let reconciling = false;
+    async function reconcile() {
+      if (reconciling) return;
+      reconciling = true;
+      try {
+        if (!API_KEY) {
+          console.log('reconcile: FIREFLIES_API_KEY not set; skipping');
+          return;
+        }
+        const budget = { used: 0, max: MAX_API_CALLS };
+        let checkpoint = await getCheckpoint();
+        const fromMs = checkpoint ? Date.parse(checkpoint) - OVERLAP_MS : Date.now() - FIRST_RUN_DAYS * 86_400_000;
+        const fromDate = new Date(fromMs).toISOString();
+        console.log(`reconcile: listing transcripts since ${fromDate}`);
+
+        let stoppedEarly = null;
+        const found = new Map();
+        try {
+          for (let skip = 0; ; skip += PAGE_SIZE) {
+            const d = await firefliesQuery(LIST_QUERY, { fromDate, limit: PAGE_SIZE, skip }, budget);
+            const batch = d?.transcripts ?? [];
+            for (const t of batch) if (t?.id) found.set(t.id, t);
+            if (batch.length < PAGE_SIZE) break;
+          }
+        } catch (e) {
+          if (e instanceof RateLimited || e instanceof BudgetExhausted) {
+            stoppedEarly = e.message;
+            console.error(`WARN: reconcile stopping while listing: ${e.message}`);
+          } else throw e;
+        }
+
+        const known = new Set();
+        if (found.size) {
+          const rows = await sql`SELECT meeting_id FROM meetings WHERE meeting_id IN ${sql([...found.keys()])}`;
+          for (const r of rows) known.add(r.meeting_id);
+        }
+        // Oldest first, so the checkpoint only ever moves forward over fully processed transcripts.
+        const fresh = [...found.values()]
+          .filter((t) => !known.has(t.id))
+          .sort((a, b) => (toMs(a.date) || 0) - (toMs(b.date) || 0));
+        console.log(`reconcile: ${found.size} listed, ${fresh.length} new`);
+
+        let pushed = 0, linked = 0, failed = 0;
+        let checkpointBlocked = false;
+        for (const item of fresh) {
+          if (stoppedEarly) break;
+          try {
+            const res = await ingestMeeting(item.id, { hintDate: item.date, budget });
+            pushed++;
+            linked += res.linked;
+            if (!checkpointBlocked && (!checkpoint || res.ms > Date.parse(checkpoint))) {
+              checkpoint = new Date(res.ms).toISOString();
+              await setCheckpoint(checkpoint);
+            }
+          } catch (e) {
+            if (e instanceof RateLimited || e instanceof BudgetExhausted || e instanceof MissingKey) {
+              stoppedEarly = e.message;
+              console.error(`WARN: reconcile stopping: ${e.message}; checkpoint stays at ${checkpoint}`);
+              break;
+            }
+            failed++;
+            checkpointBlocked = true;   // never advance past a transcript that failed; the meetings table still prevents repeats
+            console.error(`WARN: reconcile transcript ${item.id} failed: ${e.message}`);
+          }
+        }
+        lastReconcileAt = new Date().toISOString();
+        console.log(`reconcile: pushed ${pushed}, links ${linked}, failed ${failed}, api calls ${budget.used}/${budget.max}, checkpoint ${checkpoint}${stoppedEarly ? `, stopped early (${stoppedEarly})` : ''}`);
+      } finally {
+        reconciling = false;
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // HTTP
+    // ---------------------------------------------------------------------------
+
+    async function handleEventsPost(req) {
+      // Raw bytes first: the signature covers the body exactly as sent.
+      const raw = Buffer.from(await req.arrayBuffer());
+      if (!verifySignature(raw, req.headers.get('x-hub-signature'))) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      let body;
+      try { body = JSON.parse(raw.toString('utf8')); }
+      catch { return Response.json({ error: 'invalid JSON body' }, { status: 400 }); }
+      if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.meeting_id !== 'string' || !body.meeting_id) {
+        return Response.json({ error: 'meeting_id is required' }, { status: 400 });
+      }
+
+      const event = typeof body.event === 'string' ? body.event : null;
+      const dedupeKey = `${body.meeting_id}|${event ?? ''}|${body.reprocessed_at ?? ''}`;
+
+      let inserted;
+      try {
+        const rows = await sql`
+          INSERT INTO events (event, meeting_id, dedupe_key, payload)
+          VALUES (${event}, ${body.meeting_id}, ${dedupeKey}, ${raw.toString('utf8')}::jsonb)
+          RETURNING id
+        `;
+        inserted = rows[0];
+      } catch (e) {
+        console.error(`events: insert failed: ${e.message}`);
+        return Response.json({ error: 'storage unavailable' }, { status: 503 });
+      }
+
+      queueMicrotask(() => { processBatch().catch((e) => console.error(`events: immediate process failed: ${e.message}`)); });
+      return Response.json({ ok: true, id: inserted.id }, { status: 200 });
+    }
+
+    // Ready means "can accept and store events"; event freshness and backlog
+    // are the health pod's concern (see evaluateHealth).
+    async function handleReadyz() {
+      try {
+        const [{ total }] = await sql`SELECT count(*)::int AS total FROM events`;
+        return Response.json({ ready: true, total });
+      } catch (e) {
+        return Response.json({ ready: false, reason: `database unreachable: ${e.message}` }, { status: 503 });
+      }
+    }
+
+    async function main() {
+      await migrateWithRetry();
+      await reportDeadLetters().catch((e) => console.error(`startup: dead-letter report failed: ${e.message}`));
+
+      const tick = async () => {
+        await processBatch().catch((e) => console.error(`tick: processBatch failed: ${e.message}`));
+        await writeHeartbeat().catch((e) => console.error(`tick: writeHeartbeat failed: ${e.message}`));
+      };
+      tick();
+      setInterval(tick, PROCESS_INTERVAL_MS);
+
+      const reconcileSafe = () => reconcile().catch((e) => console.error(`reconcile: failed: ${e.message}`));
+      setTimeout(() => { reconcileSafe(); setInterval(reconcileSafe, RECONCILE_INTERVAL_MS); }, RECONCILE_START_DELAY_MS);
+
+      Bun.serve({
+        port: PORT,
+        async fetch(req) {
+          const { pathname } = new URL(req.url);
+          if (pathname === '/healthz') return Response.json({ ok: true });
+          if (pathname === '/readyz') return handleReadyz();
+          if (pathname === '/fireflies/events' && req.method === 'POST') return handleEventsPost(req);
+          return new Response('Not Found', { status: 404 });
+        },
+        error(e) { return Response.json({ error: e.message }, { status: 500 }); },
+      });
+
+      console.log(`fireflies-ingest listening on :${PORT}`);
+    }
+
+    if (HEALTHCHECK) await healthcheck();
+    else await main();
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fireflies-ingest
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fireflies-ingest
+  template:
+    metadata:
+      labels:
+        app: fireflies-ingest
+        entity: ssint
+        env: main
+        capability: msg
+    spec:
+      serviceAccountName: fireflies-ingest
+      containers:
+        - name: fireflies-ingest
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "/scripts/fireflies-ingest.mjs"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fireflies-ingest-pg-app
+                  key: uri
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FIREFLIES_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fireflies-api-key
+                  key: api_key
+                  optional: true
+            - name: FIREFLIES_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: fireflies-webhook-secret
+                  key: signing_secret
+                  optional: true
+            - name: GBRAIN_MCP_URL
+              value: http://gbrain.ssint-main-ai:3131/mcp
+            - name: GBRAIN_REMOTE_TOKEN
+              value: "gbrain-mcp"
+          livenessProbe:
+            # Blocks on migrateWithRetry() (up to ~120s against a not-yet-ready
+            # CNPG cluster) before the HTTP server listens, so allow grace.
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: fireflies-ingest-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fireflies-ingest
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  selector:
+    app: fireflies-ingest
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fireflies-ingest-health
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fireflies-ingest-heartbeat-reader
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["fireflies-ingest-heartbeat"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fireflies-ingest-heartbeat-reader
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fireflies-ingest-heartbeat-reader
+subjects:
+  - kind: ServiceAccount
+    name: fireflies-ingest-health
+    namespace: ssint-main-msg
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fireflies-ingest-health
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fireflies-ingest-health
+  template:
+    metadata:
+      labels:
+        app: fireflies-ingest-health
+        entity: ssint
+        env: main
+        capability: msg
+    spec:
+      serviceAccountName: fireflies-ingest-health
+      containers:
+        - name: health
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          readinessProbe:
+            exec:
+              command: ["bun", "/scripts/fireflies-ingest.mjs", "healthcheck"]
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 15
+            successThreshold: 1
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: fireflies-ingest-script
