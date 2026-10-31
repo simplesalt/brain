@@ -1,0 +1,556 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fireflies-collector
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+stringData:
+  FIREFLIES_API_KEY: "REPLACE_ME"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fireflies-collector
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fireflies-collector-state
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fireflies-collector
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["fireflies-collector-state"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fireflies-collector
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fireflies-collector
+subjects:
+  - kind: ServiceAccount
+    name: fireflies-collector
+    namespace: ssint-main-ai
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fireflies-collector-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  fireflies-collector.mjs: |
+    #!/usr/bin/env bun
+
+    import { createHash } from 'crypto';
+    import { readFileSync } from 'fs';
+    import { join } from 'path';
+
+    const API_KEY        = (process.env.FIREFLIES_API_KEY ?? '').trim();
+    const FIREFLIES_URL  = 'https://api.fireflies.ai/graphql';
+    const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain:3131/mcp';
+    const GBRAIN_TOKEN   = process.env.GBRAIN_REMOTE_TOKEN ?? '';
+
+    const MAX_API_CALLS   = 200;     // hard budget per run (Free plan: 500/day, 30/min)
+    const CALL_SPACING_MS = 2500;    // >= 2.5s between Fireflies calls
+    const PAGE_SIZE       = 50;
+    const FIRST_RUN_DAYS  = 30;
+    const OVERLAP_MS      = 86_400_000;   // re-list one day before the checkpoint; processed ids dedupe
+    const IDS_TTL_MS      = 45 * 86_400_000;
+    const FALLBACK_MAX_CHARS = 100_000;   // only used if gbrain rejects the full transcript
+
+    // Dylan's own addresses are never linked as attendees.
+    const OWN_EMAILS = new Set(['dylan@simple-salt.com', 'dylan.evans@simplesalt.company']);
+
+    const SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
+    const NAMESPACE = (() => {
+      try { return readFileSync(join(SA_DIR, 'namespace'), 'utf8').trim(); }
+      catch { return 'ssint-main-ai'; }
+    })();
+    const K8S_HOST   = 'https://kubernetes.default.svc';
+    const STATE_PATH = `/api/v1/namespaces/${NAMESPACE}/configmaps/fireflies-collector-state`;
+    const STATE_KEY  = 'state.json';
+
+    let _k8sToken, _k8sCa;
+    function k8sAuth() {
+      if (!_k8sToken) _k8sToken = readFileSync(join(SA_DIR, 'token'), 'utf8').trim();
+      if (!_k8sCa)    _k8sCa    = readFileSync(join(SA_DIR, 'ca.crt'), 'utf8');
+      return { token: _k8sToken, ca: _k8sCa };
+    }
+
+    async function k8sRequest(path, init = {}) {
+      const { token, ca } = k8sAuth();
+      return fetch(`${K8S_HOST}${path}`, {
+        ...init,
+        tls: { ca },
+        headers: { Authorization: `Bearer ${token}`, ...(init.headers ?? {}) },
+      });
+    }
+
+    async function k8sGet(path) {
+      const r = await k8sRequest(path);
+      if (!r.ok) throw new Error(`k8s GET ${path} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      return r.json();
+    }
+
+    async function k8sPatch(path, body) {
+      const r = await k8sRequest(path, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/merge-patch+json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`k8s PATCH ${path} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      return r.json();
+    }
+
+    // State: { checkpoint: ISO date of the latest fully processed transcript, ids: { <id>: <ISO processed-at> } }
+    async function loadState() {
+      const cm = await k8sGet(STATE_PATH);
+      let parsed = {};
+      try { parsed = JSON.parse(cm.data?.[STATE_KEY] ?? '{}'); } catch { parsed = {}; }
+      return { checkpoint: parsed.checkpoint || null, ids: parsed.ids && typeof parsed.ids === 'object' ? parsed.ids : {} };
+    }
+
+    async function saveState(state) {
+      const cutoff = Date.now() - IDS_TTL_MS;
+      const ids = {};
+      for (const [id, at] of Object.entries(state.ids)) {
+        const t = Date.parse(at);
+        if (!Number.isFinite(t) || t >= cutoff) ids[id] = at;
+      }
+      state.ids = ids;
+      await k8sPatch(STATE_PATH, { data: { [STATE_KEY]: JSON.stringify({ checkpoint: state.checkpoint, ids }) } });
+    }
+
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    class RateLimited extends Error {}
+    class BudgetExhausted extends Error {}
+
+    let apiCalls = 0;
+    let lastCallAt = 0;
+
+    async function firefliesQuery(query, variables) {
+      if (apiCalls >= MAX_API_CALLS) throw new BudgetExhausted(`Fireflies call budget of ${MAX_API_CALLS} reached`);
+      const wait = lastCallAt + CALL_SPACING_MS - Date.now();
+      if (wait > 0) await sleep(wait);
+      apiCalls++;
+      lastCallAt = Date.now();
+      const r = await fetch(FIREFLIES_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${API_KEY}` },
+        body: JSON.stringify({ query, variables }),
+      });
+      if (r.status === 429) throw new RateLimited('HTTP 429 from Fireflies');
+      const text = await r.text();
+      if (!r.ok) throw new Error(`Fireflies HTTP ${r.status}: ${text.slice(0, 200)}`);
+      let body;
+      try { body = JSON.parse(text); } catch { throw new Error(`Fireflies unparseable response: ${text.slice(0, 200)}`); }
+      if (body.errors?.length) {
+        const codes = body.errors.map(e => `${e.code ?? ''} ${e.message ?? ''}`).join('; ');
+        if (/too_many_requests|rate.?limit/i.test(codes)) throw new RateLimited(codes.slice(0, 200));
+        throw new Error(`Fireflies GraphQL error: ${codes.slice(0, 300)}`);
+      }
+      return body.data;
+    }
+
+    const LIST_QUERY = `query List($fromDate: DateTime, $limit: Int, $skip: Int) {
+      transcripts(fromDate: $fromDate, mine: true, limit: $limit, skip: $skip) { id title date }
+    }`;
+
+    const DETAIL_QUERY = `query Detail($id: String!) {
+      transcript(id: $id) {
+        id title date duration organizer_email cal_id transcript_url
+        meeting_attendees { displayName email name }
+        speakers { id name }
+        sentences { speaker_name text start_time }
+        summary { overview action_items keywords short_summary }
+      }
+    }`;
+
+    function toMs(d) {
+      if (d === null || d === undefined || d === '') return NaN;
+      if (typeof d === 'number') return d;
+      if (/^\d+(\.\d+)?$/.test(String(d))) return Number(d);
+      return Date.parse(d);
+    }
+
+    // ---- gbrain MCP client (same shape as email-collector) ----
+
+    function parseMcpResponse(text) {
+      let msg = null;
+      for (const block of text.split('\n\n')) {
+        const data = block.split('\n')
+          .filter(l => l.startsWith('data:'))
+          .map(l => l.slice(5).trim())
+          .join('\n');
+        if (!data) continue;
+        try { const o = JSON.parse(data); if (o.result || o.error) msg = o; } catch { /* keep scanning */ }
+      }
+      if (msg) return msg;
+      try { return JSON.parse(text); } catch { return null; }
+    }
+
+    // Pages under calls/ belong wholly to this collector, so every write deliberately overwrites (force).
+    // The request_id is a UUID derived from slug+content: a replay of the same write reuses gbrain's
+    // original receipt instead of spending a new write, and changed content gets a fresh id.
+    function putRequestId(slug, content) {
+      const h = createHash('sha256').update(`fireflies-collector:put_page:${slug}:${content}`).digest('hex');
+      const variant = ((parseInt(h[16], 16) & 0x3) | 0x8).toString(16);
+      return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+    }
+
+    async function gbrainCall(name, args) {
+      const r = await fetch(GBRAIN_MCP_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          'Authorization': `Bearer ${GBRAIN_TOKEN}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name, arguments: args },
+        }),
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0, 160)}`);
+      const msg = parseMcpResponse(text);
+      if (!msg) throw new Error(`unparseable MCP response: ${text.slice(0, 160)}`);
+      if (msg.error) throw new Error(`rpc: ${JSON.stringify(msg.error).slice(0, 160)}`);
+      const texts = (msg.result?.content ?? []).map(c => c.text ?? '');
+      if (msg.result?.isError) throw new Error(`tool: ${texts.join(' ').slice(0, 200)}`);
+      // search appends plain-text hint items after the JSON rows, so try each item on its own too.
+      let parsed = null;
+      try { parsed = JSON.parse(texts.join('\n')); } catch { /* try items */ }
+      for (const t of texts) {
+        if (parsed !== null) break;
+        try { parsed = JSON.parse(t); } catch { /* not the JSON item */ }
+      }
+      return parsed;
+    }
+
+    async function gbrainPutPage(slug, content) {
+      const receipt = await gbrainCall('put_page', { slug, content, force: true, request_id: putRequestId(slug, content) });
+      if (receipt?.state && receipt.state !== 'committed') {
+        throw new Error(`write not committed: state=${receipt.state} request_id=${receipt.request_id}`);
+      }
+      return receipt;
+    }
+
+    // ---- page building ----
+
+    function kebab(s) {
+      return String(s ?? '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
+        .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, '') || 'untitled';
+    }
+
+    function callSlug(t, dayIso) {
+      return `calls/${dayIso}-${kebab(t.title)}-${String(t.id).slice(0, 8)}`;
+    }
+
+    const q = s => String(s ?? '').replace(/"/g, "'").replace(/\s+/g, ' ').trim();
+
+    function mmss(sec) {
+      const s = Math.max(0, Math.floor(Number(sec) || 0));
+      return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+    }
+
+    function attendeeList(t) {
+      const out = [];
+      const seen = new Set();
+      for (const a of t.meeting_attendees ?? []) {
+        const email = String(a?.email ?? '').trim().toLowerCase();
+        const name = a?.displayName || a?.name || '';
+        const key = email || name.toLowerCase();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push({ name, email });
+      }
+      return out;
+    }
+
+    function asLines(v) {
+      if (Array.isArray(v)) return v.map(x => String(x).trim()).filter(Boolean);
+      return String(v ?? '').split('\n').map(x => x.replace(/^\s*[-*•]\s*/, '').trim()).filter(Boolean);
+    }
+
+    function callToMarkdown(t, dayIso, attendees, maxTranscriptChars) {
+      const durationMin = Math.round(Number(t.duration) || 0);
+      const s = t.summary ?? {};
+      const actions = asLines(s.action_items);
+      const keywords = asLines(Array.isArray(s.keywords) ? s.keywords : String(s.keywords ?? '').split(','));
+      let transcript = (t.sentences ?? [])
+        .filter(x => x && x.text)
+        .map(x => `**${x.speaker_name || 'Unknown'}** [${mmss(x.start_time)}]: ${String(x.text).trim()}`)
+        .join('\n');
+      if (maxTranscriptChars && transcript.length > maxTranscriptChars) {
+        transcript = `${transcript.slice(0, maxTranscriptChars)}\n\n[… transcript truncated; full text in Fireflies]`;
+      }
+      return [
+        '---',
+        'type: call',
+        `title: "${q(t.title || 'Untitled call').slice(0, 160)}"`,
+        `date: "${dayIso}"`,
+        `duration_min: ${durationMin}`,
+        `fireflies_id: "${t.id}"`,
+        `transcript_url: "${q(t.transcript_url)}"`,
+        'attendees:',
+        ...(attendees.length
+          ? attendees.map(a => `  - name: "${q(a.name)}"\n    email: "${q(a.email)}"`)
+          : ['  []']),
+        'tags: [call, fireflies]',
+        '---',
+        '',
+        `# ${t.title || 'Untitled call'}`,
+        '',
+        '## Summary',
+        '',
+        String(s.overview || s.short_summary || '_No summary._').trim(),
+        '',
+        '## Action items',
+        '',
+        actions.length ? actions.map(a => `- ${a}`).join('\n') : '_None._',
+        '',
+        '## Keywords',
+        '',
+        keywords.length ? keywords.join(', ') : '_None._',
+        '',
+        '## Attendees',
+        '',
+        attendees.length ? attendees.map(a => `- ${a.name || a.email}${a.email ? ` <${a.email}>` : ''}`).join('\n') : '_None recorded._',
+        '',
+        '## Transcript',
+        '',
+        transcript || '_No transcript text._',
+        '',
+      ].join('\n');
+    }
+
+    // ---- people linking ----
+
+    function pageText(p) {
+      if (!p) return '';
+      return [p.content, p.compiled_truth, p.frontmatter ? JSON.stringify(p.frontmatter) : '', JSON.stringify(p)].join('\n').toLowerCase();
+    }
+
+    const personCache = new Map();
+
+    // A people/ page matches only if the address is really on the page (search alone is fuzzy).
+    async function findPerson(email) {
+      if (personCache.has(email)) return personCache.get(email);
+      let slug = null;
+      const res = await gbrainCall('search', { query: email, limit: 5, types: ['person'] });
+      const rows = Array.isArray(res) ? res : (res?.results ?? []);
+      for (const row of rows) {
+        if (!row?.slug || !String(row.slug).startsWith('people/')) continue;
+        const page = await gbrainCall('get_page', { slug: row.slug, include_content: true });
+        if (pageText(page).includes(email)) { slug = row.slug; break; }
+      }
+      personCache.set(email, slug);
+      return slug;
+    }
+
+    async function linkAttendees(callSlugStr, t, attendees) {
+      const organizer = String(t.organizer_email ?? '').trim().toLowerCase();
+      let linked = 0;
+      for (const a of attendees) {
+        if (!a.email || OWN_EMAILS.has(a.email)) continue;
+        if (a.email === organizer && OWN_EMAILS.has(organizer)) continue;
+        let personSlug;
+        try { personSlug = await findPerson(a.email); }
+        catch (e) { console.error(`WARN: person lookup failed for ${a.email}: ${e.message}`); continue; }
+        if (!personSlug) { console.log(`unmatched attendee (no people/ page): ${a.email}`); continue; }
+        // add_link is an upsert on (from, to, type, source), so re-runs do not duplicate. Both pages exist by now.
+        const args = { from: callSlugStr, to: personSlug, context: 'attended', link_source: 'fireflies' };
+        try {
+          await gbrainCall('add_link', { ...args, link_type: 'attended' });
+          linked++;
+        } catch (e) {
+          if (!/invalid_params/.test(e.message)) { console.error(`WARN: add_link ${callSlugStr} -> ${personSlug}: ${e.message}`); continue; }
+          try { await gbrainCall('add_link', args); linked++; }
+          catch (e2) { console.error(`WARN: untyped add_link ${callSlugStr} -> ${personSlug}: ${e2.message}`); }
+        }
+      }
+      return linked;
+    }
+
+    // ---- main ----
+
+    async function collect() {
+      if (!API_KEY || API_KEY === 'REPLACE_ME') {
+        console.log('fireflies-collector: FIREFLIES_API_KEY is not set (placeholder or empty); nothing to do. Set it in the fireflies-collector Secret.');
+        return;
+      }
+      if (!GBRAIN_TOKEN) {
+        console.error('fireflies-collector: GBRAIN_REMOTE_TOKEN not set; skipping run');
+        return;
+      }
+
+      const state = await loadState();
+      const fromMs = state.checkpoint && Number.isFinite(Date.parse(state.checkpoint))
+        ? Date.parse(state.checkpoint) - OVERLAP_MS
+        : Date.now() - FIRST_RUN_DAYS * 86_400_000;
+      const fromDate = new Date(fromMs).toISOString();
+      console.log(`fireflies-collector: listing transcripts since ${fromDate}`);
+
+      let stoppedEarly = null;
+      const found = new Map();
+      try {
+        for (let skip = 0; ; skip += PAGE_SIZE) {
+          const d = await firefliesQuery(LIST_QUERY, { fromDate, limit: PAGE_SIZE, skip });
+          const batch = d?.transcripts ?? [];
+          for (const t of batch) if (t?.id) found.set(t.id, t);
+          if (batch.length < PAGE_SIZE) break;
+        }
+      } catch (e) {
+        if (e instanceof RateLimited || e instanceof BudgetExhausted) {
+          stoppedEarly = e.message;
+          console.error(`WARN: stopping run while listing: ${e.message}`);
+        } else throw e;
+      }
+
+      // Oldest first, so the checkpoint only ever moves forward over fully processed transcripts.
+      const fresh = [...found.values()]
+        .filter(t => !state.ids[t.id])
+        .sort((a, b) => (toMs(a.date) || 0) - (toMs(b.date) || 0));
+      console.log(`fireflies-collector: ${found.size} listed, ${fresh.length} new`);
+
+      let pushed = 0, linked = 0, failed = 0;
+      let checkpointBlocked = false;
+      for (const item of fresh) {
+        if (stoppedEarly) break;
+        try {
+          const d = await firefliesQuery(DETAIL_QUERY, { id: item.id });
+          const t = d?.transcript;
+          if (!t?.id) throw new Error('transcript not returned');
+          const ms = toMs(t.date ?? item.date);
+          if (!Number.isFinite(ms)) throw new Error('transcript has no usable date');
+          const dayIso = new Date(ms).toISOString().slice(0, 10);
+          const attendees = attendeeList(t);
+          const slug = callSlug(t, dayIso);
+
+          try {
+            await gbrainPutPage(slug, callToMarkdown(t, dayIso, attendees, 0));
+          } catch (e) {
+            if (!/size|large|too long|limit|413/i.test(e.message)) throw e;
+            console.error(`WARN: ${slug} rejected at full size (${e.message}); retrying with a truncated transcript`);
+            await gbrainPutPage(slug, callToMarkdown(t, dayIso, attendees, FALLBACK_MAX_CHARS));
+          }
+          pushed++;
+          try { linked += await linkAttendees(slug, t, attendees); }
+          catch (e) { console.error(`WARN: linking failed for ${slug}: ${e.message}`); }
+
+          state.ids[t.id] = new Date().toISOString();
+          if (!checkpointBlocked && (!state.checkpoint || ms > Date.parse(state.checkpoint))) {
+            state.checkpoint = new Date(ms).toISOString();
+          }
+          await saveState(state);
+        } catch (e) {
+          if (e instanceof RateLimited || e instanceof BudgetExhausted) {
+            stoppedEarly = e.message;
+            console.error(`WARN: stopping run: ${e.message}; checkpoint stays at ${state.checkpoint}`);
+            break;
+          }
+          failed++;
+          checkpointBlocked = true;   // never advance past a transcript that failed; processed ids still prevent repeats
+          console.error(`WARN: transcript ${item.id} failed: ${e.message}`);
+        }
+      }
+
+      try { await saveState(state); }
+      catch (e) { console.error(`WARN: state save failed, will retry next run: ${e.message}`); }
+      console.log(`fireflies-collector: pushed ${pushed}, links ${linked}, failed ${failed}, api calls ${apiCalls}/${MAX_API_CALLS}, checkpoint ${state.checkpoint}${stoppedEarly ? `, stopped early (${stoppedEarly})` : ''}`);
+    }
+
+    await collect();
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fireflies-collector
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 3300
+      template:
+        metadata:
+          labels:
+            app: fireflies-collector
+        spec:
+          serviceAccountName: fireflies-collector
+          restartPolicy: Never
+          containers:
+            - name: collector
+              image: oven/bun:1-alpine
+              imagePullPolicy: IfNotPresent
+              command: ["bun", "/scripts/fireflies-collector.mjs"]
+              env:
+                - name: FIREFLIES_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: fireflies-collector
+                      key: FIREFLIES_API_KEY
+                      optional: true
+                - name: GBRAIN_MCP_URL
+                  value: http://gbrain:3131/mcp
+                - name: GBRAIN_REMOTE_TOKEN
+                  value: "gbrain-mcp"
+              volumeMounts:
+                - name: collector-script
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: collector-script
+              configMap:
+                name: fireflies-collector-script
