@@ -117,6 +117,20 @@ data:
     import { readFileSync } from 'fs';
     import { join } from 'path';
 
+    // The kubelet refreshes this ConfigMap-mounted file in place when the
+    // script changes; exit so the container restarts on the new code instead
+    // of serving the old one until someone rolls the Deployment.
+    const SELF = '/scripts/fireflies-ingest.mjs';
+    const selfHash = () => { try { return createHash('sha256').update(readFileSync(SELF)).digest('hex'); } catch { return null; } };
+    const BOOT_HASH = selfHash();
+    setInterval(() => {
+      const h = selfHash();
+      if (BOOT_HASH && h && h !== BOOT_HASH) {
+        console.error('script changed on disk; exiting to restart on the new version');
+        process.exit(0);
+      }
+    }, 30_000).unref();
+
     const PORT = Number(process.env.PORT ?? 8080);
     const DATABASE_URL = process.env.DATABASE_URL ?? '';
 
@@ -990,6 +1004,8 @@ spec:
         entity: ssint
         env: main
         capability: msg
+      annotations:
+        simplesalt.company/restart-epoch: "1"
     spec:
       serviceAccountName: fireflies-ingest
       containers:
