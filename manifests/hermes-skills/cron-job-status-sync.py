@@ -9,7 +9,8 @@ what it cannot match on the "Unmatched job emails" Notion page. Nothing here ema
 
 State lives on the gbrain page ops/job-status-sync: the gbrain update time last examined for each thread,
 so unchanged threads are not read again, and the message count last handed to Hermes, so a thread is
-handed over again only when a new message lands in it. Hermes answers with JSON after a
+handed over again only when a new message lands in it. A thread Hermes never answers for (a failed run)
+is handed over again after a few hours, up to three tries. Hermes answers with JSON after a
 JOB-STATUS-RESULT line; the next run copies those answers onto the same page as a log. With nothing to do
 it prints {"wakeAgent": false} so the job skips the model call.
 """
@@ -28,6 +29,8 @@ DAYS = 30
 MAX_EXAMINED = 200
 LOG_KEEP = 200
 OUTPUTS_KEEP = 1000
+RETRY_AFTER_H = 3
+MAX_TRIES = 3
 OUTPUT_DIR = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "cron", "output")
 MARKER = "JOB-STATUS-RESULT"
 DRY_RUN = os.environ.get("JOB_STATUS_DRY_RUN") == "1"
@@ -100,7 +103,8 @@ def load_state():
     except RuntimeError:
         pass
     return {"seen": state.get("seen") or {}, "handed": state.get("handed") or {},
-            "outputs": state.get("outputs") or [], "log": state.get("log") or []}
+            "pending": state.get("pending") or {}, "outputs": state.get("outputs") or [],
+            "log": state.get("log") or []}
 
 
 def save_state(state):
@@ -149,7 +153,24 @@ def main():
     pages = [p for p in all_pages(type="email", source_id="gmail")
              if (p.get("updated_at") or "")[:10] >= since and state["seen"].get(p["slug"]) != p.get("updated_at")]
     pages.sort(key=lambda p: p.get("updated_at") or "")
-    batch, examined = [], 0
+    # Threads Hermes was handed but never answered for (a failed or cut-off run) go out again, up to MAX_TRIES.
+    for e in entries:
+        state["pending"].pop(e.get("item"), None)
+    batch, examined, gave_up = [], 0, 0
+    stale = (now - datetime.timedelta(hours=RETRY_AFTER_H)).isoformat()
+    changed = {p["slug"] for p in pages}
+    for slug, p in list(state["pending"].items()):
+        # A thread with a change waits for the loop below, which hands it over with its new messages.
+        if p["at"] > stale or slug in changed:
+            continue
+        if p["tries"] >= MAX_TRIES or len(batch) >= BATCH:
+            if p["tries"] >= MAX_TRIES:
+                print(f"job-status-sync: gave up on {slug} after {p['tries']} unanswered tries", file=sys.stderr)
+                state["pending"].pop(slug)
+                gave_up += 1
+            continue
+        batch.append(p["item"])
+        p.update(at=now.isoformat(), tries=p["tries"] + 1)
     for page in pages:
         if len(batch) >= BATCH or examined >= MAX_EXAMINED:
             break
@@ -166,15 +187,18 @@ def main():
         from_ats, job = is_job_email(fm, subject)
         if not job:
             continue
-        batch.append({"slug": slug, "date": (fm.get("date") or "")[:10], "subject": subject,
-                      "from": fm.get("from"), "from_ats": from_ats, "messages": count,
-                      "new_messages": count - int(state["handed"].get(slug) or 0)})
+        item = {"slug": slug, "date": (fm.get("date") or "")[:10], "subject": subject,
+                "from": fm.get("from"), "from_ats": from_ats, "messages": count,
+                "new_messages": count - int(state["handed"].get(slug) or 0)}
+        batch.append(item)
         state["handed"][slug] = count
+        state["pending"][slug] = {"item": item, "at": now.isoformat(), "tries": 1}
     # Forget threads that have aged out of the window, so the state page stays small.
     state["seen"] = {s: u for s, u in state["seen"].items() if (u or "")[:10] >= since}
     state["handed"] = {s: n for s, n in state["handed"].items() if s in state["seen"]}
+    state["pending"] = {s: p for s, p in state["pending"].items() if s in state["seen"]}
     state["outputs"] = state["outputs"][-OUTPUTS_KEEP:]
-    if (examined or keys) and not DRY_RUN:
+    if (examined or keys or batch or gave_up) and not DRY_RUN:
         save_state(state)
     if not batch:
         print(json.dumps({"wakeAgent": False}))
