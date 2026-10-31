@@ -54,6 +54,8 @@ configMapGenerator:
       - cron-daily-brief.py=manifests/hermes-skills/cron-daily-brief.py
       - cron-daily-brief.md=manifests/hermes-skills/cron-daily-brief.md
       - cron-linkedin-lookup.py=manifests/hermes-skills/cron-linkedin-lookup.py
+      - cron-job-status-sync.py=manifests/hermes-skills/cron-job-status-sync.py
+      - cron-job-status-sync.md=manifests/hermes-skills/cron-job-status-sync.md
       - SOUL.md=manifests/SOUL.md
       - AGENTS.md=manifests/AGENTS.md
   - name: lease-sweep-script

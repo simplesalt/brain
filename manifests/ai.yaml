@@ -956,6 +956,8 @@ spec:
               schedule_job people-scan "every 1m"
               cp /seed/cron-deletion-review.py /opt/data/scripts/cron-deletion-review.py
               schedule_job deletion-review "0 3 * * *"
+              cp /seed/cron-job-status-sync.py /opt/data/scripts/cron-job-status-sync.py
+              schedule_job job-status-sync "every 1h"
               cp /seed/cron-linkedin-lookup.py /opt/data/scripts/cron-linkedin-lookup.py
               if "$HERMES_BIN" cron list 2>/dev/null | grep -q linkedin-lookup; then
                 echo "cron: linkedin-lookup already scheduled"
