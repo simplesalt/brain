@@ -172,8 +172,11 @@ metadata:
     env: main
     capability: crawl
 spec:
-  # Runs one full crawl cycle every other day (07:23 UTC) and exits.
-  schedule: "23 7 */2 * *"
+  # Runs one full crawl cycle every other day (07:23 UTC) and exits. Cron
+  # day-of-month steps restart each month (*/2 fires on the 31st and the 1st),
+  # so the schedule fires daily and the container skips even days since the
+  # Unix epoch, keeping runs exactly 48 hours apart across month ends.
+  schedule: "23 7 * * *"
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 3600
   successfulJobsHistoryLimit: 3
@@ -196,7 +199,15 @@ spec:
             - name: discovery-worker
               image: oven/bun:1-alpine
               imagePullPolicy: IfNotPresent
-              command: ["bun", "/scripts/discovery-worker.mjs"]
+              command:
+                - sh
+                - -c
+                - |
+                  if [ $(( $(date -u +%s) / 86400 % 2 )) -eq 0 ]; then
+                    echo "discovery-worker: even epoch day, skipping"
+                    exit 0
+                  fi
+                  exec bun /scripts/discovery-worker.mjs
               env:
                 - name: DATABASE_URL
                   valueFrom:
