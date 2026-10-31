@@ -1,0 +1,62 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: discovery-to-notion
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  # Hourly: copies newly considered roles into the Notion Jobs database. Roles already there are
+  # skipped by Crawl ID, so repeat runs are safe.
+  schedule: "41 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 172800
+      template:
+        metadata:
+          labels:
+            app: discovery-to-notion
+            entity: ssint
+            env: main
+            capability: ai
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: discovery-to-notion
+              image: oven/bun:1-alpine
+              imagePullPolicy: IfNotPresent
+              command: ["bun", "/scripts/discovery-to-notion.mjs"]
+              env:
+                - name: NOTION_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: mcp-proxy-secrets
+                      key: NOTION_TOKEN
+                # Read-only login, non-secret by repo convention (see crawl-read-login). Served
+                # by -rw because the single-instance cluster has no replicas for -ro to reach.
+                - name: DATABASE_URL
+                  value: postgresql://crawl_read:dummy@crawl-pg-rw.ssint-main-crawl.svc:5432/crawl
+                - name: JOBS_DATA_SOURCE_ID
+                  value: f52dd071-f908-470a-a19e-9b303ee7134b
+                - name: TARGET_ROLES_DATA_SOURCE_ID
+                  value: 333e6a5b-9779-808c-ae3e-000b5ecb66ac
+              resources:
+                requests:
+                  memory: 32Mi
+                limits:
+                  memory: 128Mi
+              volumeMounts:
+                - name: discovery-to-notion-script
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: discovery-to-notion-script
+              configMap:
+                name: discovery-to-notion-script

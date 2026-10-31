@@ -20,6 +20,7 @@ resources:
   - manifests/email-collector.yaml
   - manifests/calendar-collector.yaml
   - manifests/lease-sweep.yaml
+  - manifests/discovery-to-notion.yaml
   - manifests/hermes-msg.yaml
   - manifests/duxsoup-ingest.yaml
   - manifests/coding.yaml
@@ -59,6 +60,10 @@ configMapGenerator:
     namespace: ssint-main-ai
     files:
       - lease-sweep.mjs=scripts/lease-sweep.mjs
+  - name: discovery-to-notion-script
+    namespace: ssint-main-ai
+    files:
+      - discovery-to-notion.mjs=scripts/discovery-to-notion.mjs
   - name: discovery-worker-script
     namespace: ssint-main-crawl
     options:

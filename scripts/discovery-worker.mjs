@@ -52,7 +52,6 @@ const GOOGLE_JOBS_SEEDS = {
   karen: ["security chief of staff remote", "chief of staff information security remote"],
   terry: ["enterprise security architect remote", "principal security architect remote"],
   dwayne: ["business information security officer remote", "BISO remote"],
-  chad: ["GRC manager remote", "governance risk and compliance manager remote"],
 };
 const PAGE_TEXT_MAX_CHARS = 8000;
 
@@ -148,22 +147,10 @@ const SEEDS = [
       "Job posting for a Business Information Security Officer (BISO) embedded in a division of a large enterprise, responsible for security risk metrics and posture",
     ],
   },
-  {
-    name: "chad",
-    role: "GRC Manager",
-    company_type: "Fortune 500",
-    responsibilities: "Drives governance, risk, and compliance program delivery.",
-    flavor:
-      "Delivery/execution language (managing audits, controls, frameworks like SOX/ISO/NIST) is a stronger signal than pure policy-writing roles.",
-    serper_queries: [],
-    exa_queries: [
-      "Job posting for a Governance, Risk, and Compliance (GRC) Manager at a large enterprise, driving delivery of GRC programs and compliance initiatives",
-    ],
-  },
 ];
 
 // Searches no longer wanted: seeding retires them (retired_at), keeping the rows their history references.
-const RETIRED_SEEDS = ["mario"];
+const RETIRED_SEEDS = ["mario", "chad"];
 
 // Applied once per cycle: CNPG may create the crawl_read role after the previous cycle ended.
 const READ_ROLE_GRANTS = `DO $$ BEGIN
