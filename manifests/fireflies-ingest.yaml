@@ -164,7 +164,7 @@ data:
         process.exit(1);
       }
       if (!SIGNING_SECRET) {
-        console.error('WARN: FIREFLIES_WEBHOOK_SECRET not set - /fireflies/events will reject every request with 401');
+        console.error('WARN: FIREFLIES_WEBHOOK_SECRET not set - the webhook endpoint will reject every request with 401');
       }
       if (!API_KEY) {
         console.error('WARN: FIREFLIES_API_KEY not set - events are stored but not processed, and the hourly reconcile is skipped');
@@ -957,7 +957,7 @@ data:
           const { pathname } = new URL(req.url);
           if (pathname === '/healthz') return Response.json({ ok: true });
           if (pathname === '/readyz') return handleReadyz();
-          if (pathname === '/fireflies/events' && req.method === 'POST') return handleEventsPost(req);
+          if (pathname === '/c8d3f02053a7ef0c/fireflies' && req.method === 'POST') return handleEventsPost(req);
           return new Response('Not Found', { status: 404 });
         },
         error(e) { return Response.json({ error: e.message }, { status: 500 }); },

@@ -255,8 +255,10 @@ spec:
         - hostname: hooks.simplesalt.company
           path: ^/duxsoup/events$
           service: http://duxsoup-ingest.ssint-main-msg.svc.k.famevans.win:8080
-        - hostname: hooks.simplesalt.company
-          path: ^/fireflies/events$
+        # No Access block: Fireflies can't present an Access token; the ingest
+        # checks Fireflies' X-Hub-Signature instead.
+        - hostname: api.simplesalt.company
+          path: ^/c8d3f02053a7ef0c/fireflies$
           service: http://fireflies-ingest.ssint-main-msg.svc.k.famevans.win:8080
         - service: http_status:404
   providerConfigRef:
