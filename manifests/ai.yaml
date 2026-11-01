@@ -650,6 +650,37 @@ spec:
               value: "gbrain-addon"
             - name: ADDON_DEFAULT_SOURCE
               value: "google"
+            # Reply-needed check: a cheap model through gbrain's AI gateway (same keys and model settings as gbrain).
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: GENERAL_API_LLM_API_KEY
+            - name: GBRAIN_CHAT_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_SLOW_REASONING_MODEL
+            - name: GBRAIN_EXPANSION_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_LIVE_DUMB_MODEL
+            - name: GBRAIN_LIVE_DUMB_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_LIVE_DUMB_MODEL
+            - name: GBRAIN_SLOW_REASONING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_SLOW_REASONING_MODEL
+            - name: GBRAIN_SLOW_DUMB_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_SLOW_DUMB_MODEL
           resources:
             requests:
               memory: 64Mi
