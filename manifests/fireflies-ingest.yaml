@@ -653,31 +653,82 @@ data:
     // People linking
     // ---------------------------------------------------------------------------
 
-    function pageText(p) {
-      if (!p) return '';
-      return [p.content, p.compiled_truth, p.frontmatter ? JSON.stringify(p.frontmatter) : '', JSON.stringify(p)].join('\n').toLowerCase();
+    // Every address a person page carries as an exact string: frontmatter aliases, emails and email
+    // (older pages use the last two). Falls back to the frontmatter block of the page content when
+    // get_page returns no parsed frontmatter. Body text never counts.
+    function pageEmails(p) {
+      const out = new Set();
+      const add = (v) => {
+        if (Array.isArray(v)) { v.forEach(add); return; }
+        if (typeof v === 'string' && v.trim()) out.add(v.trim().toLowerCase());
+      };
+      let fm = p?.frontmatter;
+      if (!fm || typeof fm !== 'object') {
+        fm = {};
+        const block = /^---\r?\n([\s\S]*?)\r?\n---/.exec(String(p?.content ?? ''))?.[1] ?? '';
+        let key = null;
+        for (const line of block.split(/\r?\n/)) {
+          const kv = /^(aliases|emails|email)\s*:\s*(.*)$/i.exec(line);
+          if (kv) {
+            key = kv[1].toLowerCase();
+            const rest = kv[2].trim();
+            fm[key] = rest.startsWith('[') ? rest.slice(1, rest.lastIndexOf(']')).split(',') : (rest ? [rest] : []);
+          } else if (key && /^\s*-\s+/.test(line)) fm[key].push(line.replace(/^\s*-\s+/, ''));
+          else if (/^\S/.test(line)) key = null;
+        }
+        for (const k of Object.keys(fm)) fm[k] = fm[k].map((x) => String(x).trim().replace(/^["']|["']$/g, ''));
+      }
+      add(fm.aliases); add(fm.emails); add(fm.email);
+      return out;
     }
 
     const PERSON_CACHE_TTL_MS = 10 * 60_000;
     const personCache = new Map();   // email -> { slug, at }
 
-    // A people/ page matches only if the address is really on the page (search alone is fuzzy).
+    // A people/ page matches only if the address equals one of its frontmatter aliases/emails/email
+    // (search alone is fuzzy, and a body mention is not identity). Two pages claiming the same address
+    // link neither: duplicates are cleaned up elsewhere.
     async function findPerson(email) {
       const hit = personCache.get(email);
       if (hit && Date.now() - hit.at < PERSON_CACHE_TTL_MS) return hit.slug;
-      let slug = null;
+      const matches = [];
       const res = await gbrainCall('search', { query: email, limit: 5, types: ['person'] });
       const rows = Array.isArray(res) ? res : (res?.results ?? []);
       for (const row of rows) {
-        if (!row?.slug || !String(row.slug).startsWith('people/')) continue;
+        if (!row?.slug || !String(row.slug).startsWith('people/') || matches.includes(row.slug)) continue;
         const page = await gbrainCall('get_page', { slug: row.slug, include_content: true });
-        if (pageText(page).includes(email)) { slug = row.slug; break; }
+        if (pageEmails(page).has(email)) matches.push(row.slug);
       }
+      let slug = null;
+      if (matches.length === 1) slug = matches[0];
+      else if (matches.length > 1) console.error(`WARN: ambiguous attendee ${email}: person pages ${matches.join(', ')} all carry it; linking none`);
       personCache.set(email, { slug, at: Date.now() });
       return slug;
     }
 
-    async function linkAttendees(callSlugStr, t, attendees) {
+    // UUID-shaped request_id (sha256, version 5, variant 10xx): a re-run of the same timeline write
+    // replays gbrain's original receipt instead of adding a second entry.
+    function timelineRequestId(personSlug, callSlugStr, dayIso, summary) {
+      const h = createHash('sha256').update(`fireflies-ingest:add_timeline_entry:${personSlug}:${callSlugStr}:${dayIso}:${summary}`).digest('hex');
+      const variant = ((parseInt(h[16], 16) & 0x3) | 0x8).toString(16);
+      return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+    }
+
+    // add_timeline_entry params: { slug, date, summary, detail, source } (date strict YYYY-MM-DD).
+    async function addMeetingTimeline(personSlug, callSlugStr, t, dayIso) {
+      const summary = `Call: ${q(t.title || 'Untitled call')}`.slice(0, 200);
+      const receipt = await gbrainCall('add_timeline_entry', {
+        slug: personSlug, date: dayIso, summary,
+        detail: `Fireflies-recorded meeting [[${callSlugStr}]].`,
+        source: callSlugStr,
+        request_id: timelineRequestId(personSlug, callSlugStr, dayIso, summary),
+      });
+      if (receipt?.state && receipt.state !== 'committed') {
+        throw new Error(`write not committed: state=${receipt.state} request_id=${receipt.request_id}`);
+      }
+    }
+
+    async function linkAttendees(callSlugStr, t, attendees, dayIso) {
       const organizer = String(t.organizer_email ?? '').trim().toLowerCase();
       let linked = 0;
       for (const a of attendees) {
@@ -686,7 +737,7 @@ data:
         let personSlug;
         try { personSlug = await findPerson(a.email); }
         catch (e) { console.error(`WARN: person lookup failed for ${a.email}: ${e.message}`); continue; }
-        if (!personSlug) { console.log(`unmatched attendee (no people/ page): ${a.email}`); continue; }
+        if (!personSlug) { console.log(`unmatched attendee (no unique people/ page): ${a.email}`); continue; }
         // add_link is an upsert on (from, to, type, source), so re-runs do not duplicate. Both pages exist by now.
         const args = { from: callSlugStr, to: personSlug, context: 'attended', link_source: 'fireflies' };
         try {
@@ -697,6 +748,8 @@ data:
           try { await gbrainCall('add_link', args); linked++; }
           catch (e2) { console.error(`WARN: untyped add_link ${callSlugStr} -> ${personSlug}: ${e2.message}`); }
         }
+        try { await addMeetingTimeline(personSlug, callSlugStr, t, dayIso); }
+        catch (e) { console.error(`WARN: timeline entry ${personSlug} for ${callSlugStr}: ${e.message}`); }
       }
       return linked;
     }
@@ -735,7 +788,7 @@ data:
       if (!exists) await gbrainPutPage(slug, meetingToMarkdown(t, dayIso, attendees), { force: false });
       else console.log(`meeting page ${slug} exists; left untouched`);
       let linked = 0;
-      try { linked = await linkAttendees(slug, t, attendees); }
+      try { linked = await linkAttendees(slug, t, attendees, dayIso); }
       catch (e) { console.error(`WARN: linking failed for ${slug}: ${e.message}`); }
 
       await sql`

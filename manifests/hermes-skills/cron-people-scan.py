@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 import urllib.request
 
 URL = os.environ.get("GBRAIN_URL", "http://gbrain:3131/mcp")
@@ -152,25 +153,131 @@ def yaml_str(s):
     return json.dumps(s, ensure_ascii=False)
 
 
+def norm_name(s):
+    s = unicodedata.normalize("NFKD", s or "")
+    return " ".join("".join(c for c in s if not unicodedata.combining(c)).casefold().split())
+
+
+def as_list(v):
+    return [str(x) for x in v] if isinstance(v, list) else ([str(v)] if v else [])
+
+
+def emails_of(page):
+    """The email addresses a page carries in aliases, emails or email, lowercased."""
+    fm = (page or {}).get("frontmatter") or {}
+    found = {a.strip().lower() for k in ("aliases", "emails", "email") for a in as_list(fm.get(k)) if "@" in a}
+    return found
+
+
+def page_title(page):
+    # gbrain v0.60+ keeps the title on the page object, older pages in frontmatter.
+    return page.get("title") or (page.get("frontmatter") or {}).get("title")
+
+
+def read_page(slug):
+    try:
+        page = call("get_page", {"slug": slug, "include_content": True})
+    except RuntimeError:
+        return None
+    return page if isinstance(page, dict) else None
+
+
+def pages_with_email(email):
+    """Person pages whose aliases, emails or email carry exactly this address: [(slug, page)]."""
+    try:
+        hits = call("search", {"query": email, "types": ["person"]})
+    except RuntimeError:
+        return []
+    if isinstance(hits, dict):
+        hits = hits.get("results") or []
+    found = []
+    for slug in dict.fromkeys(h.get("slug") for h in hits if isinstance(h, dict)):
+        page = read_page(slug) if slug and slug.startswith("people/") else None
+        if page and email in emails_of(page):
+            found.append((slug, page))
+    return found
+
+
+def add_to_list(lines, key, value, create):
+    item = yaml_str(value)
+    for i, line in enumerate(lines):
+        if not line.startswith(key + ":"):
+            continue
+        rest = line[len(key) + 1:].strip()
+        if rest.startswith("["):
+            inner = rest[1:-1].strip()
+            lines[i] = f"{key}: [{inner + ', ' if inner else ''}{item}]"
+        elif rest:
+            lines[i:i + 1] = [f"{key}:", f"  - {rest}", f"  - {item}"]
+        else:
+            j = i + 1
+            while j < len(lines) and re.match(r"\s*-\s", lines[j]):
+                j += 1
+            lines.insert(j, f"  - {item}")
+        return
+    if create:
+        lines += [f"{key}:", f"  - {item}"]
+
+
+def add_email(slug, email):
+    """Add the email to the page's aliases (and emails, if it has that list), keeping the rest of the page."""
+    for _ in range(3):
+        page = read_page(slug)
+        content = (page or {}).get("content")
+        m = re.match(r"---\n(.*?)\n---(?=\n|$)", content or "", re.S)
+        if not m:
+            raise RuntimeError(f"{slug}: no frontmatter to add {email} to")
+        lines = m.group(1).split("\n")
+        add_to_list(lines, "aliases", email, True)
+        add_to_list(lines, "emails", email, False)
+        args = {"slug": slug, "content": "---\n" + "\n".join(lines) + "\n---" + content[m.end():]}
+        if page.get("revision") is not None:
+            args["expected_revision"] = page["revision"]
+        try:
+            call("put_page", args)
+            return
+        except RuntimeError as e:
+            if "revision_conflict" not in str(e):
+                raise
+    raise RuntimeError(f"{slug}: revision conflict adding {email}")
+
+
+def new_slug(name, email, company):
+    """A free slug for this person, or the slug of a page of the same name that carries no other identifier."""
+    base = page_slug(name)
+    suffix = page_slug(company or email.split("@", 1)[1])[len("people/"):]
+    tries = [base, f"{base}-{suffix}"] + [f"{base}-{suffix}-{n}" for n in range(2, 10)]
+    for slug in tries:
+        page = read_page(slug)
+        if page is None:
+            return slug, False
+        if not emails_of(page) and norm_name(page_title(page)) == norm_name(name):
+            return slug, True
+    raise RuntimeError(f"no free slug for {name}")
+
+
 def write_person(p):
-    """Create the person's page, or add this meeting or thread to the page they already have."""
+    """Create the person's page, or add this meeting or thread to the page they already have.
+
+    The page is found by the exact email first; the model's existing_slug is used only when the title
+    matches the name. A page of the same name that carries another email is a different person.
+    """
     name, email, item = (p.get("name") or "").strip(), (p.get("email") or "").strip().lower(), p.get("item") or ""
     if not name or "@" not in email or not item:
         return
     entry = {"date": p.get("date") or "", "summary": (p.get("summary") or "Met or emailed Dylan")[:200], "source": item}
-    slug = p.get("existing_slug")
-    if slug:
-        try:
-            call("get_page", {"slug": slug})
-        except RuntimeError:
-            slug = None
+    matches = pages_with_email(email)
+    if len(matches) > 1:
+        print(f"people-scan: {email} is on several person pages ({', '.join(s for s, _ in matches)}); skipped {name}",
+              file=sys.stderr)
+        return
+    slug, needs_email = (matches[0][0], False) if matches else (None, True)
+    if not slug and p.get("existing_slug"):
+        page = read_page(p["existing_slug"])
+        if page and norm_name(page_title(page)) == norm_name(name):
+            slug = p["existing_slug"]
     if not slug:
-        slug = page_slug(name)
-        try:
-            call("get_page", {"slug": slug})
-            exists = True
-        except RuntimeError:
-            exists = False
+        slug, exists = new_slug(name, email, p.get("company"))
         if not exists:
             fm = ["---", "type: person", f"title: {yaml_str(name)}"]
             if p.get("company"):
@@ -181,6 +288,9 @@ def write_person(p):
             call("put_page", {"slug": slug, "content": "\n".join(fm) + body})
             if p.get("dylan_met_or_wrote"):
                 call("add_tag", {"slug": slug, "tag": "needs-linkedin"})
+            needs_email = False
+    if needs_email:
+        add_email(slug, email)
     call("add_timeline_entry", dict(entry, slug=slug))
 
 
