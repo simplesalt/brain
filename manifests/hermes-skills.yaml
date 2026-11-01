@@ -18,6 +18,7 @@ gbrain:
   - blog-ingest
   - strategic-reading
   - draft-in-voice
+  - meeting-ingestion
 bundled:
   - hermes-agent
   - humanizer

@@ -105,6 +105,7 @@ mcp_servers:
         - put_page
         - list_pages
         - get_timeline
+        - chronicle_day
         - add_timeline_entry
         - get_raw_data
         - sources_list

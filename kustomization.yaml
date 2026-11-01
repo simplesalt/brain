@@ -50,6 +50,8 @@ configMapGenerator:
       - qr-code-selftest-small.jpg=manifests/hermes-skills/qr-code-selftest-small.img
       - cron-people-scan.py=manifests/hermes-skills/cron-people-scan.py
       - cron-people-scan.md=manifests/hermes-skills/cron-people-scan.md
+      - cron-meeting-ingest.py=manifests/hermes-skills/cron-meeting-ingest.py
+      - cron-meeting-ingest.md=manifests/hermes-skills/cron-meeting-ingest.md
       - cron-deletion-review.py=manifests/hermes-skills/cron-deletion-review.py
       - cron-deletion-review.md=manifests/hermes-skills/cron-deletion-review.md
       - cron-daily-brief.py=manifests/hermes-skills/cron-daily-brief.py

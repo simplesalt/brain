@@ -954,6 +954,9 @@ spec:
                 fi
               }
               schedule_job people-scan "every 1m"
+              cp /seed/cron-meeting-ingest.py /opt/data/scripts/cron-meeting-ingest.py
+              # Every 5m: one long call per run, and a finished Fireflies call is ingested within minutes.
+              schedule_job meeting-ingest "every 5m"
               cp /seed/cron-deletion-review.py /opt/data/scripts/cron-deletion-review.py
               schedule_job deletion-review "0 3 * * *"
               cp /seed/cron-job-status-sync.py /opt/data/scripts/cron-job-status-sync.py
