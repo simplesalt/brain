@@ -1040,6 +1040,16 @@ spec:
               else
                 echo "WARN: cron linkedin-lookup not scheduled (non-fatal)"
               fi
+              # Dry run unless PERSON_DEDUPE_LIVE=1 is set for the job.
+              cp /seed/cron-person-dedupe.py /opt/data/scripts/cron-person-dedupe.py
+              if "$HERMES_BIN" cron list 2>/dev/null | grep -q person-dedupe; then
+                echo "cron: person-dedupe already scheduled"
+              elif "$HERMES_BIN" cron create "0 4 * * *" --no-agent --script cron-person-dedupe.py \
+                  --name person-dedupe --deliver local; then
+                echo "cron: person-dedupe scheduled (daily 04:00, dry run)"
+              else
+                echo "WARN: cron person-dedupe not scheduled (non-fatal)"
+              fi
               cp /seed/cron-timeline-sweep.py /opt/data/scripts/cron-timeline-sweep.py
               if "$HERMES_BIN" cron list 2>/dev/null | grep -q timeline-sweep; then
                 echo "cron: timeline-sweep already scheduled"

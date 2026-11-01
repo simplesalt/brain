@@ -1322,10 +1322,21 @@ data:
     // that already carries it is not rewritten.
     async function syncPersonPage(profileRow, rawPayload, eventId, timelineBullet = null, details = null) {
       const fullName = [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim();
-      const slug = profileRow.gbrain_slug
-        || (await findMatchingPersonSlug(profileRow, fullName, details))
-        || deriveSlug(profileRow);
-      const existing = await gbrainGetPage(slug, { includeContent: true });
+      // A stored slug whose page is gone (merged into another person page by the
+      // duplicate-person job) is looked up again: the survivor carries this
+      // profile's identifiers, so recreating the old slug would fork a duplicate.
+      let slug = profileRow.gbrain_slug;
+      let existing = slug ? await gbrainGetPage(slug, { includeContent: true }) : null;
+      if (!existing) {
+        const found = await findMatchingPersonSlug(profileRow, fullName, details);
+        if (found) {
+          slug = found;
+          existing = await gbrainGetPage(slug, { includeContent: true });
+        } else if (!slug) {
+          slug = deriveSlug(profileRow);
+          existing = await gbrainGetPage(slug, { includeContent: true });
+        }
+      }
 
       const det = personDetailsFor(profileRow, fullName, details);
       await writePageWithRetry('syncPersonPage', slug, existing, eventId, (ex) => {

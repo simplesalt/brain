@@ -57,6 +57,7 @@ configMapGenerator:
       - cron-daily-brief.py=manifests/hermes-skills/cron-daily-brief.py
       - cron-daily-brief.md=manifests/hermes-skills/cron-daily-brief.md
       - cron-linkedin-lookup.py=manifests/hermes-skills/cron-linkedin-lookup.py
+      - cron-person-dedupe.py=manifests/hermes-skills/cron-person-dedupe.py
       - cron-job-status-sync.py=manifests/hermes-skills/cron-job-status-sync.py
       - cron-job-status-sync.md=manifests/hermes-skills/cron-job-status-sync.md
       - cron-timeline-sweep.py=manifests/hermes-skills/cron-timeline-sweep.py
