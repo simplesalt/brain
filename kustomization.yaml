@@ -23,7 +23,6 @@ resources:
   - manifests/lease-sweep.yaml
   - manifests/discovery-to-notion.yaml
   - manifests/notion-tasks-access-check.yaml
-  - manifests/openrouter-preset-check.yaml
   - manifests/hermes-msg.yaml
   - manifests/duxsoup-ingest.yaml
   - manifests/coding.yaml
@@ -84,22 +83,6 @@ configMapGenerator:
         capability: crawl
     files:
       - discovery-worker.mjs=scripts/discovery-worker.mjs
-  - name: openrouter-preset-check-script
-    namespace: ssint-main-ai
-    files:
-      - openrouter-preset-check.mjs=scripts/openrouter-preset-check.mjs
-  - name: openrouter-preset-check-script
-    namespace: ssint-main-voice
-    options:
-      labels: {entity: ssint, env: main, capability: voice}
-    files:
-      - openrouter-preset-check.mjs=scripts/openrouter-preset-check.mjs
-  - name: openrouter-preset-check-script
-    namespace: ssint-main-crawl
-    options:
-      labels: {entity: ssint, env: main, capability: crawl}
-    files:
-      - openrouter-preset-check.mjs=scripts/openrouter-preset-check.mjs
   # One model list (manifests/llm-models.env), one stable-named copy per consuming
   # namespace: a pod can only read a ConfigMap in its own namespace.
   - name: llm-models
