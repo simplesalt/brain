@@ -233,6 +233,11 @@ spec:
                 else
                   echo "WARN: gbrain google source add failed (non-fatal)"
                 fi
+                # autopilot leaves a connector source idle until one manual sync has run; run it in the
+                # background so serve starts now, and again on each start so a failed first sync retries
+                if [ -n "$GOOGLE_SOURCES" ]; then
+                  ( $GBRAIN sync --source google </dev/null || echo "WARN: gbrain sync --source google failed (non-fatal)" ) &
+                fi
               fi
               # Token grants live in access_tokens columns (source_grant, source_id, federated_read) and a
               # permissions JSON mirror. gbrain authorizes from the columns and denies the whole source axis
