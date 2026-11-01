@@ -186,6 +186,35 @@ def merge_twins(loops):
     return merged, twin_of
 
 
+def group_threads(loops):
+    """One task per email thread: fold every owed loop on the same page into the thread's lowest id.
+
+    gbrain often opens several loops for one thread (a reply owed plus a decision or two, re-extracted by each
+    source). The kept loop is open while any member is open; its summary names how many more asks the thread
+    holds, and `open_ids` lists every open member so Hermes can settle them all.
+    Returns (grouped loops, {member id: kept id})."""
+    pages = {}
+    for lid, loop in loops.items():
+        if loop.get("page_slug") and loop.get("loop_type") in OWED_TYPES:
+            pages.setdefault(loop["page_slug"], []).append(lid)
+    out, member_of = dict(loops), {}
+    for ids in pages.values():
+        ids.sort(key=int)
+        open_ids = [i for i in ids if loops[i].get("status") == "open"]
+        keep = dict(loops[ids[0]], open_ids=open_ids or [])
+        if open_ids:
+            first = loops[open_ids[0]]
+            keep.update(status="open", loop_type=first.get("loop_type"), summary=first.get("summary"),
+                        counterparty_email=keep.get("counterparty_email") or first.get("counterparty_email"))
+            if len(open_ids) > 1:
+                keep["summary"] = f"{first.get('summary') or '(no summary)'} (+{len(open_ids) - 1} more on this thread)"
+        out[ids[0]] = keep
+        for i in ids[1:]:
+            member_of[i] = ids[0]
+            out.pop(i)
+    return out, member_of
+
+
 def loop_state(loop):
     return "closed" if loop.get("status") in CLOSED_STATUSES else "open"
 
@@ -445,12 +474,16 @@ def main(dry_run):
     today = now.date().isoformat()
     all_loops, complete = read_loops()
     loops, twin_of = merge_twins(all_loops)
+    twins = len(twin_of)
+    loops, member_of = group_threads(loops)
+    twin_of.update(member_of)
     wanted = wanted_loops(loops, now)
     by_type = {}
     for l in wanted.values():
         by_type[l["loop_type"]] = by_type.get(l["loop_type"], 0) + 1
     print(f"gbrain: {len(loops)} loops read ({'complete' if complete else 'partial'}); "
-          f"{len(twin_of)} same-thread twins folded; {len(wanted)} owed-by-us loops get rows {by_type}")
+          f"{twins} source twins and {len(member_of)} same-thread loops folded; "
+          f"{len(wanted)} threads get rows {by_type}")
 
     toks = tokens()
     if not toks:
@@ -565,7 +598,8 @@ def main(dry_run):
                 if p["tries"] >= MAX_TRIES:
                     continue
             account, thread_id = thread_info(loop["page_slug"], cache) if loop.get("page_slug") else (None, None)
-            item = {"item": lid, "row": row["id"], "row_url": row["url"], "title": row["title"],
+            item = {"item": lid, "open_loop_ids": loop.get("open_ids") or [lid],
+                    "row": row["id"], "row_url": row["url"], "title": row["title"],
                     "loop_type": loop["loop_type"], "source": loop["source_id"], "summary": loop.get("summary"),
                     "page_slug": loop.get("page_slug"), "thread_link": thread_link(account, thread_id),
                     "counterparty": loop.get("counterparty_slug") or loop.get("counterparty_email"),
@@ -678,6 +712,10 @@ def self_test():
     assert tw == {"20": "10", "40": "30"}, tw
     assert m["10"]["status"] == "done" and m["30"]["status"] == "open" and "50" in m and twins["10"]["status"] == "done"
     assert sorted(wanted_loops(m)) == ["30", "50"]
+    g, mo = group_threads(m)
+    assert mo == {"50": "30"} and sorted(wanted_loops(g)) == ["30"], (mo, sorted(wanted_loops(g)))
+    assert g["30"]["open_ids"] == ["30", "50"] and g["30"]["summary"].endswith("(+1 more on this thread)")
+    assert g["10"]["status"] == "done" and g["10"]["open_ids"] == []
     users = [{"id": "u1", "type": "person", "name": "Dylan E", "person": {"email": DYLAN_ACCOUNT}},
              {"id": "u2", "type": "person", "name": "Other", "person": {"email": "o@x.com"}}]
     assert find_user(users, DYLAN_ACCOUNT) == "u1" and find_user(users, "o@x.com") == "u2" and find_user(users, "z@x.com") is None
