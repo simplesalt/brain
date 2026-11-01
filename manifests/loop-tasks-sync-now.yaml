@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # One-shot: runs the hourly loop-tasks-sync once, right away, outside Hermes.
+  # The fixed name makes Flux apply it once. Bump the suffix to run it again.
+  name: loop-tasks-sync-now-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: loop-tasks-sync-now
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: sync
+          image: python:3.12-alpine
+          command: ["python3", "/seed/cron-loop-tasks-sync.py"]
+          env:
+            - name: GBRAIN_URL
+              value: "http://gbrain:3131/mcp"
+            - name: GBRAIN_REMOTE_TOKEN
+              value: "gbrain-mcp"
+            - name: NOTION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-proxy-secrets
+                  key: NOTION_TOKEN
+            - name: NOTION_DELETION_REVIEW_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: NOTION_DELETION_REVIEW_TOKEN
+                  optional: true
+          volumeMounts:
+            - name: seed
+              mountPath: /seed
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: seed
+          configMap:
+            name: hermes-config
