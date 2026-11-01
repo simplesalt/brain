@@ -1668,7 +1668,8 @@ data:
         SELECT id, event, payload, received_at FROM events
         WHERE type = 'message'
           AND (processed_at IS NOT NULL OR id = ${currentEventId})
-          AND (payload->'data'->>'fromId' = ${threadId} OR payload->'data'->>'toId' = ${threadId})
+          -- payload can be stored as a JSON string scalar (see normalizePayload), so unwrap it first.
+          AND ((CASE WHEN jsonb_typeof(payload) = 'string' THEN (payload #>> '{}')::jsonb ELSE payload END)->'data'->>'fromId' = ${threadId} OR (CASE WHEN jsonb_typeof(payload) = 'string' THEN (payload #>> '{}')::jsonb ELSE payload END)->'data'->>'toId' = ${threadId})
         ORDER BY id DESC
         LIMIT 200`;
       const messages = [];
@@ -1720,7 +1721,7 @@ data:
               SELECT 1 FROM events e
               WHERE e.type = 'message'
                 AND e.received_at > now() - interval '14 days'
-                AND (e.payload->'data'->>'fromId' = p.dux_id OR e.payload->'data'->>'toId' = p.dux_id)
+                AND ((CASE WHEN jsonb_typeof(e.payload) = 'string' THEN (e.payload #>> '{}')::jsonb ELSE e.payload END)->'data'->>'fromId' = p.dux_id OR (CASE WHEN jsonb_typeof(e.payload) = 'string' THEN (e.payload #>> '{}')::jsonb ELSE e.payload END)->'data'->>'toId' = p.dux_id)
             )`;
         for (const p of profiles) {
           conversations++;
