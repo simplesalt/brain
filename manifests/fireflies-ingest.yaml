@@ -81,41 +81,6 @@ subjects:
     name: fireflies-ingest
     namespace: ssint-main-msg
 ---
-# Meeting summaries share grammar's OpenRouter key: read access to that one
-# Secret in grammar's namespace, nothing else there.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: fireflies-ingest-openrouter-key
-  namespace: ssint-main-voice
-  labels:
-    entity: ssint
-    env: main
-    capability: msg
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    resourceNames: ["grammar-openrouter-api-key"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: fireflies-ingest-openrouter-key
-  namespace: ssint-main-voice
-  labels:
-    entity: ssint
-    env: main
-    capability: msg
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: fireflies-ingest-openrouter-key
-subjects:
-  - kind: ServiceAccount
-    name: fireflies-ingest
-    namespace: ssint-main-msg
----
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -172,19 +137,6 @@ data:
     const API_KEY = (process.env.FIREFLIES_API_KEY ?? '').trim();
     const SIGNING_SECRET = (process.env.FIREFLIES_WEBHOOK_SECRET ?? '').trim();
     const FIREFLIES_URL = process.env.FIREFLIES_URL ?? 'https://api.fireflies.ai/graphql';
-
-    // Summary for meetings Fireflies sent none for: written by an LLM on OpenRouter.
-    // It shares grammar's OpenRouter key, read from grammar's Secret through the
-    // Kubernetes API (a Role there allows only that Secret) and cached briefly, so a
-    // fill or rotation applies without a restart.
-    const OPENROUTER_KEY_SECRET = process.env.OPENROUTER_KEY_SECRET ?? 'ssint-main-voice/grammar-openrouter-api-key';
-    const OPENROUTER_KEY_TTL_MS = 5 * 60_000;
-    const OPENROUTER_URL = process.env.OPENROUTER_URL ?? 'https://openrouter.ai/api/v1/chat/completions';
-    const SUMMARY_MODEL = process.env.SUMMARY_MODEL ?? 'google/gemini-2.5-flash-lite';
-    // OpenRouter switches to these, in order, when the main model is down or errors.
-    const SUMMARY_FALLBACK_MODELS = (process.env.SUMMARY_FALLBACK_MODELS ?? 'openai/gpt-oss-120b').split(',').map((m) => m.trim()).filter(Boolean);
-    const SUMMARY_TIMEOUT_MS = Number(process.env.SUMMARY_TIMEOUT_MS ?? 90_000);
-    const SUMMARY_MAX_INPUT_CHARS = 200_000;
 
     const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain.ssint-main-ai:3131/mcp';
     const GBRAIN_TOKEN = process.env.GBRAIN_REMOTE_TOKEN ?? '';
@@ -628,137 +580,10 @@ data:
       return String(v ?? '').split('\n').map((x) => x.replace(/^\s*[-*•]\s*/, '').trim()).filter(Boolean);
     }
 
-    // ---------------------------------------------------------------------------
-    // Generated summary (only when Fireflies sent none)
-    // ---------------------------------------------------------------------------
-
-    const SUMMARY_SYSTEM = [
-      'You read a meeting transcript (speaker-labelled lines) and report what was decided, agreed and assigned.',
-      'Use only what is in the transcript. Never invent or infer beyond it; leave a list empty rather than guess.',
-      'Reply with strict JSON only, no prose and no code fences, in exactly this shape:',
-      '{"overview": string, "decisions": [string], "agreements": [string], "action_items": [string]}',
-      'overview: 2-3 sentences on what the meeting was about and its outcome.',
-      'decisions: choices the group made. agreements: points people explicitly agreed on that are not decisions.',
-      'action_items: tasks someone committed to or was given; start each with the owner ("Name: task") when the transcript states one.',
-    ].join('\n');
-
-    let _orKey = { value: '', at: 0 };
-    async function openrouterKey() {
-      if (_orKey.value && Date.now() - _orKey.at < OPENROUTER_KEY_TTL_MS) return _orKey.value;
-      const [ns, name] = OPENROUTER_KEY_SECRET.split('/');
-      try {
-        const s = await k8sGet(`/api/v1/namespaces/${ns}/secrets/${name}`);
-        const b64 = s?.data?.OPENROUTER_API_KEY ?? '';
-        _orKey = { value: Buffer.from(b64, 'base64').toString('utf8').trim(), at: Date.now() };
-      } catch (e) {
-        console.error(`WARN: OpenRouter key read from ${OPENROUTER_KEY_SECRET} failed: ${e.message}`);
-        return _orKey.value;   // keep the last good key through an API blip
-      }
-      return _orKey.value;
-    }
-
-    function hasFirefliesSummary(t) {
-      const s = t.summary ?? {};
-      return Boolean(String(s.overview || s.short_summary || '').trim());
-    }
-
-    function summaryStrings(v) {
-      return (Array.isArray(v) ? v : []).map((x) => String(x ?? '').trim()).filter(Boolean);
-    }
-
-    // Parse the model's reply defensively: strip code fences, take the outermost {...}.
-    function parseSummaryJson(text) {
-      let s = String(text ?? '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-      const a = s.indexOf('{'), b = s.lastIndexOf('}');
-      if (a < 0 || b < a) throw new Error('reply is not JSON');
-      const o = JSON.parse(s.slice(a, b + 1));
-      if (!o || typeof o !== 'object' || Array.isArray(o)) throw new Error('reply is not a JSON object');
-      const overview = String(o.overview ?? '').trim();
-      if (!overview) throw new Error('reply has no overview');
-      return {
-        overview,
-        decisions: summaryStrings(o.decisions),
-        agreements: summaryStrings(o.agreements),
-        action_items: summaryStrings(o.action_items),
-      };
-    }
-
-    // Returns {overview, decisions, agreements, action_items, model}, or null (logging one
-    // WARN) on any failure; the page is then written without a summary, as before.
-    async function generateSummary(t) {
-      if (hasFirefliesSummary(t)) return null;
-      let transcript = (t.sentences ?? [])
-        .filter((x) => x && x.text)
-        .map((x) => `${x.speaker_name || 'Unknown'}: ${String(x.text).trim()}`)
-        .join('\n');
-      if (!transcript) return null;
-      const key = await openrouterKey();
-      if (!key) { console.error(`WARN: summary ${t.id} skipped: OpenRouter key not filled`); return null; }
-      if (transcript.length > SUMMARY_MAX_INPUT_CHARS) {
-        transcript = `${transcript.slice(0, SUMMARY_MAX_INPUT_CHARS)}\n\n[... transcript truncated at ${SUMMARY_MAX_INPUT_CHARS} characters]`;
-      }
-      try {
-        const res = await fetch(OPENROUTER_URL, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-Title': 'fireflies-ingest summary' },
-          body: JSON.stringify({
-            model: SUMMARY_MODEL,
-            models: [SUMMARY_MODEL, ...SUMMARY_FALLBACK_MODELS],
-            temperature: 0,
-            max_tokens: 1500,
-            response_format: { type: 'json_object' },
-            messages: [
-              { role: 'system', content: SUMMARY_SYSTEM },
-              { role: 'user', content: `Meeting: ${t.title || 'Untitled call'}\n\nTranscript:\n${transcript}` },
-            ],
-          }),
-          signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS),
-        });
-        if (!res.ok) throw new Error(`OpenRouter HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-        const doc = await res.json();
-        const out = parseSummaryJson(doc?.choices?.[0]?.message?.content);
-        const model = String(doc?.model || SUMMARY_MODEL);
-        console.error(`summary: ${t.id} written by ${model}`);
-        return { ...out, model };
-      } catch (e) {
-        console.error(`WARN: summary ${t.id} failed: ${e.message}`);
-        return null;
-      }
-    }
-
-    function bullets(items) {
-      return items.length ? items.map((a) => `- ${a}`).join('\n') : '_None._';
-    }
-
-    function summarySection(t, gen) {
-      const s = t.summary ?? {};
-      const fireflies = String(s.overview || s.short_summary || '').trim();
-      if (fireflies) return fireflies;
-      if (!gen) return '_No summary._';
-      return [
-        gen.overview,
-        '',
-        '### Decisions',
-        '',
-        bullets(gen.decisions),
-        '',
-        '### Agreements',
-        '',
-        bullets(gen.agreements),
-        '',
-        '### Action items',
-        '',
-        bullets(gen.action_items),
-        '',
-        `_Summary written by ${gen.model} from the transcript, not by Fireflies._`,
-      ].join('\n');
-    }
-
-    function callToMarkdown(t, dayIso, attendees, maxTranscriptChars, gen = null) {
+    function callToMarkdown(t, dayIso, attendees, maxTranscriptChars) {
       const durationMin = Math.round(Number(t.duration) || 0);
       const s = t.summary ?? {};
-      let actions = asLines(s.action_items);
-      if (!actions.length && gen) actions = gen.action_items;
+      const actions = asLines(s.action_items);
       const keywords = asLines(Array.isArray(s.keywords) ? s.keywords : String(s.keywords ?? '').split(','));
       let transcript = (t.sentences ?? [])
         .filter((x) => x && x.text)
@@ -786,7 +611,7 @@ data:
         '',
         '## Summary',
         '',
-        summarySection(t, gen),
+        String(s.overview || s.short_summary || '_No summary._').trim(),
         '',
         '## Action items',
         '',
@@ -874,13 +699,12 @@ data:
       const attendees = attendeeList(t);
       const slug = callSlug(t, dayIso);
 
-      const gen = await generateSummary(t);   // once per ingest, not again on the re-put below
       try {
-        await gbrainPutPage(slug, callToMarkdown(t, dayIso, attendees, 0, gen));
+        await gbrainPutPage(slug, callToMarkdown(t, dayIso, attendees, 0));
       } catch (e) {
         if (!/size|large|too long|limit|413/i.test(e.message)) throw e;
         console.error(`WARN: ${slug} rejected at full size (${e.message}); retrying with a truncated transcript`);
-        await gbrainPutPage(slug, callToMarkdown(t, dayIso, attendees, FALLBACK_MAX_CHARS, gen));
+        await gbrainPutPage(slug, callToMarkdown(t, dayIso, attendees, FALLBACK_MAX_CHARS));
       }
       let linked = 0;
       try { linked = await linkAttendees(slug, t, attendees); }
@@ -1130,9 +954,6 @@ data:
     async function main() {
       await migrateWithRetry();
       await reportDeadLetters().catch((e) => console.error(`startup: dead-letter report failed: ${e.message}`));
-      if (!(await openrouterKey())) {
-        console.error(`WARN: OpenRouter key not readable from ${OPENROUTER_KEY_SECRET} - meetings Fireflies sent no summary for get none`);
-      }
 
       const tick = async () => {
         await processBatch().catch((e) => console.error(`tick: processBatch failed: ${e.message}`));
@@ -1217,11 +1038,6 @@ spec:
                   name: fireflies-webhook-secret
                   key: signing_secret
                   optional: true
-            - name: SUMMARY_MODEL
-              value: google/gemini-2.5-flash-lite
-            # OpenRouter switches to these, in order, when the main model is down or errors.
-            - name: SUMMARY_FALLBACK_MODELS
-              value: openai/gpt-oss-120b
             - name: GBRAIN_MCP_URL
               value: http://gbrain.ssint-main-ai:3131/mcp
             - name: GBRAIN_REMOTE_TOKEN
