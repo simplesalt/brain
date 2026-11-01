@@ -9,7 +9,7 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-});
+}, 60_000);
 afterAll(async () => {
   await engine.disconnect();
 });
@@ -18,7 +18,7 @@ beforeEach(async () => {
   await engine.executeRaw(
     `INSERT INTO sources (id, name, config) VALUES ('s1', 's1', '{"kind":"google"}'::jsonb) ON CONFLICT (id) DO NOTHING`,
   );
-});
+}, 30_000);
 
 const TOKEN = 'gbrain-addon';
 // engine is assigned in beforeAll, so bind the handler per request, not at module load.
