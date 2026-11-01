@@ -8,10 +8,13 @@ Every owed loop becomes a row; there is no noise screening.
 
 Per run, in order:
   1. Check the Notion token(s) against the Tasks database; a 401/404 fails the run loudly (exit 1).
-  2. Create the rows that are missing, keyed by the Loop ID property. Open loops, and loops closed within
-     CLOSED_DAYS (gbrain gives no closed_at, so the last activity date stands in for "recent").
-  3. A row whose loop is closed in gbrain: Status Done, Loop state = the closing status, Closed = the day this
-     sync saw it, Resolution = "<status> in gbrain" plus the thread link.
+  2. Create the rows that are missing, keyed by the Loop ID property. Only open loops get a new row; a loop
+     that is already closed when the sync first sees it never becomes a task.
+  3. A row whose loop is closed in gbrain: Status Done, Loop state closed, Closed = the day this sync saw it,
+     Resolution = "<status> in gbrain" plus the thread link. A row whose loop is open but whose sync-owned
+     fields are blank or wrong (Task, Loop kind, Loop state, Channel, Opened, Counterparty, Source) is repaired.
+     A row with no Task title whose loop is closed was made by an early version of this sync for a loop that
+     was never owed; it is moved to the Notion trash (restorable for 30 days).
   4. A row marked Done whose loop is still open is handed to Hermes (see cron-loop-tasks-sync.md), who looks for
      evidence the loop is settled and either closes it in gbrain or puts the row back In progress.
   5. A row whose Loop ID gbrain no longer knows gets a Sync note (only when every source answered completely).
@@ -43,7 +46,10 @@ DB_ID = "8bf70b963c9a458389a8690ae286520c"
 STATE = "ops/loop-tasks-sync"
 OWED_TYPES = {"unanswered_inbound", "commitment_owed_by_me", "decision_pending"}
 CLOSED_STATUSES = ("done", "dropped", "stale")
-CLOSED_DAYS = int(os.environ.get("LOOP_TASKS_CLOSED_DAYS", "14"))
+# Tasks select values (simplesalt/projects#832): Loop kind and Channel use the database's own option names.
+KIND = {"unanswered_inbound": "unanswered_inbound", "decision_pending": "decision_pending",
+        "commitment_owed_by_me": "commitment"}
+CHANNEL = {"gmail": "email", "google": "email"}
 MAX_CREATE = int(os.environ.get("LOOP_TASKS_MAX_CREATE", "60"))
 BATCH = int(os.environ.get("LOOP_TASKS_BATCH", "5"))
 LIMIT = 500
@@ -56,10 +62,13 @@ MARKER = "LOOP-TASKS-RESULT"
 DYLAN_ACCOUNT = "dylan.evans@simplesalt.company"
 TOKEN_ENVS = ("NOTION_DELETION_REVIEW_TOKEN", "NOTION_TOKEN")
 # Property name -> accepted Notion types. Everything is looked up by name in the live schema.
-WANT = {"Name": ("title",), "Status": ("status", "select"), "Assignee": ("people",),
-        "Loop ID": ("rich_text", "number"), "Loop state": ("select", "status", "rich_text"),
-        "Channel": ("select", "rich_text"), "Counterparty": ("rich_text",), "Source": ("url",),
+WANT = {"Task": ("title",), "Status": ("status", "select"), "Assignee": ("people",),
+        "Loop ID": ("rich_text", "number"), "Loop kind": ("select", "rich_text"),
+        "Loop state": ("select", "status", "rich_text"), "Channel": ("select", "rich_text"),
+        "Counterparty": ("url", "rich_text"), "Source": ("url",), "Opened": ("date",),
         "Closed": ("date",), "Resolution": ("rich_text",), "Sync note": ("rich_text",)}
+# Fields the sync owns on a row whose loop is open; a blank or different value is rewritten.
+SYNC_OWNED = ("Task", "Loop kind", "Loop state", "Channel", "Opened", "Counterparty", "Source")
 
 
 class NotionError(RuntimeError):
@@ -132,20 +141,22 @@ def thread_link(account, thread_id):
     return f"https://mail.google.com/mail/u/{account}/#all/{thread_id}"
 
 
-def is_recent(loop, now, days=CLOSED_DAYS):
-    ts = loop.get("last_activity_at") or loop.get("opened_at") or ""
-    return ts[:10] >= (now - datetime.timedelta(days=days)).date().isoformat()
+def wanted_loops(loops, now=None):
+    """The loops that get a new row: owed types that are open."""
+    return {lid: loop for lid, loop in loops.items()
+            if loop.get("loop_type") in OWED_TYPES and loop.get("status") == "open"}
 
 
-def wanted_loops(loops, now):
-    """The loops that get a row: owed types, open or closed recently."""
-    out = {}
-    for lid, loop in loops.items():
-        if loop.get("loop_type") not in OWED_TYPES:
-            continue
-        if loop.get("status") == "open" or is_recent(loop, now):
-            out[lid] = loop
-    return out
+def loop_state(loop):
+    return "closed" if loop.get("status") in CLOSED_STATUSES else "open"
+
+
+def counterparty(schema, loop):
+    """Counterparty value for the live property type: mailto: link for a url, plain text otherwise."""
+    email, slug = loop.get("counterparty_email"), loop.get("counterparty_slug")
+    if (schema.get("Counterparty") or {}).get("type") == "url":
+        return f"mailto:{email}" if email else None
+    return slug or email
 
 
 def resolution(status, link):
@@ -217,34 +228,41 @@ def pick_status(schema, names):
     return next((n for n in names if n in options), None)
 
 
+def synced_fields(schema, loop, account, thread_id):
+    """The sync-owned fields of a row, from its loop."""
+    return {"Task": loop.get("summary") or "(no summary)", "Loop kind": KIND.get(loop.get("loop_type")),
+            "Loop state": loop_state(loop), "Channel": CHANNEL.get(loop.get("source_id")),
+            "Opened": (loop.get("opened_at") or "")[:10] or None,
+            "Counterparty": counterparty(schema, loop), "Source": thread_link(account, thread_id)}
+
+
 def new_row_fields(schema, loop, account, thread_id, user_id):
-    link = thread_link(account, thread_id)
-    closed = loop.get("status") in CLOSED_STATUSES
-    fields = {"Name": loop.get("summary") or "(no summary)", "Loop ID": str(loop["id"]),
-              "Channel": loop.get("source_id"),
-              "Counterparty": loop.get("counterparty_slug") or loop.get("counterparty_email"),
-              "Assignee": user_id, "Source": link,
-              "Loop state": loop.get("status")}
-    if closed:
-        fields.update(Status=pick_status(schema, ["Done"]), Closed=None, Resolution=resolution(loop["status"], link))
-    else:
-        fields["Status"] = pick_status(schema, ["Not started", "To do", "Todo"])
+    fields = synced_fields(schema, loop, account, thread_id)
+    fields.update({"Loop ID": str(loop["id"]), "Assignee": user_id,
+                   "Status": pick_status(schema, ["Not started", "To do", "Todo"])})
     return fields
 
 
-def plan_existing(row, loop, handed, now_iso, tries_ok=True):
-    """What to do for one existing row and its loop: ('close', None), ('hand', None) or (None, None).
+def repair_fields(row, want):
+    """Sync-owned fields whose row value is blank or differs from `want` (None values are left alone)."""
+    return {k: v for k, v in want.items() if v not in (None, "") and row.get(k, "") != v}
 
-    `row` has status, loop_state, resolution, edited (last_edited_time)."""
+
+def plan_existing(row, loop, handed=None, now_iso=None):
+    """What to do for one existing row and its loop: 'trash', 'close', 'hand', 'repair' or None.
+
+    `row` has title, status, loop_state, resolution, edited (last_edited_time)."""
     if loop is None:
-        return None, None
+        return None
     if loop.get("status") in CLOSED_STATUSES:
-        if (row["status"] != "Done" or row["loop_state"] != loop["status"] or not row["resolution"]):
-            return "close", None
-        return None, None
-    if loop.get("status") == "open" and row["status"] == "Done":
-        return "hand", None
-    return None, None
+        if not row["title"]:
+            return "trash"
+        if row["status"] != "Done" or row["loop_state"] != "closed" or not row["resolution"]:
+            return "close"
+        return None
+    if row["status"] == "Done":
+        return "hand"
+    return "repair"
 
 
 # ---------- Notion ----------
@@ -319,9 +337,9 @@ def row_view(page):
     p = page.get("properties", {})
     g = lambda n: text_of(p[n]) if n in p else ""
     return {"id": page["id"], "url": page.get("url"), "edited": page.get("last_edited_time"),
-            "title": g("Name"), "loop_id": g("Loop ID"), "status": g("Status"), "loop_state": g("Loop state"),
+            "title": g("Task"), "loop_id": g("Loop ID"), "status": g("Status"), "loop_state": g("Loop state"),
             "resolution": g("Resolution"), "sync_note": g("Sync note"), "closed": g("Closed"),
-            "source": g("Source")}
+            "source": g("Source"), "fields": {n: g(n) for n in SYNC_OWNED}}
 
 
 # ---------- state ----------
@@ -425,7 +443,7 @@ def main(dry_run):
         if r["loop_id"]:
             rows[r["loop_id"]] = r
 
-    cache, actions = {}, {"created": [], "closed": [], "handed": [], "noted": []}
+    cache, actions = {}, {"created": [], "closed": [], "repaired": [], "trashed": [], "handed": [], "noted": []}
     tag = "[dry-run] " if dry_run else ""
 
     def write(method, path, body):
@@ -441,10 +459,8 @@ def main(dry_run):
             break
         account, thread_id = thread_info(loop["page_slug"], cache) if loop.get("page_slug") else (None, None)
         fields = new_row_fields(schema, loop, account, thread_id, find_user(users, account))
-        if loop["status"] in CLOSED_STATUSES:
-            fields["Closed"] = today
         body = {"parent": {"database_id": DB_ID}, "properties": props(schema, fields)}
-        print(f"{tag}create row for loop {lid} [{loop['loop_type']}/{loop['status']}] {fields['Name'][:80]}")
+        print(f"{tag}create row for loop {lid} [{loop['loop_type']}/{loop['status']}] {fields['Task'][:80]}")
         try:
             write("POST", "/pages", body)
             actions["created"].append(lid)
@@ -460,11 +476,29 @@ def main(dry_run):
     for lid, row in rows.items():
         loop = loops.get(lid)
         # Rows tied to loops of types we do not own (or closed long ago and unseen) are still reconciled below.
-        act, _ = plan_existing(row, loop, state["pending"], now.isoformat())
-        if act == "close":
+        act = plan_existing(row, loop)
+        if act == "trash":
+            print(f"{tag}trash row for loop {lid}: loop was already {loop['status']} when the row was made")
+            try:
+                write("PATCH", f"/pages/{row['id']}", {"archived": True})
+                actions["trashed"].append(lid)
+            except NotionError as e:
+                log(f"trash loop {lid} failed: {e}")
+        elif act == "repair":
+            account, thread_id = thread_info(loop["page_slug"], cache) if loop.get("page_slug") else (None, None)
+            fix = repair_fields(row["fields"], synced_fields(schema, loop, account, thread_id))
+            body = props(schema, fix)
+            if body:
+                print(f"{tag}repair row for loop {lid}: {sorted(body)}")
+                try:
+                    write("PATCH", f"/pages/{row['id']}", {"properties": body})
+                    actions["repaired"].append(lid)
+                except NotionError as e:
+                    log(f"repair loop {lid} failed: {e}")
+        elif act == "close":
             account, thread_id = thread_info(loop["page_slug"], cache) if loop.get("page_slug") else (None, None)
             link = thread_link(account, thread_id)
-            fields = {"Status": pick_status(schema, ["Done"]), "Loop state": loop["status"],
+            fields = {"Status": pick_status(schema, ["Done"]), "Loop state": "closed",
                       "Resolution": row["resolution"] or resolution(loop["status"], link)}
             if not row["closed"]:
                 fields["Closed"] = today
@@ -530,56 +564,67 @@ def main(dry_run):
 # ---------- self test ----------
 
 def self_test():
-    now = datetime.datetime(2026, 11, 1, tzinfo=datetime.timezone.utc)
-    schema = {"Name": {"type": "title"},
+    # Schema as built in Notion (simplesalt/projects#832), minus Sync note to exercise the missing-property path.
+    schema = {"Task": {"type": "title"},
               "Status": {"type": "status", "status": {"options": [{"name": "Not started"}, {"name": "In progress"}, {"name": "Done"}]}},
               "Assignee": {"type": "people"}, "Loop ID": {"type": "rich_text"},
+              "Loop kind": {"type": "select", "select": {"options": []}},
               "Loop state": {"type": "select", "select": {"options": []}}, "Channel": {"type": "select", "select": {"options": []}},
-              "Counterparty": {"type": "rich_text"}, "Source": {"type": "url"}, "Closed": {"type": "date"},
-              "Resolution": {"type": "rich_text"}}  # no Sync note
+              "Counterparty": {"type": "url"}, "Source": {"type": "url"}, "Opened": {"type": "date"},
+              "Closed": {"type": "date"}, "Resolution": {"type": "rich_text"}}
     loops = {
         "1": {"id": 1, "loop_type": "unanswered_inbound", "status": "open", "summary": "Reply owed", "source_id": "gmail",
-              "counterparty_email": "a@b.c", "last_activity_at": "2026-10-01T00:00:00Z", "page_slug": "emails/x"},
+              "counterparty_email": "a@b.c", "opened_at": "2026-10-01T09:00:00Z", "page_slug": "emails/x"},
         "2": {"id": 2, "loop_type": "unanswered_outbound", "status": "open", "source_id": "gmail"},
         "3": {"id": 3, "loop_type": "commitment_owed_to_me", "status": "open", "source_id": "gmail"},
         "4": {"id": 4, "loop_type": "decision_pending", "status": "done", "source_id": "gmail", "last_activity_at": "2026-10-30T00:00:00Z"},
-        "5": {"id": 5, "loop_type": "commitment_owed_by_me", "status": "dropped", "source_id": "gmail", "last_activity_at": "2025-01-01T00:00:00Z"},
-        "6": {"id": 6, "loop_type": "decision_pending", "status": "open", "source_id": "default", "counterparty_slug": "people/x"},
+        "5": {"id": 5, "loop_type": "commitment_owed_by_me", "status": "dropped", "source_id": "gmail"},
+        "6": {"id": 6, "loop_type": "commitment_owed_by_me", "status": "open", "source_id": "default", "counterparty_slug": "people/x"},
     }
-    w = wanted_loops(loops, now)
-    assert sorted(w) == ["1", "4", "6"], sorted(w)
+    assert sorted(wanted_loops(loops)) == ["1", "6"], sorted(wanted_loops(loops))
     assert thread_link("me@x.com", "abc") == "https://mail.google.com/mail/u/me@x.com/#all/abc"
     assert thread_link(None, "abc") is None
     f = new_row_fields(schema, loops["1"], "me@x.com", "abc", "user-1")
-    assert f["Status"] == "Not started" and f["Channel"] == "gmail" and f["Counterparty"] == "a@b.c"
+    assert f["Status"] == "Not started" and f["Channel"] == "email" and f["Counterparty"] == "mailto:a@b.c", f
+    assert f["Loop kind"] == "unanswered_inbound" and f["Loop state"] == "open" and f["Opened"] == "2026-10-01"
     missing = []
     p = props(schema, f, missing)
-    assert p["Name"]["title"][0]["text"]["content"] == "Reply owed"
+    assert p["Task"]["title"][0]["text"]["content"] == "Reply owed"
     assert p["Assignee"] == {"people": [{"id": "user-1"}]}
     assert p["Status"] == {"status": {"name": "Not started"}}
     assert p["Source"]["url"].endswith("#all/abc") and p["Loop ID"]["rich_text"][0]["text"]["content"] == "1"
-    assert "Sync note" not in p
+    assert p["Counterparty"] == {"url": "mailto:a@b.c"} and p["Opened"] == {"date": {"start": "2026-10-01"}}
+    assert missing == [], missing
     props(schema, {"Sync note": "x"}, missing)
     assert missing == ["Sync note"], missing
-    fc = new_row_fields(schema, loops["4"], None, None, None)
-    assert fc["Status"] == "Done" and fc["Loop state"] == "done" and fc["Resolution"] == "done in gbrain"
+    f6 = new_row_fields(schema, loops["6"], None, None, None)
+    assert f6["Loop kind"] == "commitment" and f6["Channel"] is None and f6["Counterparty"] is None
+    assert counterparty({"Counterparty": {"type": "rich_text"}}, loops["6"]) == "people/x"
     assert resolution("dropped", "http://l") == "dropped in gbrain - http://l"
     assert pick_status({"Status": {"type": "status", "status": {"options": [{"name": "Done"}]}}}, ["Not started"]) is None
-    assert make_prop(schema, "Status", "Bogus") is None or True
-    row = {"status": "In progress", "loop_state": "open", "resolution": "", "edited": "t"}
-    assert plan_existing(row, loops["4"], {}, "")[0] == "close"
-    assert plan_existing(dict(row, status="Done", loop_state="done", resolution="r"), loops["4"], {}, "")[0] is None
-    assert plan_existing(dict(row, status="Done"), loops["1"], {}, "")[0] == "hand"
-    assert plan_existing(row, loops["1"], {}, "")[0] is None
-    assert plan_existing(row, None, {}, "")[0] is None
+    row = {"title": "T", "status": "In progress", "loop_state": "open", "resolution": "", "edited": "t"}
+    assert plan_existing(row, loops["4"]) == "close"
+    assert plan_existing(dict(row, title=""), loops["4"]) == "trash"
+    assert plan_existing(dict(row, status="Done", loop_state="closed", resolution="r"), loops["4"]) is None
+    assert plan_existing(dict(row, status="Done", loop_state="done", resolution="r"), loops["4"]) == "close"
+    assert plan_existing(dict(row, status="Done"), loops["1"]) == "hand"
+    assert plan_existing(row, loops["1"]) == "repair"
+    assert plan_existing(row, None) is None
+    want = synced_fields(schema, loops["1"], "me@x.com", "abc")
+    assert repair_fields(want, want) == {}
+    fix = repair_fields(dict(want, Task="", Channel="gmail"), want)
+    assert fix == {"Task": "Reply owed", "Channel": "email"}, fix
+    assert "Channel" not in repair_fields({"Channel": "manual"}, synced_fields(schema, loops["6"], None, None))
     users = [{"id": "u1", "type": "person", "name": "Dylan E", "person": {"email": DYLAN_ACCOUNT}},
              {"id": "u2", "type": "person", "name": "Other", "person": {"email": "o@x.com"}}]
     assert find_user(users, DYLAN_ACCOUNT) == "u1" and find_user(users, "o@x.com") == "u2" and find_user(users, "z@x.com") is None
     page = {"id": "r1", "properties": {"Loop ID": {"type": "number", "number": 12.0},
                                        "Status": {"type": "status", "status": {"name": "Done"}},
-                                       "Name": {"type": "title", "title": [{"plain_text": "T"}]}}}
+                                       "Task": {"type": "title", "title": [{"plain_text": "T"}]},
+                                       "Opened": {"type": "date", "date": {"start": "2026-10-01"}}}}
     v = row_view(page)
     assert v["loop_id"] == "12" and v["status"] == "Done" and v["title"] == "T"
+    assert v["fields"]["Task"] == "T" and v["fields"]["Opened"] == "2026-10-01" and v["fields"]["Channel"] == ""
     print("self-test passed")
 
 
