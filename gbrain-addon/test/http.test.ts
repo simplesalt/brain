@@ -21,7 +21,8 @@ beforeEach(async () => {
 });
 
 const TOKEN = 'gbrain-addon';
-const handle = makeHandler(engine, { token: TOKEN, defaultSource: 's1' });
+// engine is assigned in beforeAll, so bind the handler per request, not at module load.
+const handle = (req: Request) => makeHandler(engine, { token: TOKEN, defaultSource: 's1' })(req);
 const auth = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
 const post = (path: string, body: unknown, headers: Record<string, string> = auth) =>
   handle(new Request(`http://x${path}`, { method: 'POST', headers, body: typeof body === 'string' ? body : JSON.stringify(body) }));
