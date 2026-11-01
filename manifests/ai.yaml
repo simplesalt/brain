@@ -190,24 +190,22 @@ spec:
         capability: ai
     spec:
       initContainers:
-        # gbrain and our loop add-on come baked into the simplesalt/oci gbrain image (gbrain pin and
-        # add-on pin in simplesalt/oci gbrain/pins.env); nothing is installed at start. This only copies
-        # the image's admin dashboard assets out for admin-gate, which runs on a plain python image.
-        - name: seed-admin-assets
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:2462351f96a9a67eebebfe2b73941daf2c89bb87da3f6d295e5da4a2e355b2be
+        - name: install-gbrain
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
             - |
-              set -eu
-              mkdir -p /out/gbrain/admin
-              cp -a "$GBRAIN_HOME/admin/dist" /out/gbrain/admin/
+              if [ ! -x /install/bin/gbrain ]; then
+                BUN_INSTALL=/install bun install -g github:garrytan/gbrain#23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc \
+                  || { echo "FATAL: gbrain install failed"; exit 1; }
+              fi
           volumeMounts:
-            - name: gbrain-admin-assets
-              mountPath: /out
+            - name: gbrain-install
+              mountPath: /install
       containers:
         - name: gbrain
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:2462351f96a9a67eebebfe2b73941daf2c89bb87da3f6d295e5da4a2e355b2be
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -482,13 +480,13 @@ spec:
             limits:
               memory: 2Gi
           volumeMounts:
-            - name: gbrain-google-dir
-              mountPath: /opt/gbrain/google-google
+            - name: gbrain-install
+              mountPath: /install
             - name: google-token
               mountPath: /google
               readOnly: true
         - name: autopilot
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:2462351f96a9a67eebebfe2b73941daf2c89bb87da3f6d295e5da4a2e355b2be
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -616,28 +614,11 @@ spec:
             limits:
               memory: 2Gi
           volumeMounts:
-            - name: gbrain-google-dir
-              mountPath: /opt/gbrain/google-google
+            - name: gbrain-install
+              mountPath: /install
             - name: google-token
               mountPath: /google
               readOnly: true
-        # simplesalt/brain gbrain-addon: channel-neutral loop jobs (addon-loop-open, addon-loop-recheck)
-        # on Minion queue "addon" (simplesalt/projects#838).
-        - name: addon-worker
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:2462351f96a9a67eebebfe2b73941daf2c89bb87da3f6d295e5da4a2e355b2be
-          imagePullPolicy: IfNotPresent
-          command: ["gbrain-addon-worker"]
-          env:
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: gbrain-pg-app
-                  key: uri
-          resources:
-            requests:
-              memory: 64Mi
-            limits:
-              memory: 512Mi
         - name: admin-gate
           image: python:3.12-alpine
           command: ["python", "/scripts/admin_gate.py"]
@@ -656,15 +637,11 @@ spec:
             - name: admin-gate-script
               mountPath: /scripts
               readOnly: true
-            - name: gbrain-admin-assets
+            - name: gbrain-install
               mountPath: /install
               readOnly: true
       volumes:
-        - name: gbrain-admin-assets
-          emptyDir: {}
-        # The google source's working dir (/install/google-google, /install -> /opt/gbrain in the
-        # image), shared by gbrain and autopilot as before.
-        - name: gbrain-google-dir
+        - name: gbrain-install
           emptyDir: {}
         - name: google-token
           configMap:
