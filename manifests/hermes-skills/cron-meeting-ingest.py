@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Pick the next Fireflies call that gbrain has saved but Hermes has not ingested yet.
+"""Pick the next Fireflies meeting that gbrain has saved but Hermes has not ingested yet.
 
-Runs every few minutes as the trigger for the meeting-ingest cron job: it wakes Hermes only when a call page
-under calls/ has not been handled. It lists the call pages in gbrain's default source, drops the ones already
-handled, and prints ONE call for Hermes to run gbrain's meeting-ingestion skill on (calls are long). Handled
+Runs every few minutes as the trigger for the meeting-ingest cron job: it wakes Hermes only when a Fireflies
+meeting page under meetings/ has not been handled. It lists the type: meeting pages in gbrain's default source
+that carry a fireflies_id (the Fireflies import writes it; other meeting pages are skipped), drops the ones
+already handled, and prints ONE meeting for Hermes to run gbrain's meeting-ingestion skill on (calls are long). Handled
 slugs are kept on the gbrain page ops/meeting-ingest, marked when handed out so no call is processed twice.
 On the first run only calls from the last 30 days are taken, so an old backlog does not flood the model; older
 calls are marked handled without being handed out. With nothing to do it prints {"wakeAgent": false} so the job
@@ -18,7 +19,7 @@ import urllib.request
 URL = os.environ.get("GBRAIN_URL", "http://gbrain:3131/mcp")
 TOKEN = os.environ.get("GBRAIN_REMOTE_TOKEN", "gbrain-mcp")
 STATE = "ops/meeting-ingest"
-PREFIX = "calls/"
+PREFIX = "meetings/"
 DAYS = 30
 DRY_RUN = os.environ.get("MEETING_INGEST_DRY_RUN") == "1"
 
@@ -60,6 +61,25 @@ def slug_date(page):
     return m.group(0) if m else ""
 
 
+def is_fireflies(page):
+    """True when the page's frontmatter has a fireflies_id. list_pages rows may not carry frontmatter, so
+    read the page when the row does not say."""
+    fm = page.get("frontmatter")
+    if isinstance(fm, dict):
+        return bool(fm.get("fireflies_id"))
+    try:
+        full = call("get_page", {"slug": page["slug"], "include_content": True})
+    except RuntimeError:
+        return False
+    if not isinstance(full, dict):
+        return False
+    fm = full.get("frontmatter")
+    if isinstance(fm, dict):
+        return bool(fm.get("fireflies_id"))
+    head = re.match(r"---\n(.*?)\n---", full.get("content") or "", re.S)
+    return bool(head and re.search(r"^fireflies_id:\s*\S", head.group(1), re.M))
+
+
 def load_state():
     """Returns (handled slugs, state page revision or None, whether the state page exists)."""
     try:
@@ -87,14 +107,23 @@ def main():
     since = (now - datetime.timedelta(days=DAYS)).date().isoformat()
     today = now.date().isoformat()
     done, revision, exists = load_state()
-    pages = [p for p in all_pages(type="call", source_id="default")
+    pages = [p for p in all_pages(type="meeting", source_id="default")
              if p["slug"].startswith(PREFIX) and p["slug"] not in done]
     fresh = [p for p in pages if since <= slug_date(p) <= today]
     # Calls older than the window (or with no date in the slug) are never handed out; mark them so they
     # are not listed again.
     stale = {p["slug"] for p in pages if not (since <= slug_date(p) <= today)}
     fresh.sort(key=slug_date, reverse=True)
-    pick = fresh[0] if fresh else None
+    # Pick the newest fresh meeting that came from Fireflies. Non-Fireflies meetings are marked handled so
+    # they are not read again.
+    pick, other = None, set()
+    for p in fresh:
+        if is_fireflies(p):
+            pick = p
+            break
+        other.add(p["slug"])
+    stale |= other
+    fresh = [p for p in fresh if p["slug"] not in other]
     if not DRY_RUN:
         marked = done | stale | ({pick["slug"]} if pick else set())
         if marked != done or not exists:
@@ -102,7 +131,7 @@ def main():
     if not pick:
         print(json.dumps({"wakeAgent": False}))
         return
-    print(f"1 call to ingest; {len(fresh) - 1} more waiting.")
+    print(f"1 meeting to ingest; {len(fresh) - 1} more waiting.")
     print(json.dumps({"slug": pick["slug"], "title": pick.get("title"), "date": slug_date(pick)}, indent=1))
 
 

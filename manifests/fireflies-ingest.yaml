@@ -494,7 +494,9 @@ data:
       try { return JSON.parse(text); } catch { return null; }
     }
 
-    // Pages under calls/ belong wholly to this ingest, so every write deliberately overwrites (force).
+    // The transcript sidecar under sources/meetings/ belongs wholly to this ingest, so its write deliberately
+    // overwrites (force). The meeting page is only created when absent (see ingestMeeting): Hermes rewrites it
+    // after the first ingest, and a re-ingest must not undo that.
     // The request_id is a UUID derived from slug+content: a replay of the same write reuses gbrain's
     // original receipt instead of spending a new write, and changed content gets a fresh id.
     function putRequestId(slug, content) {
@@ -533,8 +535,10 @@ data:
       return parsed;
     }
 
-    async function gbrainPutPage(slug, content) {
-      const receipt = await gbrainCall('put_page', { slug, content, force: true, request_id: putRequestId(slug, content) });
+    async function gbrainPutPage(slug, content, { force = true } = {}) {
+      const args = { slug, content, request_id: putRequestId(slug, content) };
+      if (force) args.force = true;
+      const receipt = await gbrainCall('put_page', args);
       if (receipt?.state && receipt.state !== 'committed') {
         throw new Error(`write not committed: state=${receipt.state} request_id=${receipt.request_id}`);
       }
@@ -550,9 +554,11 @@ data:
         .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, '') || 'untitled';
     }
 
-    function callSlug(t, dayIso) {
-      return `calls/${dayIso}-${kebab(t.title)}-${String(t.id).slice(0, 8)}`;
+    function callBase(t, dayIso) {
+      return `${dayIso}-${kebab(t.title)}-${String(t.id).slice(0, 8)}`;
     }
+    const meetingSlug = (t, dayIso) => `meetings/${callBase(t, dayIso)}`;
+    const transcriptSlug = (t, dayIso) => `sources/meetings/${callBase(t, dayIso)}-transcript`;
 
     const q = (s) => String(s ?? '').replace(/"/g, "'").replace(/\s+/g, ' ').trim();
 
@@ -580,11 +586,7 @@ data:
       return String(v ?? '').split('\n').map((x) => x.replace(/^\s*[-*•]\s*/, '').trim()).filter(Boolean);
     }
 
-    function callToMarkdown(t, dayIso, attendees, maxTranscriptChars) {
-      const durationMin = Math.round(Number(t.duration) || 0);
-      const s = t.summary ?? {};
-      const actions = asLines(s.action_items);
-      const keywords = asLines(Array.isArray(s.keywords) ? s.keywords : String(s.keywords ?? '').split(','));
+    function transcriptText(t, maxTranscriptChars) {
       let transcript = (t.sentences ?? [])
         .filter((x) => x && x.text)
         .map((x) => `**${x.speaker_name || 'Unknown'}** [${mmss(x.start_time)}]: ${String(x.text).trim()}`)
@@ -592,22 +594,37 @@ data:
       if (maxTranscriptChars && transcript.length > maxTranscriptChars) {
         transcript = `${transcript.slice(0, maxTranscriptChars)}\n\n[... transcript truncated; full text in Fireflies]`;
       }
+      return transcript;
+    }
+
+    // Meeting page (type: meeting, as gbrain's meeting-ingestion skill expects). Drafted with
+    // facts_backstop: false; Hermes drops that line once it has verified the page.
+    function meetingToMarkdown(t, dayIso, attendees) {
+      const durationMin = Math.round(Number(t.duration) || 0);
+      const s = t.summary ?? {};
+      const actions = asLines(s.action_items);
+      const keywords = asLines(Array.isArray(s.keywords) ? s.keywords : String(s.keywords ?? '').split(','));
+      const tSlug = transcriptSlug(t, dayIso);
       return [
         '---',
-        'type: call',
+        'type: meeting',
         `title: "${q(t.title || 'Untitled call').slice(0, 160)}"`,
         `date: "${dayIso}"`,
         `duration_min: ${durationMin}`,
         `fireflies_id: "${t.id}"`,
         `transcript_url: "${q(t.transcript_url)}"`,
+        `transcript: ${tSlug}`,
+        'facts_backstop: false',
         'attendees:',
         ...(attendees.length
           ? attendees.map((a) => `  - name: "${q(a.name)}"\n    email: "${q(a.email)}"`)
           : ['  []']),
-        'tags: [call, fireflies]',
+        'tags: [meeting, fireflies]',
         '---',
         '',
         `# ${t.title || 'Untitled call'}`,
+        '',
+        `The full transcript is on its own page: [Transcript](${tSlug}) ([[${tSlug}]]).`,
         '',
         '## Summary',
         '',
@@ -625,9 +642,28 @@ data:
         '',
         attendees.length ? attendees.map((a) => `- ${a.name || a.email}${a.email ? ` <${a.email}>` : ''}`).join('\n') : '_None recorded._',
         '',
-        '## Transcript',
+      ].join('\n');
+    }
+
+    // Raw transcript sidecar (type: source). facts_backstop: false stays on permanently.
+    function transcriptToMarkdown(t, dayIso, maxTranscriptChars) {
+      const mSlug = meetingSlug(t, dayIso);
+      return [
+        '---',
+        'type: source',
+        `title: "Transcript: ${q(t.title || 'Untitled call').slice(0, 150)}"`,
+        `date: "${dayIso}"`,
+        `fireflies_id: "${t.id}"`,
+        `meeting: ${mSlug}`,
+        'facts_backstop: false',
+        'tags: [transcript, fireflies]',
+        '---',
         '',
-        transcript || '_No transcript text._',
+        `# Transcript: ${t.title || 'Untitled call'}`,
+        '',
+        `Meeting page: [${t.title || 'Untitled call'}](${mSlug}) ([[${mSlug}]]).`,
+        '',
+        transcriptText(t, maxTranscriptChars) || '_No transcript text._',
         '',
       ].join('\n');
     }
@@ -685,8 +721,8 @@ data:
     }
 
     // ---------------------------------------------------------------------------
-    // Meeting ingest: fetch the transcript, write the calls/ page, link attendees.
-    // Idempotent: same slug (overwritten), same request_id for same content, upserted links.
+    // Meeting ingest: fetch the transcript, write the transcript sidecar and (if absent) the meetings/ page, link attendees.
+    // Idempotent: sidecar overwritten with the same request_id for same content, meeting page never overwritten, upserted links.
     // ---------------------------------------------------------------------------
 
     async function ingestMeeting(meetingId, { hintDate = null, budget = null } = {}) {
@@ -697,15 +733,26 @@ data:
       if (!Number.isFinite(ms)) throw new Error(`transcript ${meetingId} has no usable date`);
       const dayIso = new Date(ms).toISOString().slice(0, 10);
       const attendees = attendeeList(t);
-      const slug = callSlug(t, dayIso);
+      const slug = meetingSlug(t, dayIso);
+      const tSlug = transcriptSlug(t, dayIso);
 
+      // Sidecar first so the meeting page's transcript link never dangles. Always rewritten (force).
       try {
-        await gbrainPutPage(slug, callToMarkdown(t, dayIso, attendees, 0));
+        await gbrainPutPage(tSlug, transcriptToMarkdown(t, dayIso, 0));
       } catch (e) {
         if (!/size|large|too long|limit|413/i.test(e.message)) throw e;
-        console.error(`WARN: ${slug} rejected at full size (${e.message}); retrying with a truncated transcript`);
-        await gbrainPutPage(slug, callToMarkdown(t, dayIso, attendees, FALLBACK_MAX_CHARS));
+        console.error(`WARN: ${tSlug} rejected at full size (${e.message}); retrying with a truncated transcript`);
+        await gbrainPutPage(tSlug, transcriptToMarkdown(t, dayIso, FALLBACK_MAX_CHARS));
       }
+      // Meeting page: create only when absent. Hermes rewrites it after the first ingest.
+      let exists = true;
+      try { await gbrainCall('get_page', { slug }); }
+      catch (e) {
+        if (!/page_not_found/.test(e.message)) throw e;
+        exists = false;
+      }
+      if (!exists) await gbrainPutPage(slug, meetingToMarkdown(t, dayIso, attendees), { force: false });
+      else console.log(`meeting page ${slug} exists; left untouched`);
       let linked = 0;
       try { linked = await linkAttendees(slug, t, attendees); }
       catch (e) { console.error(`WARN: linking failed for ${slug}: ${e.message}`); }
