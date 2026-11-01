@@ -1634,6 +1634,7 @@ data:
     // conversation id, so external_id is a stable hash of the other person's
     // Dux Soup id + event time + text, and thread_id is that person's id.
     // Both calls are idempotent, so a retried event replays them harmlessly.
+    const OPEN_PER_MESSAGE = false;
     async function syncMessageLoops(row, { slug, isReceived, text, profileRow, senderName }) {
       const sentAtIso = eventIsoTime(row, null);
       if (!sentAtIso) throw new Error(`message event ${row.id} has no usable time`);
@@ -1643,7 +1644,9 @@ data:
         counterparty_slug: slug,
         messages: [{ channel: 'linkedin', message_id: messageId, page_slug: slug, from_me: !isReceived, sent_at: sentAtIso, text }],
       });
-      if (!isReceived) return;
+      // Per-message opens are off: they opened a loop for every inbound message. Conversation-level
+      // detection with gbrain's own reply rules replaces them (simplesalt/projects#838).
+      if (!isReceived || !OPEN_PER_MESSAGE) return;
       const name = senderName || [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim() || 'Someone';
       const oneLine = text.replace(/\s+/g, ' ').trim();
       await addonPost('/loops/open', {
