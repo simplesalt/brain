@@ -60,6 +60,7 @@ spec:
           name: gbrain-pg-rehearsal-app
   storage:
     size: 10Gi
+  enablePDB: false
 ---
 apiVersion: apps/v1
 kind: Deployment
