@@ -11,22 +11,6 @@ metadata:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
 ---
-# Filled by a person out of band, key OPENROUTER_API_KEY: a dedicated OpenRouter
-# key with a low spending limit, used to write a summary for meetings Fireflies
-# sent none for. Flux merges so reconciliation never wipes it.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: fireflies-openrouter-api-key
-  namespace: ssint-main-msg
-  labels:
-    entity: ssint
-    env: main
-    capability: msg
-  annotations:
-    kustomize.toolkit.fluxcd.io/ssa: merge
-type: Opaque
----
 apiVersion: v1
 kind: Secret
 metadata:
@@ -97,6 +81,41 @@ subjects:
     name: fireflies-ingest
     namespace: ssint-main-msg
 ---
+# Meeting summaries share grammar's OpenRouter key: read access to that one
+# Secret in grammar's namespace, nothing else there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fireflies-ingest-openrouter-key
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["grammar-openrouter-api-key"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fireflies-ingest-openrouter-key
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fireflies-ingest-openrouter-key
+subjects:
+  - kind: ServiceAccount
+    name: fireflies-ingest
+    namespace: ssint-main-msg
+---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -155,9 +174,11 @@ data:
     const FIREFLIES_URL = process.env.FIREFLIES_URL ?? 'https://api.fireflies.ai/graphql';
 
     // Summary for meetings Fireflies sent none for: written by an LLM on OpenRouter.
-    // The key is read from the mounted Secret on each use, so a fill or rotation
-    // applies without a restart.
-    const OPENROUTER_KEY_PATH = process.env.OPENROUTER_KEY_PATH ?? '/secrets/openrouter/OPENROUTER_API_KEY';
+    // It shares grammar's OpenRouter key, read from grammar's Secret through the
+    // Kubernetes API (a Role there allows only that Secret) and cached briefly, so a
+    // fill or rotation applies without a restart.
+    const OPENROUTER_KEY_SECRET = process.env.OPENROUTER_KEY_SECRET ?? 'ssint-main-voice/grammar-openrouter-api-key';
+    const OPENROUTER_KEY_TTL_MS = 5 * 60_000;
     const OPENROUTER_URL = process.env.OPENROUTER_URL ?? 'https://openrouter.ai/api/v1/chat/completions';
     const SUMMARY_MODEL = process.env.SUMMARY_MODEL ?? 'google/gemini-2.5-flash-lite';
     // OpenRouter switches to these, in order, when the main model is down or errors.
@@ -209,9 +230,6 @@ data:
       }
       if (!API_KEY) {
         console.error('WARN: FIREFLIES_API_KEY not set - events are stored but not processed, and the hourly reconcile is skipped');
-      }
-      if (!openrouterKey()) {
-        console.error('WARN: OpenRouter key not filled (secret fireflies-openrouter-api-key) - meetings Fireflies sent no summary for get none');
       }
     }
 
@@ -624,8 +642,19 @@ data:
       'action_items: tasks someone committed to or was given; start each with the owner ("Name: task") when the transcript states one.',
     ].join('\n');
 
-    function openrouterKey() {
-      try { return readFileSync(OPENROUTER_KEY_PATH, 'utf8').trim(); } catch { return ''; }
+    let _orKey = { value: '', at: 0 };
+    async function openrouterKey() {
+      if (_orKey.value && Date.now() - _orKey.at < OPENROUTER_KEY_TTL_MS) return _orKey.value;
+      const [ns, name] = OPENROUTER_KEY_SECRET.split('/');
+      try {
+        const s = await k8sGet(`/api/v1/namespaces/${ns}/secrets/${name}`);
+        const b64 = s?.data?.OPENROUTER_API_KEY ?? '';
+        _orKey = { value: Buffer.from(b64, 'base64').toString('utf8').trim(), at: Date.now() };
+      } catch (e) {
+        console.error(`WARN: OpenRouter key read from ${OPENROUTER_KEY_SECRET} failed: ${e.message}`);
+        return _orKey.value;   // keep the last good key through an API blip
+      }
+      return _orKey.value;
     }
 
     function hasFirefliesSummary(t) {
@@ -663,7 +692,7 @@ data:
         .map((x) => `${x.speaker_name || 'Unknown'}: ${String(x.text).trim()}`)
         .join('\n');
       if (!transcript) return null;
-      const key = openrouterKey();
+      const key = await openrouterKey();
       if (!key) { console.error(`WARN: summary ${t.id} skipped: OpenRouter key not filled`); return null; }
       if (transcript.length > SUMMARY_MAX_INPUT_CHARS) {
         transcript = `${transcript.slice(0, SUMMARY_MAX_INPUT_CHARS)}\n\n[... transcript truncated at ${SUMMARY_MAX_INPUT_CHARS} characters]`;
@@ -1101,6 +1130,9 @@ data:
     async function main() {
       await migrateWithRetry();
       await reportDeadLetters().catch((e) => console.error(`startup: dead-letter report failed: ${e.message}`));
+      if (!(await openrouterKey())) {
+        console.error(`WARN: OpenRouter key not readable from ${OPENROUTER_KEY_SECRET} - meetings Fireflies sent no summary for get none`);
+      }
 
       const tick = async () => {
         await processBatch().catch((e) => console.error(`tick: processBatch failed: ${e.message}`));
@@ -1220,17 +1252,10 @@ spec:
             - name: script
               mountPath: /scripts
               readOnly: true
-            - name: openrouter-key
-              mountPath: /secrets/openrouter
-              readOnly: true
       volumes:
         - name: script
           configMap:
             name: fireflies-ingest-script
-        - name: openrouter-key
-          secret:
-            secretName: fireflies-openrouter-api-key
-            optional: true
 ---
 apiVersion: v1
 kind: Service
