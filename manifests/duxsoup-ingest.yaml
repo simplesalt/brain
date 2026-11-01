@@ -873,7 +873,23 @@ data:
     }
 
     const emailKey = (e) => String(e).trim().toLowerCase();
-    const phoneKey = (p) => String(p).replace(/\D/g, '') || String(p).trim();
+    // E.164 (+<country><number>), default region US when there is no country
+    // code. null when the number cannot be normalized confidently (extension,
+    // letters, an invalid US number, a wrong length): callers leave it unchanged.
+    function normalizePhone(p) {
+      const s = String(p ?? '').trim();
+      if (!s || !/^\+?[\d\s().-]+$/.test(s)) return null;
+      const digits = s.replace(/\D/g, '');
+      if (s.startsWith('+') || digits.startsWith('00')) {
+        const intl = s.startsWith('+') ? digits : digits.slice(2);
+        if (!/^[1-9]\d{7,14}$/.test(intl)) return null;
+        if (intl.startsWith('1') && !/^1[2-9]\d{2}[2-9]\d{6}$/.test(intl)) return null;
+        return `+${intl}`;
+      }
+      const us = digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
+      return /^[2-9]\d{2}[2-9]\d{6}$/.test(us) ? `+1${us}` : null;
+    }
+    const phoneKey = (p) => normalizePhone(p) ?? (String(p).replace(/\D/g, '') || String(p).trim());
 
     function asList(v) {
       if (Array.isArray(v)) return v.map((x) => String(x)).filter((x) => x.trim());
@@ -919,7 +935,7 @@ data:
         linkedin_id: idMatch ? idMatch[1] : null,
         linkedin_sales_id: salesMatch ? salesMatch[1] : null,
         emails: dedupeBy(splitMulti(d.Email).filter((e) => e.includes('@')), emailKey),
-        phones: dedupeBy(splitMulti(d.Phone), phoneKey),
+        phones: dedupeBy(splitMulti(d.Phone).map((p) => normalizePhone(p) ?? p), phoneKey),
         twitter: cleanStr(d.Twitter),
         website: cleanStr(d.PersonalWebsite),
         location: cleanStr(d.Location),
@@ -1166,17 +1182,36 @@ data:
       return String(s ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
     }
 
+    // Reads an alias/handle list as the identifiers it carries.
+    const emailAliasOk = (a) => /^[^\s:@]+@[^\s@]+$/.test(String(a).trim());
+
+    // The normalized identifiers a page's frontmatter holds: emails (emails: and
+    // aliases), LinkedIn URLs (linkedin: and aliases) and E.164 phones (phones:).
+    function pageIdentifiers(fm) {
+      const aliases = asList(fm.aliases);
+      return {
+        emails: new Set([...asList(fm.emails), ...aliases.filter(emailAliasOk)].map(emailKey)),
+        urls: new Set([...asList(fm.linkedin), ...aliases].map(normalizeLinkedinUrl).filter(Boolean)),
+        phones: new Set(asList(fm.phones).map(normalizePhone).filter(Boolean)),
+      };
+    }
+
     // Searches gbrain for an existing page of `type` so re-discovering someone (or
     // a company) another source already knows doesn't fork a duplicate page.
-    // Order: a page listing the LinkedIn URL (linkedin: or aliases), else the
-    // only page with exactly this name that doesn't carry a different LinkedIn
-    // URL. Anything less clear returns null.
-    async function findMatchingPageSlug(type, { url, name }) {
+    // Order: a page whose frontmatter lists one of the exact normalized
+    // identifiers (email, LinkedIn URL, phone; a search hit alone proves nothing),
+    // else the only page with exactly this name that doesn't carry a different
+    // LinkedIn URL. Identifiers pointing at two different pages pick neither: that
+    // event falls back to the LinkedIn URL / name rule alone and the conflict is
+    // logged. Anything less clear returns null.
+    async function findMatchingPageSlug(type, { url, name, emails = [], phones = [] }) {
       const wantUrl = normalizeLinkedinUrl(url);
       const wantName = nameKey(name);
+      const wantEmails = uniqueList(emails.map(emailKey));
+      const wantPhones = uniqueList(phones.map(normalizePhone));
       const seen = new Set();
-      const nameHits = [];
-      const queries = uniqueList([linkedinVanity(url), url, name]);
+      const pages = [];
+      const queries = uniqueList([linkedinVanity(url), url, name, ...wantEmails, ...wantPhones]);
       for (const q of queries) {
         let results;
         try { results = await gbrainSearch(q, { limit: 10, types: [type] }); }
@@ -1185,18 +1220,35 @@ data:
           if (!r?.slug || seen.has(r.slug)) continue;
           seen.add(r.slug);
           const page = await gbrainGetPage(r.slug).catch(() => null);
-          if (!page) continue;
-          const fm = page.frontmatter ?? {};
-          const urls = [...asList(fm.linkedin), ...asList(fm.aliases)].map(normalizeLinkedinUrl).filter(Boolean);
-          if (wantUrl && urls.includes(wantUrl)) return r.slug;
-          if (wantName && nameKey(page.title) === wantName && !(wantUrl && urls.length)) nameHits.push(r.slug);
+          if (page) pages.push({ slug: r.slug, page, ids: pageIdentifiers(page.frontmatter ?? {}) });
         }
+      }
+
+      const idSlugs = pages
+        .filter(({ ids }) => wantEmails.some((e) => ids.emails.has(e))
+          || (wantUrl && ids.urls.has(wantUrl))
+          || wantPhones.some((ph) => ph && ids.phones.has(ph)))
+        .map((p) => p.slug);
+      if (idSlugs.length === 1) return idSlugs[0];
+      if (idSlugs.length > 1) {
+        console.error(`match: identifiers for ${type} "${name}" point at ${idSlugs.length} pages (${idSlugs.join(', ')}); not picking one, using the LinkedIn URL / name rule only`);
+      }
+
+      const nameHits = [];
+      for (const { slug, page, ids } of pages) {
+        if (wantUrl && ids.urls.has(wantUrl)) return slug;
+        if (wantName && nameKey(page.title) === wantName && !(wantUrl && ids.urls.size)) nameHits.push(slug);
       }
       return nameHits.length === 1 ? nameHits[0] : null;
     }
 
-    async function findMatchingPersonSlug(profileRow, fullName) {
-      return findMatchingPageSlug('person', { url: profileRow.profile_url, name: fullName });
+    async function findMatchingPersonSlug(profileRow, fullName, details = null) {
+      return findMatchingPageSlug('person', {
+        url: profileRow.profile_url,
+        name: fullName,
+        emails: details?.emails ?? [],
+        phones: details?.phones ?? [],
+      });
     }
 
     // Writes a page against the revision it was read at (never forced) and skips
@@ -1241,11 +1293,13 @@ data:
       for (const [k, v] of Object.entries(details ?? {})) {
         if (!isEmptyVal(v)) det[k] = v;
       }
+      // Every alias is already normalized: gbrain matches emails and LinkedIn URLs
+      // as exact strings. Phones are never aliases (they go under phones:).
       det.aliases = uniqueList([
-        profileRow.profile_url,
-        det.linkedin,
+        normalizeLinkedinUrl(profileRow.profile_url),
+        normalizeLinkedinUrl(det.linkedin),
         `dux:${profileRow.dux_id}`,
-        ...det.emails,
+        ...det.emails.map(emailKey),
         det.linkedin_id ? `linkedin-id:${det.linkedin_id}` : null,
         det.linkedin_sales_id ? `linkedin-sales:${det.linkedin_sales_id}` : null,
       ]);
@@ -1269,7 +1323,7 @@ data:
     async function syncPersonPage(profileRow, rawPayload, eventId, timelineBullet = null, details = null) {
       const fullName = [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim();
       const slug = profileRow.gbrain_slug
-        || (await findMatchingPersonSlug(profileRow, fullName))
+        || (await findMatchingPersonSlug(profileRow, fullName, details))
         || deriveSlug(profileRow);
       const existing = await gbrainGetPage(slug, { includeContent: true });
 
@@ -1591,6 +1645,65 @@ data:
       console.log(`backfill: profiles checked=${rows.length} ok=${ok} failed=${failed}`);
     }
 
+    // The aliases and phones of a Dux Soup person page in normalized form: LinkedIn
+    // URL and email aliases normalized, the page's own linkedin: and emails
+    // present as aliases, phone-looking aliases moved to phones:, phones in
+    // E.164 where that is certain. Everything else is kept. Pure, and a fixed
+    // point: applying it to its own result changes nothing.
+    function normalizeIdentifierFrontmatter(fm) {
+      const phones = [];
+      const aliases = [];
+      for (const a of asList(fm.aliases)) {
+        const s = a.trim();
+        if (normalizeLinkedinUrl(s)) aliases.push(normalizeLinkedinUrl(s));
+        else if (emailAliasOk(s)) aliases.push(emailKey(s));
+        else if (/^\+?[\d\s().-]{7,}$/.test(s) && normalizePhone(s)) phones.push(normalizePhone(s));
+        else aliases.push(s);
+      }
+      for (const u of asList(fm.linkedin)) aliases.push(normalizeLinkedinUrl(u));
+      for (const e of asList(fm.emails)) if (emailAliasOk(e)) aliases.push(emailKey(e));
+      const out = { ...fm };
+      const al = uniqueList(aliases);
+      if (al.length) out.aliases = al;
+      const ph = dedupeBy([...asList(fm.phones), ...phones].map((x) => normalizePhone(x) ?? x), phoneKey);
+      if (ph.length) out.phones = ph;
+      return out;
+    }
+
+    // One-time (per process start) pass over the person pages Dux Soup wrote
+    // (source: duxsoup, or a duxsoup_fields list) that rewrites aliases and phones
+    // into normalized form, so gbrain's exact-string alias lookup finds them.
+    // Idempotent: a page already normalized is not written. Written against the
+    // revision it was read at. Sequential and best effort; a failing page is
+    // logged and skipped, the next start retries.
+    async function backfillPersonIdentifiers() {
+      const rows = await sql`SELECT DISTINCT gbrain_slug FROM profiles WHERE gbrain_slug IS NOT NULL ORDER BY gbrain_slug`;
+      let checked = 0, changed = 0, failed = 0;
+      for (const { gbrain_slug: slug } of rows) {
+        try {
+          const page = await gbrainGetPage(slug, { includeContent: true });
+          const fm = page?.frontmatter;
+          if (!fm || (fm.source !== 'duxsoup' && !Array.isArray(fm.duxsoup_fields))) continue;
+          checked++;
+          const wrote = await writePageWithRetry('backfillPersonIdentifiers', slug, page, null, (ex) => {
+            const merged = normalizeIdentifierFrontmatter(ex.frontmatter ?? {});
+            // Same carry-over as mergeFrontmatter: v0.60+ keeps title, tags and
+            // type on the page object, so a rewrite without them would drop them.
+            if (merged.title == null && ex.title) merged.title = ex.title;
+            if (merged.tags == null && Array.isArray(ex.tags) && ex.tags.length) merged.tags = ex.tags;
+            if (isEmptyVal(merged.type) && !isEmptyVal(ex.type)) merged.type = ex.type;
+            if (JSON.stringify([merged.aliases, merged.phones]) === JSON.stringify([ex.frontmatter?.aliases, ex.frontmatter?.phones])) return null;
+            return upsertContactBlock(replaceFrontmatterBlock(ex.content, merged), merged);
+          });
+          if (wrote) changed++;
+        } catch (e) {
+          failed++;
+          console.error(`backfill: person identifiers ${slug} failed: ${String(e?.message ?? e).slice(0, 300)}`);
+        }
+      }
+      console.log(`backfill: person identifiers pages=${rows.length} duxsoup=${checked} changed=${changed} failed=${failed}`);
+    }
+
     // rccommand and session events are kept in the events table only (no gbrain
     // write); their latest state is read directly from events by writeHeartbeat.
     async function processEvent(rawRow) {
@@ -1772,7 +1885,9 @@ data:
       backfillMessageTimelines()
         .catch((e) => console.error(`startup: message timeline backfill failed: ${e.message}`))
         .then(() => backfillProfiles())
-        .catch((e) => console.error(`startup: profile backfill failed: ${e.message}`));
+        .catch((e) => console.error(`startup: profile backfill failed: ${e.message}`))
+        .then(() => backfillPersonIdentifiers())
+        .catch((e) => console.error(`startup: person identifier backfill failed: ${e.message}`));
 
       const settingsPoll = () => pollDuxSoupSettings()
         .catch((e) => console.error(`duxsoup-settings-poll: unexpected failure: ${stripSecrets(e?.message ?? e).slice(0, 300)}`));
