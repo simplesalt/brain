@@ -99,10 +99,12 @@ data:
     const iss = process.env.GOOGLE_CLIENT_EMAIL, sub = process.env.WORK_EMAIL;
     if (!privKey || !iss || !sub) { console.error('google-token: GOOGLE_PRIVATE_KEY_B64, GOOGLE_CLIENT_EMAIL and WORK_EMAIL must be set'); process.exit(1); }
     const b64url = s => Buffer.from(s).toString('base64url');
+    // argv[2] is a comma list of services (gmail,calendar,contacts); none means gmail+calendar.
+    const scopes = { gmail: 'https://www.googleapis.com/auth/gmail.modify', calendar: 'https://www.googleapis.com/auth/calendar.events', contacts: 'https://www.googleapis.com/auth/contacts.readonly' };
+    const scope = (process.argv[2] || 'gmail,calendar').split(',').map(x => scopes[x]).filter(Boolean).join(' ');
     const now = Math.floor(Date.now() / 1000);
     const unsigned = `${b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: process.env.GOOGLE_PRIVATE_KEY_ID ?? '' }))}.${b64url(JSON.stringify({
-      iss, sub, scope: process.argv[2] === 'contacts' ? 'https://www.googleapis.com/auth/contacts.readonly'
-        : 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.events',
+      iss, sub, scope,
       aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600,
     }))}`;
     const jwt = `${unsigned}.${createSign('RSA-SHA256').update(unsigned).sign(privKey, 'base64url')}`;
@@ -213,27 +215,27 @@ spec:
                 || echo "WARN: config set autopilot.incremental_extract_include_frontmatter failed (non-fatal)"
               GOOGLE_SOURCES=""
               if [ -n "$WORK_EMAIL" ] && [ -n "$GOOGLE_CLIENT_EMAIL" ] && [ -n "$GOOGLE_PRIVATE_KEY_B64" ]; then
-                EXISTING="$($GBRAIN sources list 2>/dev/null)"
-                for svc in gcontacts:contacts gmail:gmail gcal:calendar; do
-                  id="${svc%%:*}"; service="${svc#*:}"
-                  token_cmd="bun /google/google-token.mjs"
-                  if [ "$service" = contacts ]; then
-                    token_cmd="bun /google/google-token.mjs contacts"
-                    if ! $token_cmd >/dev/null 2>&1; then
-                      echo "WARN: contacts.readonly not granted to the service account yet; skipping gcontacts"
-                      continue
-                    fi
-                  fi
-                  if echo "$EXISTING" | grep -qw "$id"; then
-                    GOOGLE_SOURCES="$GOOGLE_SOURCES,$id"
-                  elif $GBRAIN sources add "$id" --kind google --account "$WORK_EMAIL" --services "$service" \
-                      --history-days 90 --dir "/install/google-$id" \
-                      --access command --token-command "$token_cmd"; then
-                    GOOGLE_SOURCES="$GOOGLE_SOURCES,$id"
-                  else
-                    echo "WARN: gbrain $id source add failed (non-fatal)"
-                  fi
-                done
+                EXISTING="$($GBRAIN sources list --json 2>/dev/null)"
+                # one source carries every granted service; contacts is optional until contacts.readonly is granted
+                services="gmail,calendar"
+                if bun /google/google-token.mjs contacts >/dev/null 2>&1; then
+                  services="gmail,calendar,contacts"
+                else
+                  echo "WARN: contacts.readonly not granted to the service account yet; google source has no contacts"
+                fi
+                token_cmd="bun /google/google-token.mjs $services"
+                if echo "$EXISTING" | bun -e 'const s = JSON.parse(await Bun.stdin.text()).sources ?? []; process.exit(s.some(x => x.id === "google") ? 0 : 1)' 2>/dev/null; then
+                  GOOGLE_SOURCES="google"
+                elif $GBRAIN sources add google --kind google --account "$WORK_EMAIL" --services "$services" \
+                    --contacts-dir contacts --history-days 90 --dir /install/google-google \
+                    --access command --token-command "$token_cmd"; then
+                  GOOGLE_SOURCES="google"
+                else
+                  echo "WARN: gbrain google source add failed (non-fatal)"
+                fi
+                # the old per-service sources stay readable until they are archived by hand
+                LEGACY="$(echo "$EXISTING" | bun -e 'const s = JSON.parse(await Bun.stdin.text()).sources ?? []; console.log(s.filter(x => ["gmail", "gcal", "gcontacts"].includes(x.id) && !x.archived).map(x => x.id).join(","))' 2>/dev/null)"
+                [ -n "$LEGACY" ] && GOOGLE_SOURCES="$GOOGLE_SOURCES,$LEGACY"
               fi
               GOOGLE_SOURCES="${GOOGLE_SOURCES#,}" bun -e '
                 import { SQL } from "bun";
@@ -250,11 +252,11 @@ spec:
                   console.log("gbrain: hermes-mcp granted read on " + process.env.GOOGLE_SOURCES);
                 }
                 const mt = process.env.GBRAIN_MAIL_TOKEN;
-                if (mt && (process.env.GOOGLE_SOURCES || "").split(",").includes("gmail")) {
+                if (mt && (process.env.GOOGLE_SOURCES || "").split(",").includes("google")) {
                   const mh = new Bun.CryptoHasher("sha256").update(mt).digest("hex");
                   await db`INSERT INTO access_tokens (name, token_hash) VALUES (${"hermes-mail"}, ${mh}) ON CONFLICT (token_hash) DO NOTHING`;
-                  await db`UPDATE access_tokens SET permissions = (CASE WHEN jsonb_typeof(permissions) = ${"object"} THEN permissions ELSE jsonb_build_object() END) || jsonb_build_object(${"source_id"}::text, ${"gmail"}::text) WHERE name = ${"hermes-mail"}`;
-                  console.log("gbrain: hermes-mail bearer asserted, scoped to gmail");
+                  await db`UPDATE access_tokens SET permissions = (CASE WHEN jsonb_typeof(permissions) = ${"object"} THEN permissions ELSE jsonb_build_object() END) || jsonb_build_object(${"source_id"}::text, ${"google"}::text) WHERE name = ${"hermes-mail"}`;
+                  console.log("gbrain: hermes-mail bearer asserted, scoped to google");
                 }
                 await db.end();
                 console.log("gbrain: hermes-mcp bearer asserted");
