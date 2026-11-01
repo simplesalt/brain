@@ -59,6 +59,7 @@ configMapGenerator:
       - cron-linkedin-lookup.py=manifests/hermes-skills/cron-linkedin-lookup.py
       - cron-job-status-sync.py=manifests/hermes-skills/cron-job-status-sync.py
       - cron-job-status-sync.md=manifests/hermes-skills/cron-job-status-sync.md
+      - cron-timeline-sweep.py=manifests/hermes-skills/cron-timeline-sweep.py
       - SOUL.md=manifests/SOUL.md
       - AGENTS.md=manifests/AGENTS.md
   - name: lease-sweep-script

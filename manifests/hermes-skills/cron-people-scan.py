@@ -37,6 +37,7 @@ AUTOMATED = re.compile(r"(no-?reply|do-?not-?reply|notification|newsletter|maile
                        r"marketing|hello@|support@|team@|^em@|receipt|invoice|billing|statement|customerservice|^service@|"
                        r"^contact@|^office@|^welcome@|^register@|^notify@|^studio@|^help@|calendar-server|@resource\.calendar\.google\.com)", re.I)
 SELF = re.compile(r"^(dylan[.a-z]*@(simplesalt\.company|simple-salt\.com|saltyonsecurity\.net|gmail\.com)"
+                  r"|russ(ell)?[.a-z]*@(simplesalt\.company|simple-salt\.com)"
                   r"|admin@simplesalt\.company)$", re.I)
 
 
@@ -291,6 +292,12 @@ def write_person(p):
             needs_email = False
     if needs_email:
         add_email(slug, email)
+    # The timeline-sweep job may already have recorded this thread or meeting on the page.
+    timeline = call("get_timeline", {"slug": slug})
+    if isinstance(timeline, dict):
+        timeline = timeline.get("entries") or timeline.get("timeline") or []
+    if any(isinstance(e, dict) and e.get("source") == item for e in timeline or []):
+        return
     call("add_timeline_entry", dict(entry, slug=slug))
 
 
