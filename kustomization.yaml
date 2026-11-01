@@ -76,9 +76,13 @@ configMapGenerator:
       - src--http.ts=gbrain-addon/src/http.ts
       - src--jobs.ts=gbrain-addon/src/jobs.ts
       - src--validate.ts=gbrain-addon/src/validate.ts
+      - src--reply-check.ts=gbrain-addon/src/reply-check.ts
+      - src--reply-review.ts=gbrain-addon/src/reply-review.ts
       - src--worker.ts=gbrain-addon/src/worker.ts
       - test--http.test.ts=gbrain-addon/test/http.test.ts
       - test--loops.test.ts=gbrain-addon/test/loops.test.ts
+      - test--replycheck.test.ts=gbrain-addon/test/replycheck.test.ts
+      - test--thread.test.ts=gbrain-addon/test/thread.test.ts
   - name: lease-sweep-script
     namespace: ssint-main-ai
     files:

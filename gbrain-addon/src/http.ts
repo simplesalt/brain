@@ -7,9 +7,10 @@
  *   GET  /health         -> {"ok":true}
  *   POST /loops/open     -> loopOpen(engine, body)
  *   POST /loops/recheck  -> loopRecheck(engine, body)
+ *   POST /loops/thread   -> loopThread(engine, body, opts.thread)
  */
 import type { BrainEngine } from 'gbrain/engine';
-import { loopOpen, loopRecheck } from './jobs.ts';
+import { loopOpen, loopRecheck, loopThread, type ThreadDeps } from './jobs.ts';
 import { AddonParamError } from './validate.ts';
 
 export const MAX_BODY_BYTES = 256 * 1024;
@@ -19,6 +20,8 @@ export interface HandlerOpts {
   token?: string;
   /** source_id used when a body omits it. */
   defaultSource?: string;
+  /** Reply-needed gate for /loops/thread (see ThreadDeps). */
+  thread?: ThreadDeps;
 }
 
 function json(status: number, body: unknown): Response {
@@ -30,6 +33,7 @@ export function makeHandler(engine: BrainEngine, opts: HandlerOpts = {}) {
   const routes: Record<string, (engine: BrainEngine, data: unknown) => Promise<unknown>> = {
     '/loops/open': loopOpen,
     '/loops/recheck': loopRecheck,
+    '/loops/thread': (e, d) => loopThread(e, d, opts.thread),
   };
 
   return async (req: Request): Promise<Response> => {

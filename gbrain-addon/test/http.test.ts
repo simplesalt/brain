@@ -81,7 +81,7 @@ describe('addon http', () => {
     const r = await post('/loops/recheck', {
       counterparty_slug: 'people/bob',
       messages: [
-        { channel: 'linkedin', message_id: 'li-1', from_me: true, sent_at: '2026-01-02T09:00:00Z', text: 'thanks' },
+        { channel: 'linkedin', message_id: 'li-1', from_me: true, sent_at: '2026-01-02T09:00:00Z', text: 'Sending it over tomorrow' },
       ],
     });
     expect(r.status).toBe(200);

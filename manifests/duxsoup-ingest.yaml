@@ -101,9 +101,12 @@ data:
 
     const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain.ssint-main-ai:3131/mcp';
     const GBRAIN_TOKEN = process.env.GBRAIN_REMOTE_TOKEN ?? '';
-    // gbrain add-on (open-loop tracking): /loops/recheck and /loops/open.
+    // gbrain add-on (open-loop tracking): /loops/recheck and /loops/thread.
     const ADDON_URL = (process.env.ADDON_URL ?? 'http://gbrain.ssint-main-ai:3140').replace(/\/+$/, '');
     const ADDON_TOKEN = process.env.ADDON_TOKEN ?? 'gbrain-addon';
+    // Conversation-level loop detection (message path and hourly sweep); 'off' skips both.
+    const CONVERSATION_LOOPS = String(process.env.CONVERSATION_LOOPS ?? 'on').trim().toLowerCase() !== 'off';
+    const LOOPS_SWEEP_INTERVAL_MS = Number(process.env.LOOPS_SWEEP_INTERVAL_MS ?? 60 * 60 * 1000);
 
     const POD_NAME = process.env.POD_NAME ?? 'unknown';
     const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 120);
@@ -1627,37 +1630,120 @@ data:
       return { slug, date, isReceived, text: stringifyDetail(d.text ?? ''), profileRow, senderName };
     }
 
-    // Open-loop tracking for one message event, once its person page slug is
-    // known: recheck first (the message may settle the person's open loops),
-    // then, for an inbound message, open an unanswered_inbound loop (so a new
-    // inbound message never closes itself). Dux Soup sends no message or
-    // conversation id, so external_id is a stable hash of the other person's
-    // Dux Soup id + event time + text, and thread_id is that person's id.
-    // Both calls are idempotent, so a retried event replays them harmlessly.
-    const OPEN_PER_MESSAGE = false;
-    async function syncMessageLoops(row, { slug, isReceived, text, profileRow, senderName }) {
+    // Cross-channel closing for one message event, once its person page slug is
+    // known: recheck lets the message settle the person's open loops (e.g. an
+    // email loop answered over LinkedIn). Dux Soup sends no message or
+    // conversation id, so the message id is a stable hash of the other person's
+    // Dux Soup id + direction + event time + text. Idempotent, so a retried
+    // event replays it harmlessly. Opening loops is conversation-level, see
+    // syncConversationLoops (simplesalt/projects#838).
+    function duxMessageId(threadId, isReceived, sentAtIso, text) {
+      return `duxsoup:${shortHash(`${threadId}|${isReceived ? 'in' : 'out'}|${sentAtIso}|${text}`)}`;
+    }
+
+    async function syncMessageLoops(row, { slug, isReceived, text, profileRow }) {
       const sentAtIso = eventIsoTime(row, null);
       if (!sentAtIso) throw new Error(`message event ${row.id} has no usable time`);
-      const threadId = String(profileRow.dux_id);
-      const messageId = `duxsoup:${shortHash(`${threadId}|${isReceived ? 'in' : 'out'}|${sentAtIso}|${text}`)}`;
+      const messageId = duxMessageId(String(profileRow.dux_id), isReceived, sentAtIso, text);
       await addonPost('/loops/recheck', {
         counterparty_slug: slug,
         messages: [{ channel: 'linkedin', message_id: messageId, page_slug: slug, from_me: !isReceived, sent_at: sentAtIso, text }],
       });
-      // Per-message opens are off: they opened a loop for every inbound message. Conversation-level
-      // detection with gbrain's own reply rules replaces them (simplesalt/projects#838).
-      if (!isReceived || !OPEN_PER_MESSAGE) return;
-      const name = senderName || [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim() || 'Someone';
-      const oneLine = text.replace(/\s+/g, ' ').trim();
-      await addonPost('/loops/open', {
-        channel: 'linkedin',
-        external_id: messageId,
-        thread_id: threadId,
-        loop_type: 'unanswered_inbound',
-        counterparty_slug: slug,
-        summary: `${name} messaged you on LinkedIn: ${oneLine.slice(0, 120)}`,
-        evidence: [{ message_id: messageId, page_slug: slug, quote: oneLine.slice(0, 200) }],
-      });
+    }
+
+    // Conversation-level loop detection. CONVERSATION_LOOPS=off skips it.
+    // Posts the whole stored LinkedIn conversation with one person (latest 50
+    // messages, both directions) to the add-on, which applies gbrain's email
+    // reply rules and opens/closes loops itself. Stored message events are the
+    // source: direction and time are derived exactly as for a live event
+    // (event name 'received' or data.fromId present = inbound; time via
+    // eventIsoTime), and the counterparty is data.fromId (inbound) or
+    // data.toId (outbound). Processed events plus the one being processed
+    // (currentEventId). Idempotent. Returns the add-on result, or
+    // { notFound: true } while the add-on has no /loops/thread route (404).
+    async function syncConversationLoops(profileRow, slug, name, currentEventId = null) {
+      if (!CONVERSATION_LOOPS) return null;
+      const threadId = String(profileRow.dux_id);
+      const rows = await sql`
+        SELECT id, event, payload, received_at FROM events
+        WHERE type = 'message'
+          AND (processed_at IS NOT NULL OR id = ${currentEventId})
+          AND (payload->'data'->>'fromId' = ${threadId} OR payload->'data'->>'toId' = ${threadId})
+        ORDER BY id DESC
+        LIMIT 200`;
+      const messages = [];
+      for (const raw of rows) {
+        const row = { ...raw, payload: normalizePayload(raw.payload) };
+        const d = row.payload?.data ?? {};
+        const ev = String(row.event ?? row.payload?.event ?? '').toLowerCase();
+        const isReceived = ev ? ev === 'received' : (d.fromId != null || d.from != null);
+        const otherId = isReceived ? d.fromId : d.toId;
+        if (otherId == null || String(otherId) !== threadId) continue;
+        const sentAt = eventIsoTime(row, null);
+        if (!sentAt) continue;
+        const text = stringifyDetail(d.text ?? '');
+        messages.push({ message_id: duxMessageId(threadId, isReceived, sentAt, text), from_me: !isReceived, sent_at: sentAt, text });
+      }
+      messages.sort((a, b) => a.sent_at.localeCompare(b.sent_at));
+      const latest = messages.slice(-50);
+      if (!latest.length) return { skipped: true };
+      try {
+        const res = await addonPost('/loops/thread', {
+          channel: 'linkedin',
+          thread_id: threadId,
+          counterparty_slug: slug,
+          counterparty_name: name || undefined,
+          messages: latest,
+        });
+        return res ?? { skipped: true };
+      } catch (e) {
+        if (String(e?.message ?? '').includes('HTTP 404')) return { notFound: true };
+        throw e;
+      }
+    }
+
+    let loopsThreadNotFoundLogged = false;
+
+    // Hourly: re-evaluate every conversation with a message in the last 14 days,
+    // so one that passes the 24h grace opens on time without a new message.
+    // Only logs; never throws.
+    let sweeping = false;
+    async function sweepConversationLoops() {
+      if (!CONVERSATION_LOOPS || sweeping) return;
+      sweeping = true;
+      let conversations = 0, opened = 0, closed = 0, held = 0, failed = 0, notFound = false;
+      try {
+        const profiles = await sql`
+          SELECT p.* FROM profiles p
+          WHERE p.gbrain_slug IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM events e
+              WHERE e.type = 'message'
+                AND e.received_at > now() - interval '14 days'
+                AND (e.payload->'data'->>'fromId' = p.dux_id OR e.payload->'data'->>'toId' = p.dux_id)
+            )`;
+        for (const p of profiles) {
+          conversations++;
+          try {
+            const name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
+            const res = await syncConversationLoops(p, p.gbrain_slug, name);
+            if (res?.notFound) { notFound = true; break; }
+            opened += Number(res?.opened) || 0;
+            closed += Number(res?.closed) || 0;
+            if (res?.held_until) held++;
+          } catch (e) {
+            failed++;
+            console.error(`loops-sweep: ${p.dux_id} failed: ${String(e?.message ?? e).slice(0, 200)}`);
+          }
+        }
+      } catch (e) {
+        failed++;
+        console.error(`loops-sweep: query failed: ${e.message}`);
+      } finally {
+        sweeping = false;
+      }
+      if (notFound) console.error('loops-sweep: add-on has no /loops/thread yet (404); skipped');
+      console.log(`loops-sweep: conversations=${conversations} opened=${opened} closed=${closed} held=${held} failed=${failed}`);
     }
 
     async function processMessage(row) {
@@ -1671,6 +1757,12 @@ data:
         source: `duxsoup:message:${row.id}`,
       });
       await syncMessageLoops(row, w);
+      const name = [w.profileRow.first_name, w.profileRow.last_name].filter(Boolean).join(' ').trim() || (w.isReceived ? w.senderName : '');
+      const conv = await syncConversationLoops(w.profileRow, slug, name, row.id);
+      if (conv?.notFound && !loopsThreadNotFoundLogged) {
+        loopsThreadNotFoundLogged = true;
+        console.error('loops-thread: add-on has no /loops/thread yet (404); message processed without it');
+      }
     }
 
     // One-time (per process start) pass over stored message events so messages
@@ -1963,6 +2055,11 @@ data:
       settingsPoll();
       setInterval(settingsPoll, SETTINGS_POLL_INTERVAL_MS);
 
+      const loopsSweep = () => sweepConversationLoops()
+        .catch((e) => console.error(`loops-sweep: unexpected failure: ${String(e?.message ?? e).slice(0, 300)}`));
+      setTimeout(loopsSweep, 5 * 60 * 1000);
+      setInterval(loopsSweep, LOOPS_SWEEP_INTERVAL_MS);
+
       Bun.serve({
         port: PORT,
         async fetch(req) {
@@ -2046,6 +2143,8 @@ spec:
               value: http://gbrain.ssint-main-ai:3140
             - name: ADDON_TOKEN
               value: "gbrain-addon"
+            - name: CONVERSATION_LOOPS
+              value: "off"
           livenessProbe:
             # The container blocks on migrateWithRetry() (schema migration, up to
             # ~120s of retries against a not-yet-ready CNPG cluster) before the
