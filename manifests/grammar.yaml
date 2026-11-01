@@ -3,8 +3,12 @@
 # https://api.simplesalt.company/45e6451afc312886/grammar (its authoritative address). Signed-in
 # callers only (Cloudflare Access, in the same app as Big AGI); Big AGI's Aa
 # button calls it directly with that one sign-in.
-# Filled by a person out of band, key OPENROUTER_API_KEY: a dedicated OpenRouter
-# key with a low spending limit. Flux merges so reconciliation never wipes it.
+# It signs in to OpenRouter by federation: its Kubernetes service account token is
+# exchanged for a short-lived access token under the policy id in the shared model
+# config (GRAMMAR_FEDERATION_POLICY_ID in manifests/llm-models.env). Only while that
+# id is empty does it use the stored key below, filled by a person out of band, key
+# OPENROUTER_API_KEY: a dedicated OpenRouter key with a low spending limit. Flux
+# merges so reconciliation never wipes it.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -17,6 +21,16 @@ metadata:
   annotations:
     kustomize.toolkit.fluxcd.io/ssa: merge
 type: Opaque
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grammar
+  namespace: ssint-main-voice
+  labels:
+    entity: ssint
+    env: main
+    capability: voice
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -40,8 +54,11 @@ data:
     # ALLOWED_ORIGINS (Big AGI's grammar button) call it directly with the Access
     # cookie; GET BASE_PATH is a sign-in page they open once if that cookie is missing,
     # and GET BASE_PATH?return=<url on ALLOWED_ORIGINS> sends the browser back there.
-    # It owns its OpenRouter key; /healthz is unready until the key is filled, and the
-    # key is re-read on each use.
+    # OpenRouter auth: with a federation policy id set (GRAMMAR_FEDERATION_POLICY_ID, from
+    # the shared model config) it exchanges its service account token (re-read on each
+    # exchange, kubelet rotates it) for a short-lived access token, cached and renewed
+    # shortly before it expires. With no policy id it uses its stored key, re-read on each
+    # use. /healthz is unready until one of the two works.
     import base64, hashlib, hmac, json, os, threading, time, http.server, urllib.error, urllib.parse, urllib.request
 
     PORT = int(os.environ.get('PORT', '8000'))
@@ -54,6 +71,9 @@ data:
                       b'<p>Signed in to the grammar fix. You can close this window.</p>'
                       b'<script>try{opener&&opener.postMessage("grammar-signed-in","*")}catch(e){}setTimeout(()=>close(),800)</script>')
     KEY_PATH = os.environ.get('KEY_PATH', '/secrets/OPENROUTER_API_KEY')
+    OIDC_TOKEN_PATH = os.environ.get('OIDC_TOKEN_PATH', '/var/run/secrets/openrouter/token')
+    FEDERATION_POLICY_ID = os.environ.get('GRAMMAR_FEDERATION_POLICY_ID', '').strip()
+    TOKEN_URL = os.environ.get('TOKEN_URL', 'https://openrouter.ai/api/v1/oauth/token')
     LLM_URL = os.environ.get('LLM_URL', 'https://openrouter.ai/api/v1/chat/completions')
     MODEL = os.environ['MODEL']  # from the llm-models ConfigMap
     # OpenRouter switches to these, in order, when the main model is down or errors (none set: the preset carries the backup).
@@ -76,6 +96,52 @@ data:
         except OSError:
             return ''
 
+    _tok = {'value': '', 'expires': 0.0, 'retry': 0.0}
+    _tok_lock = threading.Lock()
+
+    def _exchange():
+        """Swap the service account token for an OpenRouter access token; return (token, seconds valid) or ('', 0)."""
+        try:
+            with open(OIDC_TOKEN_PATH) as f:
+                subject = f.read().strip()
+            form = urllib.parse.urlencode({
+                'grant_type': 'urn:ietf:params:oauth:grant-type:token-exchange',
+                'subject_token_type': 'urn:ietf:params:oauth:token-type:jwt',
+                'subject_token': subject, 'federation_policy_id': FEDERATION_POLICY_ID}).encode()
+            r = urllib.request.Request(TOKEN_URL, data=form, method='POST', headers={
+                'Content-Type': 'application/x-www-form-urlencoded'})
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                doc = json.load(resp)
+            return doc['access_token'], float(doc.get('expires_in') or 0)
+        except urllib.error.HTTPError as e:
+            detail = e.read()[:500].decode('utf-8', 'replace')
+            print(f'grammar: token exchange HTTP {e.code}: {detail}', flush=True)
+        except Exception as e:
+            print(f'grammar: token exchange failed: {type(e).__name__}', flush=True)
+        return '', 0.0
+
+    def bearer():
+        """The token to send to OpenRouter: the exchanged access token when a policy id is set, else the stored key."""
+        if not FEDERATION_POLICY_ID:
+            return openrouter_key()
+        with _tok_lock:
+            now = time.time()
+            if _tok['value'] and _tok['expires'] - now >= 120:
+                return _tok['value']
+            if now < _tok['retry']:
+                return ''
+            value, ttl = _exchange()
+            if value:
+                _tok.update(value=value, expires=now + ttl, retry=0.0)
+            else:
+                _tok.update(value='', expires=0.0, retry=now + 10)
+            return value
+
+    def drop_token():
+        """Forget the cached access token so the next call exchanges again."""
+        with _tok_lock:
+            _tok.update(value='', expires=0.0)
+
     def fix(text, context=''):
         """Return text with punctuation and grammar fixed, or raise."""
         user = (f'Context:\n{context[-6000:]}\n\n' if context else '') + f'Transcript:\n{text}'
@@ -84,10 +150,15 @@ data:
         if FALLBACK_MODELS:
             body['models'] = [MODEL] + FALLBACK_MODELS
         r = urllib.request.Request(LLM_URL, data=json.dumps(body).encode(), method='POST', headers={
-            'Authorization': 'Bearer ' + openrouter_key(), 'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + bearer(), 'Content-Type': 'application/json',
             'X-Title': 'grammar fix'})
-        with urllib.request.urlopen(r, timeout=30) as resp:
-            doc = json.load(resp)
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                doc = json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and FEDERATION_POLICY_ID:
+                drop_token()
+            raise
         # A preset is served by whatever model it names, so only a plain model id can be compared.
         if doc.get('model') and doc['model'] != MODEL and not MODEL.startswith('@preset/'):
             print(f'grammar: served by fallback {doc["model"]}', flush=True)
@@ -210,10 +281,11 @@ data:
                     self._reply(401, {'error': 'not signed in'})
             elif self.path != '/healthz':
                 self._reply(404, {'error': 'not found'})
-            elif not openrouter_key():
-                self._reply(503, {'ok': False, 'error': 'OpenRouter key not filled'})
+            elif not bearer():
+                self._reply(503, {'ok': False, 'error': 'OpenRouter token exchange failing' if FEDERATION_POLICY_ID
+                                  else 'OpenRouter key not filled'})
             else:
-                self._reply(200, {'ok': True, 'model': MODEL})
+                self._reply(200, {'ok': True, 'model': MODEL, 'auth': 'federated' if FEDERATION_POLICY_ID else 'key'})
 
         def do_POST(self):
             if self.path.split('?', 1)[0] != BASE_PATH:
@@ -227,8 +299,9 @@ data:
             if not verify_access_jwt(self.headers.get(JWT_HEADER, '')):
                 self._reply(401, {'error': 'not signed in'})
                 return
-            if not openrouter_key():
-                self._reply(503, {'error': 'grammar key not filled'})
+            if not bearer():
+                self._reply(503, {'error': 'grammar token exchange failing' if FEDERATION_POLICY_ID
+                                  else 'grammar key not filled'})
                 return
             as_json = self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() == 'application/json'
             try:
@@ -261,8 +334,12 @@ data:
 
     if __name__ == '__main__':
         srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
-        print(f'grammar :{PORT} model {MODEL}' + ('' if openrouter_key() else
-              ' (unready: secret grammar-openrouter-api-key is not filled)'), flush=True)
+        if FEDERATION_POLICY_ID:
+            print(f'grammar :{PORT} model {MODEL} auth federated (policy {FEDERATION_POLICY_ID})'
+                  + ('' if bearer() else ' (unready: token exchange failing)'), flush=True)
+        else:
+            print(f'grammar :{PORT} model {MODEL} auth key' + ('' if openrouter_key() else
+                  ' (unready: secret grammar-openrouter-api-key is not filled)'), flush=True)
         srv.serve_forever()
 ---
 apiVersion: apps/v1
@@ -288,8 +365,11 @@ spec:
         capability: voice
       # The script is read only at start; its hash here restarts the pod when it changes.
       annotations:
-        grammar-script-sha: c41998ba13e59ad1
+        grammar-script-sha: f9e8adfc43e24cc7
     spec:
+      serviceAccountName: grammar
+      # The app never calls the Kubernetes API; only the projected OpenRouter token below is mounted.
+      automountServiceAccountToken: false
       containers:
         - name: grammar
           image: python:3.12-alpine
@@ -306,6 +386,15 @@ spec:
                 configMapKeyRef:
                   name: llm-models
                   key: LIVE_DUMB_MODEL
+            # The OpenRouter federation policy id (llm-models ConfigMap); empty or unset means the stored key is used.
+            - name: GRAMMAR_FEDERATION_POLICY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GRAMMAR_FEDERATION_POLICY_ID
+                  optional: true
+            - name: OIDC_TOKEN_PATH
+              value: "/var/run/secrets/openrouter/openrouter-token"
             - name: ACCESS_TEAM_DOMAIN
               value: "https://fqurzlaaagt.cloudflareaccess.com"
             - name: BASE_PATH
@@ -320,6 +409,9 @@ spec:
               mountPath: /scripts
             - name: key
               mountPath: /secrets
+              readOnly: true
+            - name: openrouter-token
+              mountPath: /var/run/secrets/openrouter
               readOnly: true
           readinessProbe:
             httpGet:
@@ -347,6 +439,14 @@ spec:
           secret:
             secretName: grammar-openrouter-api-key
             optional: true
+        # Service account token for the OpenRouter exchange; kubelet rotates it.
+        - name: openrouter-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: https://openrouter.ai
+                  expirationSeconds: 3600
+                  path: openrouter-token
 ---
 apiVersion: v1
 kind: Service
