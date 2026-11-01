@@ -5,7 +5,7 @@ Runs every minute as the trigger for the people-scan cron job: it wakes Hermes o
 a meeting or email thread whose people it has not met yet. It lists Dylan's synced meetings (past ones only) and email
 threads from gbrain, drops the ones already handled, newsletters and automated mail, and prints a
 batch for Hermes to turn into people pages. Handled slugs are kept on the gbrain page ops/people-scan
-(Hermes cannot tag pages in the google source), marked when handed out so no item is
+(Hermes cannot tag pages in the gmail and gcal sources), marked when handed out so no item is
 processed twice. With nothing to do it prints {"wakeAgent": false} so the job skips the model call.
 
 Hermes only judges: its answer lists the real people as JSON after a PEOPLE-SCAN-RESULT line. Before
@@ -337,7 +337,7 @@ def main():
     done = load_state()
     applied = apply_results(applied_marks(done))
     done |= {"output:" + k for k in applied}
-    pages = [p for p in all_pages(type="meeting", source_id="google") + all_pages(type="email", source_id="google")
+    pages = [p for p in all_pages(type="meeting", source_id="gcal") + all_pages(type="email", source_id="gmail")
              if p["slug"] not in done]
     today = now.date().isoformat()
     pages = [p for p in pages if slug_date(p) <= today]

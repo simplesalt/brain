@@ -79,12 +79,13 @@ Save them there. gbrain holds project knowledge.
   it can be about a different person or an older topic. Check gbrain before
   acting on it.
 
-- Dylan's Google account is one gbrain source, `google`: his Gmail (one
-  `emails/...` page per thread), his calendar (`calendar/...` meeting pages) and
-  his contacts (`contacts/...`); gbrain syncs it itself. What Dylan owes or is
-  waiting on (unanswered email, promises, pending decisions): `open_loops` with
-  `source_id: "google"`. Email loops close on their own when a reply lands.
-- gbrain sources are only `default` and `google`, and your token reads both; check with `sources_list`, never guess a source id. Dux-Soup
+- Dylan's Gmail is in gbrain source `gmail` (one `emails/...` page per thread)
+  and his calendar in source `gcal` (`calendar/...` meeting pages); gbrain syncs
+  both itself. What Dylan owes or is waiting on (unanswered email, promises,
+  pending decisions): `open_loops` with `source_id: "gmail"`. Email loops close
+  on their own when a reply lands.
+- gbrain sources are only `default`, `gmail` and `gcal`, and your token reads
+  all three; check with `sources_list`, never guess a source id. Dux-Soup
   (LinkedIn) has no source of its own: it writes into `default` — `people/...`
   pages, LinkedIn actions such as connect invites in each page's
   `get_timeline` (source `duxsoup:action:...`), and the original payload in

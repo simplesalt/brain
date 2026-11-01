@@ -46,10 +46,10 @@ Three or more timeline entries with a consistent role, or a filled
 
 ### 2. gbrain: Dylan's mail and calendar
 
-gbrain holds Dylan's Gmail (`emails/...` pages) and calendar (`calendar/...`
-pages) in source `google`. Search it for the name: `mcp__gbrain__query` /
-`mcp__gbrain__search` with `source_id` `google`, `types` `email`, then
-`meeting`. Recurring meetings or a long thread with one person usually settle who
+gbrain holds Dylan's Gmail (source `gmail`, `emails/...` pages) and calendar
+(source `gcal`, `calendar/...` pages). Search both for the name:
+`mcp__gbrain__query` / `mcp__gbrain__search` with `source_id` `gmail`, then
+`gcal`. Recurring meetings or a long thread with one person usually settle who
 "Clayton" is, with a surname and an email address. The email domain names the
 company unless it is a personal domain (gmail.com and the like).
 

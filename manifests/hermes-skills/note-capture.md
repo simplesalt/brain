@@ -23,7 +23,7 @@ Before asking anything, settle what a check can settle:
 
 - What the note was for: if it has a date, or Dylan says when, look for a
   meeting then: `mcp__gbrain__search` with `{"query": "<YYYY-MM-DD> <names on the
-  page>", "source_id": "google", "types": ["meeting"]}` (meeting slugs start with
+  page>", "source_id": "gcal", "types": ["meeting"]}` (meeting slugs start with
   `calendar/YYYY/MM/YYYY-MM-DD-`). A matching meeting tells you who was there.
 - Who is who: for every name, initial or company, `mcp__gbrain__search` (add the
   company or meeting attendees as context). Treat a match as settled only when

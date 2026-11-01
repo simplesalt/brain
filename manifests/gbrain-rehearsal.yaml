@@ -736,7 +736,7 @@ spec:
                 cfg persistence.unbound_write
                 cfg cycle.conversation_facts_backfill.enabled true
 
-                section "U4. default source local_path null (google is a connector source and keeps its own) and sync.repo_path unset"
+                section "U4. default source local_path null (gmail and gcal are connector sources and keep theirs) and sync.repo_path unset"
                 $GBRAIN sources list --json >/work/sources.json 2>/work/sources.err
                 echo "[exit $?]"
                 scan "sources local_path null" bun -e '
