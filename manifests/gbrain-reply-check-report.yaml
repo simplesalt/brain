@@ -3,7 +3,7 @@ kind: Job
 metadata:
   # One-shot, read-only: prints the add-on's reply-needed verdicts with each loop's summary.
   # Bump the suffix to run it again.
-  name: gbrain-reply-check-report-2
+  name: gbrain-reply-check-report-3
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -29,9 +29,9 @@ spec:
           args:
             - |
               psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -P pager=off -c "
-                SELECT c.verdict, l.status, l.id, left(l.summary, 90) AS summary, left(c.reason, 120) AS reason
+                SELECT c.verdict, c.prompt_version AS v, l.status, l.id, left(l.summary, 90) AS summary, left(c.reason, 120) AS reason
                   FROM addon_reply_checks c JOIN open_loops l ON l.id = c.loop_id
-                 ORDER BY c.checked_at DESC LIMIT 60;" -c "
+                 ORDER BY c.checked_at DESC LIMIT 15;" -c "
                 SELECT source_id, loop_type, status, count(*) FROM open_loops
                  WHERE source_id IN ('google','gmail') GROUP BY 1,2,3 ORDER BY 1,2,3;"
           env:
