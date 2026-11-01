@@ -156,6 +156,36 @@ def wanted_loops(loops, now=None):
             if loop.get("loop_type") in OWED_TYPES and loop.get("status") == "open"}
 
 
+def merge_twins(loops):
+    """Fold loops that several sources hold for the same thread into one.
+
+    Two sources can ingest the same mailbox (gmail and google do), each opening its own loop for the same
+    thread. Twins share page, loop type, counterparty and opened_at. The lowest id is kept; if any twin is
+    closed the kept loop takes that closing status, since a close in one source is the settled answer.
+    Returns (merged loops, {twin id: kept id})."""
+    groups = {}
+    for lid, loop in loops.items():
+        if not loop.get("page_slug"):
+            continue
+        key = (loop["page_slug"], loop.get("loop_type"), loop.get("counterparty_email") or loop.get("counterparty_slug"),
+               loop.get("opened_at"))
+        groups.setdefault(key, []).append(lid)
+    merged, twin_of = dict(loops), {}
+    for ids in groups.values():
+        if len(ids) < 2:
+            continue
+        ids.sort(key=int)
+        keep = dict(loops[ids[0]])
+        closed = [loops[i]["status"] for i in ids if loops[i].get("status") in CLOSED_STATUSES]
+        if closed:
+            keep["status"] = closed[0]
+        merged[ids[0]] = keep
+        for i in ids[1:]:
+            twin_of[i] = ids[0]
+            merged.pop(i)
+    return merged, twin_of
+
+
 def loop_state(loop):
     return "closed" if loop.get("status") in CLOSED_STATUSES else "open"
 
@@ -413,13 +443,14 @@ def read_results(read):
 def main(dry_run):
     now = datetime.datetime.now(datetime.timezone.utc)
     today = now.date().isoformat()
-    loops, complete = read_loops()
+    all_loops, complete = read_loops()
+    loops, twin_of = merge_twins(all_loops)
     wanted = wanted_loops(loops, now)
     by_type = {}
     for l in wanted.values():
         by_type[l["loop_type"]] = by_type.get(l["loop_type"], 0) + 1
     print(f"gbrain: {len(loops)} loops read ({'complete' if complete else 'partial'}); "
-          f"{len(wanted)} owed-by-us loops get rows {by_type}")
+          f"{len(twin_of)} same-thread twins folded; {len(wanted)} owed-by-us loops get rows {by_type}")
 
     toks = tokens()
     if not toks:
@@ -484,6 +515,15 @@ def main(dry_run):
     batch = []
     for lid, row in rows.items():
         loop = loops.get(lid)
+        if lid in twin_of:
+            # A row made for a twin duplicates the kept loop's row; only the sync makes rows with a Loop ID.
+            print(f"{tag}trash row for loop {lid}: same thread as loop {twin_of[lid]}")
+            try:
+                write("PATCH", f"/pages/{row['id']}", {"archived": True})
+                actions["trashed"].append(lid)
+            except NotionError as e:
+                log(f"trash loop {lid} failed: {e}")
+            continue
         # Rows tied to loops of types we do not own (or closed long ago and unseen) are still reconciled below.
         act = plan_existing(row, loop)
         if act == "trash":
@@ -541,7 +581,7 @@ def main(dry_run):
     # 5. reconcile rows gbrain no longer knows (only when every source answered completely)
     if complete:
         for lid, row in rows.items():
-            if lid in loops:
+            if lid in all_loops:
                 continue
             note = f"Loop {lid} is not known to gbrain (checked {today})."
             if row["sync_note"].startswith(f"Loop {lid} is not known to gbrain"):
@@ -624,6 +664,20 @@ def self_test():
     fix = repair_fields(dict(want, Task="", Channel="gmail"), want)
     assert fix == {"Task": "Reply owed", "Channel": "email"}, fix
     assert "Channel" not in repair_fields({"Channel": "manual"}, synced_fields(schema, loops["6"], None, None))
+    twins = {"10": {"id": 10, "loop_type": "unanswered_inbound", "status": "done", "page_slug": "e/a",
+                    "counterparty_email": "a@b.c", "opened_at": "t1", "source_id": "gmail"},
+             "20": {"id": 20, "loop_type": "unanswered_inbound", "status": "open", "page_slug": "e/a",
+                    "counterparty_email": "a@b.c", "opened_at": "t1", "source_id": "google"},
+             "30": {"id": 30, "loop_type": "unanswered_inbound", "status": "open", "page_slug": "e/b",
+                    "counterparty_email": "a@b.c", "opened_at": "t2", "source_id": "gmail"},
+             "40": {"id": 40, "loop_type": "unanswered_inbound", "status": "open", "page_slug": "e/b",
+                    "counterparty_email": "a@b.c", "opened_at": "t2", "source_id": "google"},
+             "50": {"id": 50, "loop_type": "decision_pending", "status": "open", "page_slug": "e/b",
+                    "counterparty_email": "a@b.c", "opened_at": "t2", "source_id": "google"}}
+    m, tw = merge_twins(twins)
+    assert tw == {"20": "10", "40": "30"}, tw
+    assert m["10"]["status"] == "done" and m["30"]["status"] == "open" and "50" in m and twins["10"]["status"] == "done"
+    assert sorted(wanted_loops(m)) == ["30", "50"]
     users = [{"id": "u1", "type": "person", "name": "Dylan E", "person": {"email": DYLAN_ACCOUNT}},
              {"id": "u2", "type": "person", "name": "Other", "person": {"email": "o@x.com"}}]
     assert find_user(users, DYLAN_ACCOUNT) == "u1" and find_user(users, "o@x.com") == "u2" and find_user(users, "z@x.com") is None

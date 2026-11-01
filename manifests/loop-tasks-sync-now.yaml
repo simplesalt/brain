@@ -3,7 +3,7 @@ kind: Job
 metadata:
   # One-shot: runs the hourly loop-tasks-sync once, right away, outside Hermes.
   # The fixed name makes Flux apply it once. Bump the suffix to run it again.
-  name: loop-tasks-sync-now-3
+  name: loop-tasks-sync-now-4
   namespace: ssint-main-ai
   labels:
     entity: ssint
