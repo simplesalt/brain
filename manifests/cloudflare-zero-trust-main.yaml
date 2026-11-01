@@ -215,6 +215,28 @@ spec:
     name: ssint-main
 
 ---
+# Public address of the cluster's service account signing keys (see the tunnel
+# rule below); OpenRouter fetches the key set here.
+apiVersion: dns.upjet-cloudflare.upbound.io/v1alpha1
+kind: Record
+metadata:
+  name: cf-main-dns-oidc-simplesalt-company
+  labels:
+    entity: ssint
+    env: main
+    capability: access
+spec:
+  forProvider:
+    zoneId: 260b251cdb53f8376875a8eb8d03ca0b
+    name: oidc.simplesalt.company
+    type: CNAME
+    content: 83c27a64-4074-474c-9a8f-19448d1c2081.cfargotunnel.com
+    proxied: true
+    ttl: 1
+  providerConfigRef:
+    name: ssint-main
+
+---
 apiVersion: zero.upjet-cloudflare.upbound.io/v1alpha1
 kind: TrustTunnelCloudflaredConfig
 metadata:
@@ -260,6 +282,12 @@ spec:
         - hostname: api.simplesalt.company
           path: ^/c8d3f02053a7ef0c/fireflies$
           service: http://fireflies-ingest.ssint-main-msg.svc.k.famevans.win:8080
+        # The cluster's public signing keys, for OpenRouter workload identity
+        # federation. No Access block: OpenRouter fetches them anonymously. Only
+        # the two discovery paths pass; the publisher serves nothing else either.
+        - hostname: oidc.simplesalt.company
+          path: ^/(openid/v1/jwks|\.well-known/openid-configuration)$
+          service: http://oidc-publisher.cluster-main-identity.svc.k.famevans.win:8080
         - service: http_status:404
   providerConfigRef:
     name: ssint-main
