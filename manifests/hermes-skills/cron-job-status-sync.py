@@ -2,7 +2,7 @@
 """Pick new job-application and recruiter-call emails for Hermes to match to the Notion Jobs database.
 
 Runs hourly as the trigger for the job-status-sync cron job. It lists Dylan's email threads from gbrain
-(source gmail) and keeps the ones with a new message that looks like it is about a job: mail from an
+(source google) and keeps the ones with a new message that looks like it is about a job: mail from an
 applicant tracking system, or a subject about an application, interview, offer or call with a recruiter.
 It prints a batch for Hermes, who matches each thread to a row in Jobs, moves that row's Stage, and lists
 what it cannot match on the "Unmatched job emails" Notion page. Nothing here emails Dylan.
@@ -150,7 +150,7 @@ def main():
     keys, entries = read_results(set(state["outputs"]))
     state["outputs"] += keys
     state["log"] += entries
-    pages = [p for p in all_pages(type="email", source_id="gmail")
+    pages = [p for p in all_pages(type="email", source_id="google")
              if (p.get("updated_at") or "")[:10] >= since and state["seen"].get(p["slug"]) != p.get("updated_at")]
     pages.sort(key=lambda p: p.get("updated_at") or "")
     # Threads Hermes was handed but never answered for (a failed or cut-off run) go out again, up to MAX_TRIES.

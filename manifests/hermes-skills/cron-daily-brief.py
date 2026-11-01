@@ -21,7 +21,7 @@ def main():
     today = datetime.datetime.now(TZ).date()
     near = {(today + datetime.timedelta(days=d)).isoformat() for d in (-1, 0, 1)}
     meetings = []
-    for page in scan.all_pages(type="meeting", source_id="gcal"):
+    for page in scan.all_pages(type="meeting", source_id="google"):
         if scan.slug_date(page) not in near:
             continue
         fm = (scan.call("get_page", {"slug": page["slug"]}) or {}).get("frontmatter") or {}
