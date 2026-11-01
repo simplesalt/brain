@@ -165,7 +165,8 @@ data:
     // Dylan's own addresses are never linked as attendees.
     const OWN_EMAILS = new Set(['dylan@simple-salt.com', 'dylan.evans@simplesalt.company']);
 
-    const PROCESSED_EVENTS = new Set(['meeting.summarized', 'meeting.transcribed']);
+    // Only the transcript matters: summaries are written in gbrain by Hermes's meeting skill.
+    const PROCESSED_EVENTS = new Set(['meeting.transcribed']);
     const NO_KEY_ERROR = 'FIREFLIES_API_KEY not set (secret fireflies-api-key missing or empty); event left unprocessed, will retry once the key is present and the pod restarts';
 
     // `healthcheck` only reads the heartbeat Lease: no database, no server, no
@@ -218,7 +219,7 @@ data:
         updated_at timestamptz NOT NULL DEFAULT now()
       )`,
       `COMMENT ON TABLE events IS 'Every Fireflies webhook event with a valid signature, stored verbatim before processing; the durability boundary for the ingest endpoint.'`,
-      `COMMENT ON COLUMN events.event IS 'Fireflies event name, as sent (e.g. meeting.summarized).'`,
+      `COMMENT ON COLUMN events.event IS 'Fireflies event name, as sent (e.g. meeting.transcribed).'`,
       `COMMENT ON COLUMN events.dedupe_key IS 'meeting_id|event|reprocessed_at; a later event with the same key as an already-processed one is skipped.'`,
       `COMMENT ON COLUMN events.payload IS 'Full raw webhook JSON body, verbatim.'`,
       `COMMENT ON COLUMN events.processed_at IS 'When this event was successfully applied to gbrain (or skipped as duplicate/uninteresting); NULL while pending or retrying.'`,
@@ -465,7 +466,6 @@ data:
         meeting_attendees { displayName email name }
         speakers { id name }
         sentences { speaker_name text start_time }
-        summary { overview action_items keywords short_summary }
       }
     }`;
 
@@ -581,11 +581,6 @@ data:
       return out;
     }
 
-    function asLines(v) {
-      if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
-      return String(v ?? '').split('\n').map((x) => x.replace(/^\s*[-*•]\s*/, '').trim()).filter(Boolean);
-    }
-
     function transcriptText(t, maxTranscriptChars) {
       let transcript = (t.sentences ?? [])
         .filter((x) => x && x.text)
@@ -598,12 +593,10 @@ data:
     }
 
     // Meeting page (type: meeting, as gbrain's meeting-ingestion skill expects). Drafted with
-    // facts_backstop: false; Hermes drops that line once it has verified the page.
+    // facts_backstop: false; Hermes drops that line once it has verified the page. Summary, decisions
+    // and action items are written by Hermes with gbrain's meeting skill, never taken from Fireflies.
     function meetingToMarkdown(t, dayIso, attendees) {
       const durationMin = Math.round(Number(t.duration) || 0);
-      const s = t.summary ?? {};
-      const actions = asLines(s.action_items);
-      const keywords = asLines(Array.isArray(s.keywords) ? s.keywords : String(s.keywords ?? '').split(','));
       const tSlug = transcriptSlug(t, dayIso);
       return [
         '---',
@@ -625,18 +618,6 @@ data:
         `# ${t.title || 'Untitled call'}`,
         '',
         `The full transcript is on its own page: [Transcript](${tSlug}) ([[${tSlug}]]).`,
-        '',
-        '## Summary',
-        '',
-        String(s.overview || s.short_summary || '_No summary._').trim(),
-        '',
-        '## Action items',
-        '',
-        actions.length ? actions.map((a) => `- ${a}`).join('\n') : '_None._',
-        '',
-        '## Keywords',
-        '',
-        keywords.length ? keywords.join(', ') : '_None._',
         '',
         '## Attendees',
         '',
