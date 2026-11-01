@@ -1,0 +1,68 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # One-shot: runs gbrain-addon's tests, then gbrain's own loop tests, against
+  # the pinned gbrain. Results are in this Job's logs. Bump the suffix to rerun.
+  name: gbrain-addon-test-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 2400
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata:
+      labels:
+        app: gbrain-addon-test
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: test
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              W=/work/gbrain-addon
+              mkdir -p "$W/src" "$W/test"
+              for f in /seed/*; do
+                n="$(basename "$f")"
+                case "$n" in
+                  src--*) cp "$f" "$W/src/${n#src--}" ;;
+                  test--*) cp "$f" "$W/test/${n#test--}" ;;
+                  *) cp "$f" "$W/$n" ;;
+                esac
+              done
+              cd "$W" || exit 1
+              bun install || { echo "RESULT addon-install FAIL"; exit 1; }
+              if bun test test/; then echo "RESULT addon-tests PASS"; A=0; else echo "RESULT addon-tests FAIL"; A=1; fi
+              cd "$W/node_modules/gbrain" || exit 1
+              bun install || { echo "RESULT gbrain-install FAIL"; exit 1; }
+              T="$(ls test/google-loop-detect*.test.ts test/loops-store*.test.ts test/ops-loops*.test.ts test/loops-extract*.test.ts 2>/dev/null | grep -v '\.serial\.' | tr '\n' ' ')"
+              echo "gbrain loop tests: $T"
+              if bun test $T; then echo "RESULT gbrain-loop-tests PASS"; G=0; else echo "RESULT gbrain-loop-tests FAIL"; G=1; fi
+              exit $((A + G))
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: seed
+              mountPath: /seed
+            - name: work
+              mountPath: /work
+      volumes:
+        - name: seed
+          configMap:
+            name: gbrain-addon-src
+        - name: work
+          emptyDir:
+            sizeLimit: 4Gi

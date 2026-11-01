@@ -10,8 +10,5 @@
   },
   "dependencies": {
     "gbrain": "github:garrytan/gbrain#23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc"
-  },
-  "devDependencies": {
-    "@types/bun": "latest"
   }
 }

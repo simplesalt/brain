@@ -24,6 +24,7 @@ resources:
   - manifests/discovery-to-notion.yaml
   - manifests/notion-tasks-access-check.yaml
   - manifests/loop-tasks-sync-now.yaml
+  - manifests/gbrain-addon-test.yaml
   - manifests/hermes-msg.yaml
   - manifests/duxsoup-ingest.yaml
   - manifests/coding.yaml
@@ -67,6 +68,15 @@ configMapGenerator:
       - cron-timeline-sweep.py=manifests/hermes-skills/cron-timeline-sweep.py
       - SOUL.md=manifests/SOUL.md
       - AGENTS.md=manifests/AGENTS.md
+  - name: gbrain-addon-src
+    namespace: ssint-main-ai
+    files:
+      - package.json=gbrain-addon/package.json
+      - src--gbrain-internal.ts=gbrain-addon/src/gbrain-internal.ts
+      - src--jobs.ts=gbrain-addon/src/jobs.ts
+      - src--validate.ts=gbrain-addon/src/validate.ts
+      - src--worker.ts=gbrain-addon/src/worker.ts
+      - test--loops.test.ts=gbrain-addon/test/loops.test.ts
   - name: lease-sweep-script
     namespace: ssint-main-ai
     files:
