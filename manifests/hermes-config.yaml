@@ -2,12 +2,13 @@ _config_version: 39
 model:
   provider: openrouter
   # Expanded from the llm-models ConfigMap (env on the hermes-agent pod). No fallback model on purpose.
-  default: ${REASONING_MODEL}
-provider_routing:
-  sort: price
-  data_collection: deny
+  default: ${LIVE_REASONING_MODEL}
+  # Must match the live-reasoning OpenRouter preset's model: Hermes cannot look up a preset's
+  # context window. MiniMax M3.1 Flash is 1M.
+  context_length: 1048576
+# Provider routing and reasoning effort are not set here: the OpenRouter preset carries them,
+# and anything Hermes sent would override the preset.
 agent:
-  reasoning_effort: high
   environment_hint: |-
     At the start of every session, call hindsight_recall before giving your
     first response. Use it to retrieve context about ongoing work, recent
@@ -66,12 +67,9 @@ auxiliary:
   vision:
     provider: openrouter
     model: ${VISION_MODEL}
-    fallback_chain:
-      - provider: openrouter
-        model: ${VISION_FALLBACK_MODEL}
   approval:
     provider: openrouter
-    model: ${VISION_FALLBACK_MODEL}
+    model: ${LIVE_DUMB_MODEL}
   compression:
     provider: main
   session_search:

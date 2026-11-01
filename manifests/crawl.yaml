@@ -224,16 +224,16 @@ spec:
                     secretKeyRef:
                       name: exa-api-key
                       key: api_key
-                - name: REASONING_MODEL
+                - name: SLOW_REASONING_MODEL
                   valueFrom:
                     configMapKeyRef:
                       name: llm-models
-                      key: REASONING_MODEL
-                - name: BULK_MODEL
+                      key: SLOW_REASONING_MODEL
+                - name: SLOW_DUMB_MODEL
                   valueFrom:
                     configMapKeyRef:
                       name: llm-models
-                      key: BULK_MODEL
+                      key: SLOW_DUMB_MODEL
               resources:
                 requests:
                   memory: 64Mi

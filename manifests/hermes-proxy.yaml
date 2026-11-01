@@ -447,7 +447,7 @@ spec:
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: BULK_MODEL
+                  key: LIVE_DUMB_MODEL
             - name: ACCESS_TEAM_DOMAIN
               value: "https://fqurzlaaagt.cloudflareaccess.com"
             - name: ACCESS_AUD

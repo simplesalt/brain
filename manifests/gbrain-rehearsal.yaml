@@ -171,18 +171,20 @@ spec:
                 || echo "WARN: config set consent.preapprove.paid.max_usd_per_run failed (non-fatal)"
               $GBRAIN config set search.reranker.model "$RERANKER_MODEL" \
                 || echo "WARN: config set search.reranker.model failed (non-fatal)"
-              $GBRAIN config set facts.extraction_model "$GBRAIN_BULK_MODEL" \
+              $GBRAIN config set facts.extraction_model "$GBRAIN_SLOW_DUMB_MODEL" \
                 || echo "WARN: config set facts.extraction_model failed (non-fatal)"
-              $GBRAIN config set models.tier.utility "$GBRAIN_BULK_MODEL" \
+              $GBRAIN config set models.tier.utility "$GBRAIN_SLOW_DUMB_MODEL" \
                 || echo "WARN: config set models.tier.utility failed (non-fatal)"
-              $GBRAIN config set models.tier.reasoning "$GBRAIN_REASONING_MODEL" \
+              $GBRAIN config set models.tier.reasoning "$GBRAIN_SLOW_REASONING_MODEL" \
                 || echo "WARN: config set models.tier.reasoning failed (non-fatal)"
-              $GBRAIN config set models.tier.deep "$GBRAIN_REASONING_MODEL" \
+              $GBRAIN config set models.tier.deep "$GBRAIN_SLOW_REASONING_MODEL" \
                 || echo "WARN: config set models.tier.deep failed (non-fatal)"
-              $GBRAIN config set models.default "$GBRAIN_REASONING_MODEL" \
+              $GBRAIN config set models.default "$GBRAIN_SLOW_REASONING_MODEL" \
                 || echo "WARN: config set models.default failed (non-fatal)"
-              $GBRAIN config set models.dream.extract_atoms "$GBRAIN_BULK_MODEL" \
+              $GBRAIN config set models.dream.extract_atoms "$GBRAIN_SLOW_DUMB_MODEL" \
                 || echo "WARN: config set models.dream.extract_atoms failed (non-fatal)"
+              $GBRAIN config set models.expansion "$GBRAIN_LIVE_DUMB_MODEL" \
+                || echo "WARN: config set models.expansion failed (non-fatal)"
               $GBRAIN config set cycle.conversation_facts_backfill.enabled true \
                 || echo "WARN: config set cycle.conversation_facts_backfill.enabled failed (non-fatal)"
               $GBRAIN config set cycle.enrich_thin.enabled false \
@@ -216,27 +218,32 @@ spec:
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_REASONING_MODEL
+                  key: GBRAIN_SLOW_REASONING_MODEL
             - name: GBRAIN_CHAT_FALLBACK_CHAIN
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_BULK_MODEL
+                  key: GBRAIN_SLOW_DUMB_MODEL
             - name: GBRAIN_EXPANSION_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_BULK_MODEL
-            - name: GBRAIN_BULK_MODEL
+                  key: GBRAIN_LIVE_DUMB_MODEL
+            - name: GBRAIN_LIVE_DUMB_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_BULK_MODEL
-            - name: GBRAIN_REASONING_MODEL
+                  key: GBRAIN_LIVE_DUMB_MODEL
+            - name: GBRAIN_SLOW_REASONING_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_REASONING_MODEL
+                  key: GBRAIN_SLOW_REASONING_MODEL
+            - name: GBRAIN_SLOW_DUMB_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_SLOW_DUMB_MODEL
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -335,27 +342,32 @@ spec:
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_REASONING_MODEL
+                  key: GBRAIN_SLOW_REASONING_MODEL
             - name: GBRAIN_CHAT_FALLBACK_CHAIN
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_BULK_MODEL
+                  key: GBRAIN_SLOW_DUMB_MODEL
             - name: GBRAIN_EXPANSION_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_BULK_MODEL
-            - name: GBRAIN_BULK_MODEL
+                  key: GBRAIN_LIVE_DUMB_MODEL
+            - name: GBRAIN_LIVE_DUMB_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_BULK_MODEL
-            - name: GBRAIN_REASONING_MODEL
+                  key: GBRAIN_LIVE_DUMB_MODEL
+            - name: GBRAIN_SLOW_REASONING_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_REASONING_MODEL
+                  key: GBRAIN_SLOW_REASONING_MODEL
+            - name: GBRAIN_SLOW_DUMB_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_SLOW_DUMB_MODEL
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -713,12 +725,13 @@ spec:
                 cfg mcp.publish_advisor true
                 cfg mcp.publish_skills
                 cfg search.reranker.model "$RERANKER_MODEL"
-                cfg facts.extraction_model "$GBRAIN_BULK_MODEL"
-                cfg models.tier.utility "$GBRAIN_BULK_MODEL"
-                cfg models.tier.reasoning "$GBRAIN_REASONING_MODEL"
-                cfg models.tier.deep "$GBRAIN_REASONING_MODEL"
-                cfg models.default "$GBRAIN_REASONING_MODEL"
-                cfg models.dream.extract_atoms "$GBRAIN_BULK_MODEL"
+                cfg facts.extraction_model "$GBRAIN_SLOW_DUMB_MODEL"
+                cfg models.tier.utility "$GBRAIN_SLOW_DUMB_MODEL"
+                cfg models.tier.reasoning "$GBRAIN_SLOW_REASONING_MODEL"
+                cfg models.tier.deep "$GBRAIN_SLOW_REASONING_MODEL"
+                cfg models.default "$GBRAIN_SLOW_REASONING_MODEL"
+                cfg models.dream.extract_atoms "$GBRAIN_SLOW_DUMB_MODEL"
+                cfg models.expansion "$GBRAIN_LIVE_DUMB_MODEL"
                 cfg memory.auto_writeback salient
                 cfg persistence.unbound_write
                 cfg cycle.conversation_facts_backfill.enabled true
@@ -960,27 +973,32 @@ spec:
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_REASONING_MODEL
+                  key: GBRAIN_SLOW_REASONING_MODEL
             - name: GBRAIN_CHAT_FALLBACK_CHAIN
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_BULK_MODEL
+                  key: GBRAIN_SLOW_DUMB_MODEL
             - name: GBRAIN_EXPANSION_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_BULK_MODEL
-            - name: GBRAIN_BULK_MODEL
+                  key: GBRAIN_LIVE_DUMB_MODEL
+            - name: GBRAIN_LIVE_DUMB_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_BULK_MODEL
-            - name: GBRAIN_REASONING_MODEL
+                  key: GBRAIN_LIVE_DUMB_MODEL
+            - name: GBRAIN_SLOW_REASONING_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: llm-models
-                  key: GBRAIN_REASONING_MODEL
+                  key: GBRAIN_SLOW_REASONING_MODEL
+            - name: GBRAIN_SLOW_DUMB_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_SLOW_DUMB_MODEL
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
