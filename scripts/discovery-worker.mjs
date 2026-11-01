@@ -958,8 +958,8 @@ async function enrichCandidates() {
 }
 
 const LLM_BATCH = Number(process.env.LLM_BATCH ?? 8);
-const LLM_MODELS = (process.env.LLM_MODELS ?? "minimax/minimax-m2.7,openai/gpt-oss-120b").split(",");
-const OPENROUTER_KEY_FILE = process.env.OPENROUTER_KEY_FILE ?? "/secrets/openrouter/api_key";
+// Primary then fallback, from the llm-models ConfigMap unless LLM_MODELS overrides.
+const LLM_MODELS = (process.env.LLM_MODELS ?? [process.env.REASONING_MODEL, process.env.BULK_MODEL].filter(Boolean).join(",")).split(",").filter(Boolean);const OPENROUTER_KEY_FILE = process.env.OPENROUTER_KEY_FILE ?? "/secrets/openrouter/api_key";
 const EXTRACT_VERSION = 3;
 
 async function openrouterKey() {

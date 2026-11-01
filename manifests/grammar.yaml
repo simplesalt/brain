@@ -55,7 +55,7 @@ data:
                       b'<script>try{opener&&opener.postMessage("grammar-signed-in","*")}catch(e){}setTimeout(()=>close(),800)</script>')
     KEY_PATH = os.environ.get('KEY_PATH', '/secrets/OPENROUTER_API_KEY')
     LLM_URL = os.environ.get('LLM_URL', 'https://openrouter.ai/api/v1/chat/completions')
-    MODEL = os.environ.get('MODEL', 'google/gemini-2.5-flash-lite')
+    MODEL = os.environ['MODEL']  # from the llm-models ConfigMap
     # OpenRouter switches to these, in order, when the main model is down or errors.
     FALLBACK_MODELS = [m.strip() for m in os.environ.get('FALLBACK_MODELS', '').split(',') if m.strip()]
     MAX_BYTES = 64 * 1024
@@ -297,11 +297,18 @@ spec:
           env:
             - name: PORT
               value: "8000"
+            # Models come from the llm-models ConfigMap (manifests/llm-models.env).
             - name: MODEL
-              value: google/gemini-2.5-flash-lite
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GRAMMAR_MODEL
             # Open-weight backup, so the fix can also run outside the big model vendors.
             - name: FALLBACK_MODELS
-              value: google/gemma-4-26b-a4b-it
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GRAMMAR_FALLBACK_MODELS
             - name: ACCESS_TEAM_DOMAIN
               value: "https://fqurzlaaagt.cloudflareaccess.com"
             - name: BASE_PATH

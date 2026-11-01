@@ -51,7 +51,8 @@ spec:
           args:
             - |
               export PATH="/install/bin:$PATH"
-              TARGET_MODEL=openai:text-embedding-3-small
+              TARGET_MODEL="$GBRAIN_EMBEDDING_MODEL"
+              [ -n "$TARGET_MODEL" ] || { echo "FATAL: GBRAIN_EMBEDDING_MODEL is empty"; exit 1; }
               TARGET_DIM=1536
               EXPECTED_SCHEMA=141
               export TARGET_MODEL TARGET_DIM EXPECTED_SCHEMA
@@ -326,7 +327,10 @@ spec:
                   name: gbrain-pg-app
                   key: uri
             - name: GBRAIN_EMBEDDING_MODEL
-              value: openai:text-embedding-3-small
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: EMBEDDING_MODEL
             - name: GBRAIN_EMBEDDING_DIMENSIONS
               value: "1536"
             - name: OPENAI_API_KEY

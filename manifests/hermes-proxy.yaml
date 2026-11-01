@@ -235,7 +235,7 @@ data:
                     print(f'hermes-proxy: retry of {rid} skipped: {e!r}', flush=True)
 
     SIDE_KEY = os.environ.get('SIDE_LLM_API_KEY', '')
-    SIDE_MODEL = os.environ.get('SIDE_LLM_MODEL', 'openai/gpt-oss-120b')
+    SIDE_MODEL = os.environ['SIDE_LLM_MODEL']  # from the llm-models ConfigMap
     SIDE_MARKERS = ('extract a concise chat title',)
 
     def is_side_request(doc):
@@ -443,6 +443,11 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: GENERAL_API_LLM_API_KEY
+            - name: SIDE_LLM_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: BULK_MODEL
             - name: ACCESS_TEAM_DOMAIN
               value: "https://fqurzlaaagt.cloudflareaccess.com"
             - name: ACCESS_AUD

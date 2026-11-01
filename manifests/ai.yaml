@@ -183,10 +183,20 @@ spec:
                 || echo "WARN: config set mcp.publish_advisor failed (non-fatal)"
               $GBRAIN config set memory.auto_writeback salient \
                 || echo "WARN: config set memory.auto_writeback failed (non-fatal)"
-              $GBRAIN config set search.reranker.model voyage:rerank-2.5 \
+              $GBRAIN config set search.reranker.model "$RERANKER_MODEL" \
                 || echo "WARN: config set search.reranker.model failed (non-fatal)"
-              $GBRAIN config set facts.extraction_model openrouter:openai/gpt-oss-120b \
+              $GBRAIN config set facts.extraction_model "$GBRAIN_BULK_MODEL" \
                 || echo "WARN: config set facts.extraction_model failed (non-fatal)"
+              $GBRAIN config set models.tier.utility "$GBRAIN_BULK_MODEL" \
+                || echo "WARN: config set models.tier.utility failed (non-fatal)"
+              $GBRAIN config set models.tier.reasoning "$GBRAIN_REASONING_MODEL" \
+                || echo "WARN: config set models.tier.reasoning failed (non-fatal)"
+              $GBRAIN config set models.tier.deep "$GBRAIN_REASONING_MODEL" \
+                || echo "WARN: config set models.tier.deep failed (non-fatal)"
+              $GBRAIN config set models.default "$GBRAIN_REASONING_MODEL" \
+                || echo "WARN: config set models.default failed (non-fatal)"
+              $GBRAIN config set models.dream.extract_atoms "$GBRAIN_BULK_MODEL" \
+                || echo "WARN: config set models.dream.extract_atoms failed (non-fatal)"
               $GBRAIN config set cycle.conversation_facts_backfill.enabled true \
                 || echo "WARN: config set cycle.conversation_facts_backfill.enabled failed (non-fatal)"
               $GBRAIN config set cycle.enrich_thin.enabled true \
@@ -255,16 +265,45 @@ spec:
                   name: gbrain-pg-app
                   key: uri
             - name: GBRAIN_CHAT_MODEL
-              value: openrouter:minimax/minimax-m2.7
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_REASONING_MODEL
             - name: GBRAIN_CHAT_FALLBACK_CHAIN
-              value: openrouter:openai/gpt-oss-120b
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_BULK_MODEL
+            - name: GBRAIN_EXPANSION_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_BULK_MODEL
+            - name: GBRAIN_BULK_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_BULK_MODEL
+            - name: GBRAIN_REASONING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_REASONING_MODEL
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
                   key: GENERAL_API_LLM_API_KEY
             - name: GBRAIN_EMBEDDING_MODEL
-              value: openai:text-embedding-3-small
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: EMBEDDING_MODEL
+            - name: RERANKER_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: RERANKER_MODEL
             - name: GBRAIN_EMBEDDING_DIMENSIONS
               value: "1536"
             - name: OPENAI_API_KEY
@@ -395,16 +434,45 @@ spec:
                   name: gbrain-pg-app
                   key: uri
             - name: GBRAIN_CHAT_MODEL
-              value: openrouter:minimax/minimax-m2.7
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_REASONING_MODEL
             - name: GBRAIN_CHAT_FALLBACK_CHAIN
-              value: openrouter:openai/gpt-oss-120b
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_BULK_MODEL
+            - name: GBRAIN_EXPANSION_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_BULK_MODEL
+            - name: GBRAIN_BULK_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_BULK_MODEL
+            - name: GBRAIN_REASONING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: GBRAIN_REASONING_MODEL
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: hermes-secrets
                   key: GENERAL_API_LLM_API_KEY
             - name: GBRAIN_EMBEDDING_MODEL
-              value: openai:text-embedding-3-small
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: EMBEDDING_MODEL
+            - name: RERANKER_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: RERANKER_MODEL
             - name: GBRAIN_EMBEDDING_DIMENSIONS
               value: "1536"
             - name: OPENAI_API_KEY
@@ -902,6 +970,8 @@ spec:
               merged = deep_merge(live, seed)
               # Git owns the MCP server list: a server dropped from the seed leaves the live config too.
               merged["mcp_servers"] = seed.get("mcp_servers", {})
+              # Hermes runs with no fallback model; one dropped from the seed must leave the live config too.
+              merged.pop("fallback_providers", None)
 
               with open(live_path, "w") as f:
                   yaml.dump(merged, f, default_flow_style=False, indent=2, allow_unicode=True)
@@ -1035,6 +1105,26 @@ spec:
               value: local
             - name: HINDSIGHT_BANK_ID
               value: hermes
+            - name: REASONING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: REASONING_MODEL
+            - name: BULK_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: BULK_MODEL
+            - name: VISION_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: VISION_MODEL
+            - name: VISION_FALLBACK_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: VISION_FALLBACK_MODEL
           volumeMounts:
             - name: home
               mountPath: /opt/data
@@ -1173,6 +1263,27 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: GENERAL_API_LLM_API_KEY
+            # config.yaml names the model as ${REASONING_MODEL}; Hermes expands it at load.
+            - name: REASONING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: REASONING_MODEL
+            - name: BULK_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: BULK_MODEL
+            - name: VISION_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: VISION_MODEL
+            - name: VISION_FALLBACK_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: VISION_FALLBACK_MODEL
             - name: HINDSIGHT_MODE
               value: local_external
             - name: HINDSIGHT_API_URL

@@ -59,3 +59,37 @@ spec:
                   rollingUpdate:
                     maxSurge: 0
                     maxUnavailable: 1
+              # Models come from the llm-models ConfigMap. Chart 0.2.0 lists env as
+              # PROVIDER, BASE_URL, MODEL (index 2), ...; the test fails the render
+              # if a chart bump moves it. Retain and consolidation use the global
+              # (BULK) model; reflect (and mental-model refresh) use REASONING.
+              # Provider prefs: cheapest provider, no data collection, zero retention.
+              - op: test
+                path: /spec/template/spec/containers/0/env/2/name
+                value: HINDSIGHT_API_LLM_MODEL
+              - op: replace
+                path: /spec/template/spec/containers/0/env/2
+                value:
+                  name: HINDSIGHT_API_LLM_MODEL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: llm-models
+                      key: BULK_MODEL
+              - op: add
+                path: /spec/template/spec/containers/0/env/-
+                value:
+                  name: HINDSIGHT_API_REFLECT_LLM_MODEL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: llm-models
+                      key: REASONING_MODEL
+              - op: add
+                path: /spec/template/spec/containers/0/env/-
+                value:
+                  name: HINDSIGHT_API_LLM_EXTRA_BODY
+                  value: '{"provider":{"sort":"price","data_collection":"deny","zdr":true}}'
+              - op: add
+                path: /spec/template/spec/containers/0/env/-
+                value:
+                  name: HINDSIGHT_API_REFLECT_LLM_EXTRA_BODY
+                  value: '{"provider":{"sort":"price","data_collection":"deny","zdr":true}}'

@@ -78,6 +78,34 @@ configMapGenerator:
         capability: crawl
     files:
       - discovery-worker.mjs=scripts/discovery-worker.mjs
+  # One model list (manifests/llm-models.env), one stable-named copy per consuming
+  # namespace: a pod can only read a ConfigMap in its own namespace.
+  - name: llm-models
+    namespace: ssint-main-ai
+    envs:
+      - manifests/llm-models.env
+    options:
+      disableNameSuffixHash: true
+  - name: llm-models
+    namespace: ssint-main-crawl
+    envs:
+      - manifests/llm-models.env
+    options:
+      disableNameSuffixHash: true
+      labels:
+        entity: ssint
+        env: main
+        capability: crawl
+  - name: llm-models
+    namespace: ssint-main-voice
+    envs:
+      - manifests/llm-models.env
+    options:
+      disableNameSuffixHash: true
+      labels:
+        entity: ssint
+        env: main
+        capability: voice
 generatorOptions:
   labels:
     entity: ssint

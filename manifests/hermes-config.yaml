@@ -1,14 +1,13 @@
 _config_version: 39
 model:
   provider: openrouter
-  default: minimax/minimax-m3.1-flash
-fallback_providers:
-  - provider: openrouter
-    model: openai/gpt-oss-120b
+  # Expanded from the llm-models ConfigMap (env on the hermes-agent pod). No fallback model on purpose.
+  default: ${REASONING_MODEL}
+provider_routing:
+  sort: price
+  data_collection: deny
 agent:
-  reasoning_overrides:
-    "minimax/minimax-m3.1-flash": "high"
-    "openai/gpt-oss-120b": "high"
+  reasoning_effort: high
   environment_hint: |-
     At the start of every session, call hindsight_recall before giving your
     first response. Use it to retrieve context about ongoing work, recent
@@ -66,13 +65,13 @@ web:
 auxiliary:
   vision:
     provider: openrouter
-    model: google/gemini-3.8-flash
+    model: ${VISION_MODEL}
     fallback_chain:
       - provider: openrouter
-        model: qwen/qwen3-vl-235b-a22b-instruct
+        model: ${VISION_FALLBACK_MODEL}
   approval:
     provider: openrouter
-    model: qwen/qwen3-vl-235b-a22b-instruct
+    model: ${VISION_FALLBACK_MODEL}
   compression:
     provider: main
   session_search:
