@@ -116,6 +116,52 @@ data:
     if (!r.ok) { console.error(`google-token: exchange failed ${r.status}: ${(await r.text()).slice(0, 300)}`); process.exit(1); }
     const { access_token, expires_in } = await r.json();
     console.log(JSON.stringify({ access_token, expires_in }));
+  # Carries loop state from the old gmail source to the google source that re-ingests the same mailbox
+  # (simplesalt/projects#844). A google loop whose gmail twin (same thread, loop type and counterparty) was
+  # closed done or dropped is closed the same way, unless the thread had activity after that close; gmail
+  # mutes are copied to google. Reads with SQL, writes only through the gbrain CLI. Idempotent.
+  loops-carry.mjs: |
+    import { SQL } from 'bun';
+    const cli = (process.env.GBRAIN || 'gbrain').split(' ');
+    const dry = process.argv.includes('--dry-run');
+    const db = new SQL(process.env.DATABASE_URL);
+    const run = args => {
+      if (dry) { console.log(`loops-carry: would run gbrain ${args.join(' ')}`); return true; }
+      const p = Bun.spawnSync([...cli, ...args], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+      if (p.exitCode !== 0) console.error(`loops-carry: gbrain ${args.join(' ')} failed: ${p.stderr.toString().slice(0, 300)}`);
+      return p.exitCode === 0;
+    };
+    const active = (await db`SELECT id FROM sources WHERE archived IS NOT TRUE`).map(r => r.id);
+    if (!active.includes('gmail') || !active.includes('google')) {
+      console.log('loops-carry: gmail or google source not active; nothing to carry');
+      await db.end(); process.exit(3);
+    }
+    const twins = await db`
+      SELECT g.id, o.status, o.id AS gmail_id
+      FROM open_loops g
+      JOIN open_loops o ON o.source_id = 'gmail'
+        AND COALESCE(o.thread_id, o.page_slug) = COALESCE(g.thread_id, g.page_slug)
+        AND o.loop_type = g.loop_type
+        AND lower(COALESCE(o.counterparty_email, o.counterparty_slug, '')) = lower(COALESCE(g.counterparty_email, g.counterparty_slug, ''))
+      WHERE g.source_id = 'google' AND g.status = 'open'
+        AND o.status IN ('done', 'dropped') AND o.closed_at IS NOT NULL
+        AND g.last_activity_at <= o.closed_at + interval '1 minute'
+        AND COALESCE(g.thread_id, g.page_slug) IS NOT NULL`;
+    let closed = 0;
+    const seen = new Set();
+    for (const t of twins) {
+      if (seen.has(t.id)) continue;
+      seen.add(t.id);
+      if (run(['loops', t.status === 'done' ? 'done' : 'drop', String(t.id), '--note', `carried from gmail loop ${t.gmail_id}`])) closed++;
+    }
+    const mutes = await db`
+      SELECT o.kind, o.value FROM loop_suppressions o
+      WHERE o.source_id = 'gmail' AND NOT EXISTS (
+        SELECT 1 FROM loop_suppressions g WHERE g.source_id = 'google' AND g.kind = o.kind AND g.value = o.value)`;
+    let muted = 0;
+    for (const m of mutes) if (run(['loops', 'mute', m.kind, m.value, '--source', 'google'])) muted++;
+    console.log(`loops-carry: closed ${closed} of ${seen.size} google twins of closed gmail loops; copied ${muted} of ${mutes.length} mutes`);
+    await db.end();
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -237,6 +283,8 @@ spec:
                 # background so serve starts now, and again on each start so a failed first sync retries
                 if [ -n "$GOOGLE_SOURCES" ]; then
                   ( $GBRAIN sync --source google </dev/null || echo "WARN: gbrain sync --source google failed (non-fatal)" ) &
+                  # hourly, until the gmail source is archived (exit 3): google loops take their gmail twin's close
+                  ( sleep 600; while :; do GBRAIN="$GBRAIN" bun /google/loops-carry.mjs </dev/null; [ $? = 3 ] && break; sleep 3600; done ) &
                 fi
               fi
               # Token grants live in access_tokens columns (source_grant, source_id, federated_read) and a
