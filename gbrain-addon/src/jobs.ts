@@ -207,6 +207,8 @@ export async function loopThread(engine: BrainEngine, data: unknown, deps: Threa
       channel,
       counterparty_name: name,
       subject,
+      // Any message from me in the conversation as given to us; the caller sends the full history.
+      prior_contact: msgs.some((m) => m.from_me),
       messages: msgs.slice(-6).map((m) => ({ from_me: m.from_me, text: m.text, sent_at: new Date(m.ms).toISOString() })),
     });
     if (!verdictIn.needs_reply && !verdictIn.unknown && verdictIn.confidence >= (deps.minConfidence ?? 0.7)) {

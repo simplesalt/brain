@@ -26,7 +26,20 @@ export interface ReplyCheckInput {
   messages?: ReplyMessage[];
   /** Alternative to `messages`: the rendered thread text (an email thread page). */
   thread_text?: string;
+  /**
+   * Has the account owner ever written to this counterparty? true / false, or
+   * null/undefined when it could not be determined (the judge then decides as before).
+   */
+  prior_contact?: boolean | null;
 }
+
+/**
+ * Version of REPLY_CHECK_SYSTEM. Stored with every verdict (addon_reply_checks.prompt_version);
+ * the post-pass re-judges open loops whose stored verdict is older. Bump it on any prompt change.
+ *   1: original prompt
+ *   2: cold-pitch rule (prior_contact)
+ */
+export const PROMPT_VERSION = 2;
 
 export interface ReplyVerdict {
   needs_reply: boolean;
@@ -57,6 +70,8 @@ export const REPLY_CHECK_SYSTEM = `You decide whether the latest message from th
 
 Needs a reply (needs_reply true): a question addressed to me, a request, scheduling or logistics awaiting my answer, an introduction or offer that expects my answer, anything waiting on my decision or input.
 Does NOT need a reply (needs_reply false): automated notices (shipping, receipts, invoices, alerts, confirmations, system mail), newsletters, marketing, cold sales pitches or mass outreach, FYIs, announcements, congratulations, thank-yous and other pleasantries, messages that already say no answer is needed, conversations whose last substantive message is mine.
+
+Cold outreach rule: the <thread> header carries prior_contact=true|false|unknown, whether I have ever written to this person. When prior_contact=false and the latest message is unsolicited outreach, needs_reply is false EVEN IF it asks a question ("would you be open to a call?", "any thoughts?"). Unsolicited outreach covers: selling, vendor, agency or partnership pitches; event, webinar or conference invitations and follow-ups; recruiting; "quick question" or "just checking in" prospecting. When prior_contact=true or unknown, judge the message on its merits as above (a person I have written to asking a real question still needs a reply). Do not apply this rule to a stranger's genuine personal request that is not selling or promoting anything.
 
 Rules:
 - Output STRICT JSON, nothing else: {"needs_reply":true|false,"reason":"<=120 chars, plain words","confidence":0.0-1.0}
@@ -118,6 +133,7 @@ export async function buildPrompt(input: ReplyCheckInput): Promise<string> {
     `counterparty=${JSON.stringify(input.counterparty_name ?? input.counterparty_email ?? '')}`,
     ...(input.counterparty_email ? [`counterparty_email=${JSON.stringify(input.counterparty_email)}`] : []),
     `subject=${JSON.stringify(esc(input.subject ?? ''))}`,
+    `prior_contact=${input.prior_contact === true ? 'true' : input.prior_contact === false ? 'false' : 'unknown'}`,
     'account_owner="me"',
   ].join(' ');
   return `<thread ${attrs}>\n${body}\n</thread>\n\nDoes the latest message from the other person need a personal reply from me? Answer with the JSON only.`;

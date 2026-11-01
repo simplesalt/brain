@@ -43,6 +43,16 @@ address. Result: `{opened, closed, held_until?, verdict}`, verdict one of `reply
 
 ## Reply-needed check
 
+Cold-pitch rule (prompt version 2): the judge input carries `prior_contact` (true / false / null) and the `<thread>`
+header shows `prior_contact=true|false|unknown`. With `false`, unsolicited outreach (selling, vendor or partnership
+pitches, event or webinar invitations, recruiting, "quick question" prospecting) needs no reply even when it asks a
+question; `null` judges as before. Gmail loops: true if the thread page has a message from me (a `## → ` heading),
+else true if another email page in the source lists my account (frontmatter `account`) in `senders` and the
+counterparty in `participants`; false otherwise; null if account or counterparty email is unknown. Channel
+conversations (`/loops/thread`): true if any supplied message is `from_me`. Post-pass loops built from evidence quotes
+only: null. `PROMPT_VERSION` (`src/reply-check.ts`) is stored per verdict in `prompt_version` (added with
+`ADD COLUMN IF NOT EXISTS`, old rows = 1); open loops with an older stored version are re-judged by the post-pass.
+
 gbrain opens `unanswered_inbound` ("reply owed") loops from mechanical rules, so receipts, shipping
 notices, pitches and FYIs become loops. The add-on adds a model judgment, no gbrain code changes.
 
@@ -57,7 +67,7 @@ Model: `ADDON_REPLY_CHECK_MODEL`, else gbrain's cheap utility tier (`getExpansio
 
 Post-pass (`reviewNewLoops`, `src/reply-review.ts`), run by the worker every `ADDON_REPLY_CHECK_INTERVAL_MS`
 (60000): takes open `unanswered_inbound` loops of `ADDON_DEFAULT_SOURCE` not yet judged at their current
-`last_activity_at` (table `addon_reply_checks(loop_id, last_activity_at, verdict, reason, checked_at)`, created
+`last_activity_at` (table `addon_reply_checks(loop_id, last_activity_at, verdict, reason, checked_at, prompt_version)`, created
 with `CREATE TABLE IF NOT EXISTS`; an `unknown` verdict is retried after 15 min). Gmail loops are judged on the
 email thread page (`engine.getPage(page_slug, {sourceId}).compiled_truth`); our own channel loops
 (`linkedin:`, `fireflies:`, `sms:`, `manual:` thread ids) on their evidence quotes. `needs_reply=false` with
