@@ -2144,7 +2144,7 @@ spec:
             - name: ADDON_TOKEN
               value: "gbrain-addon"
             - name: CONVERSATION_LOOPS
-              value: "off"
+              value: "on"
           livenessProbe:
             # The container blocks on migrateWithRetry() (schema migration, up to
             # ~120s of retries against a not-yet-ready CNPG cluster) before the
