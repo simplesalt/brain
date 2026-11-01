@@ -25,6 +25,7 @@ resources:
   - manifests/notion-tasks-access-check.yaml
   - manifests/loop-tasks-sync-now.yaml
   - manifests/gbrain-addon-test.yaml
+  - manifests/gbrain-reply-check-report.yaml
   - manifests/hermes-msg.yaml
   - manifests/duxsoup-ingest.yaml
   - manifests/coding.yaml

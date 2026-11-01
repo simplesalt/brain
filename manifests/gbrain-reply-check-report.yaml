@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # One-shot, read-only: prints the add-on's reply-needed verdicts with each loop's summary.
+  # Bump the suffix to run it again.
+  name: gbrain-reply-check-report-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: gbrain-reply-check-report
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: report
+          image: postgres:17-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -P pager=off -c "
+                SELECT c.verdict, l.status, l.id, left(l.summary, 90) AS summary, left(c.reason, 120) AS reason
+                  FROM addon_reply_checks c JOIN open_loops l ON l.id = c.loop_id
+                 ORDER BY c.checked_at DESC LIMIT 60;" -c "
+                SELECT source_id, loop_type, status, count(*) FROM open_loops
+                 WHERE source_id IN ('google','gmail') GROUP BY 1,2,3 ORDER BY 1,2,3;"
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+          resources:
+            requests:
+              memory: 32Mi
+            limits:
+              memory: 128Mi
