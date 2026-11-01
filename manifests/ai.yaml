@@ -1051,6 +1051,8 @@ spec:
               schedule_job deletion-review "0 3 * * *"
               cp /seed/cron-job-status-sync.py /opt/data/scripts/cron-job-status-sync.py
               schedule_job job-status-sync "every 1h"
+              cp /seed/cron-loop-tasks-sync.py /opt/data/scripts/cron-loop-tasks-sync.py
+              schedule_job loop-tasks-sync "every 1h"
               cp /seed/cron-linkedin-lookup.py /opt/data/scripts/cron-linkedin-lookup.py
               if "$HERMES_BIN" cron list 2>/dev/null | grep -q linkedin-lookup; then
                 echo "cron: linkedin-lookup already scheduled"
@@ -1357,6 +1359,13 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: NOTION_DELETION_REVIEW_TOKEN
+                  optional: true
+            # The key that can edit the Tasks database; loop-tasks-sync writes rows with it.
+            - name: NOTION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-proxy-secrets
+                  key: NOTION_TOKEN
                   optional: true
           ports:
             - name: api

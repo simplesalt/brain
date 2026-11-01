@@ -61,6 +61,8 @@ configMapGenerator:
       - cron-person-dedupe.py=manifests/hermes-skills/cron-person-dedupe.py
       - cron-job-status-sync.py=manifests/hermes-skills/cron-job-status-sync.py
       - cron-job-status-sync.md=manifests/hermes-skills/cron-job-status-sync.md
+      - cron-loop-tasks-sync.py=manifests/hermes-skills/cron-loop-tasks-sync.py
+      - cron-loop-tasks-sync.md=manifests/hermes-skills/cron-loop-tasks-sync.md
       - cron-timeline-sweep.py=manifests/hermes-skills/cron-timeline-sweep.py
       - SOUL.md=manifests/SOUL.md
       - AGENTS.md=manifests/AGENTS.md
