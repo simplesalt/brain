@@ -1,0 +1,107 @@
+# One-shot: each app's OpenRouter key calls each of the four presets once (plus the vision
+# model on the Hermes key), with a tiny prompt. Logs only key label, preset, HTTP status, the
+# provider and model OpenRouter routed to, and OpenRouter's error message; never a key or a body.
+# Script: scripts/openrouter-preset-check.mjs. The fixed names make Flux apply each Job once. Bump the suffix to run again.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openrouter-preset-check-ai-1
+  namespace: ssint-main-ai
+  labels: {entity: ssint, env: main, capability: ai}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app: openrouter-preset-check, entity: ssint, env: main, capability: ai}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: check
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: [bun, /script/openrouter-preset-check.mjs]
+          volumeMounts:
+            - {name: script, mountPath: /script}
+          env:
+            - name: KEYS
+              value: '[["hermes","K_HERMES",["google/gemini-3.8-flash"]],["hindsight","K_HINDSIGHT"]]'
+            - name: K_HERMES
+              valueFrom: {secretKeyRef: {name: hermes-secrets, key: GENERAL_API_LLM_API_KEY}}
+            - name: K_HINDSIGHT
+              valueFrom: {secretKeyRef: {name: hermes-secrets, key: HINDSIGHT_API_LLM_API_KEY}}
+          resources:
+            requests: {memory: 32Mi}
+            limits: {memory: 128Mi}
+      volumes:
+        - name: script
+          configMap: {name: openrouter-preset-check-script}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openrouter-preset-check-voice-1
+  namespace: ssint-main-voice
+  labels: {entity: ssint, env: main, capability: voice}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app: openrouter-preset-check, entity: ssint, env: main, capability: voice}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: check
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: [bun, /script/openrouter-preset-check.mjs]
+          volumeMounts:
+            - {name: script, mountPath: /script}
+          env:
+            - name: KEYS
+              value: '[["grammar","K_GRAMMAR"]]'
+            - name: K_GRAMMAR
+              valueFrom: {secretKeyRef: {name: grammar-openrouter-api-key, key: OPENROUTER_API_KEY}}
+          resources:
+            requests: {memory: 32Mi}
+            limits: {memory: 128Mi}
+      volumes:
+        - name: script
+          configMap: {name: openrouter-preset-check-script}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openrouter-preset-check-crawl-1
+  namespace: ssint-main-crawl
+  labels: {entity: ssint, env: main, capability: crawl}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app: openrouter-preset-check, entity: ssint, env: main, capability: crawl}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: check
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          command: [bun, /script/openrouter-preset-check.mjs]
+          volumeMounts:
+            - {name: script, mountPath: /script}
+          env:
+            - name: KEYS
+              value: '[["crawler","K_CRAWLER"]]'
+            - name: K_CRAWLER
+              valueFrom: {secretKeyRef: {name: openrouter-api-key, key: api_key}}
+          resources:
+            requests: {memory: 32Mi}
+            limits: {memory: 128Mi}
+      volumes:
+        - name: script
+          configMap: {name: openrouter-preset-check-script}
