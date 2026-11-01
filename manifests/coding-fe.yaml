@@ -116,10 +116,12 @@ spec:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   upgrade:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   values:
     commonLabels:
       entity: fe

@@ -38,10 +38,12 @@ spec:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   upgrade:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   values:
     repo:
       slug: basis
@@ -86,10 +88,12 @@ spec:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   upgrade:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   values:
     repo:
       slug: brain
@@ -136,10 +140,12 @@ spec:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   upgrade:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   values:
     repo:
       slug: oci
@@ -184,10 +190,12 @@ spec:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   upgrade:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   values:
     repo:
       slug: projects
@@ -228,10 +236,12 @@ spec:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   upgrade:
     timeout: 10m
     remediation:
       retries: 3
+    disableWait: true
   values:
     repo:
       slug: cloud-basis
