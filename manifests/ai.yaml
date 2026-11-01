@@ -194,7 +194,7 @@ spec:
         # add-on pin in simplesalt/oci gbrain/pins.env); nothing is installed at start. This only copies
         # the image's admin dashboard assets out for admin-gate, which runs on a plain python image.
         - name: seed-admin-assets
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:2462351f96a9a67eebebfe2b73941daf2c89bb87da3f6d295e5da4a2e355b2be
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:bc264534da16a3a0bb0b47423255a1f2e5304bc1a4c4599ce1617155f6f866cd
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -207,7 +207,7 @@ spec:
               mountPath: /out
       containers:
         - name: gbrain
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:2462351f96a9a67eebebfe2b73941daf2c89bb87da3f6d295e5da4a2e355b2be
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:bc264534da16a3a0bb0b47423255a1f2e5304bc1a4c4599ce1617155f6f866cd
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -497,7 +497,7 @@ spec:
               mountPath: /google
               readOnly: true
         - name: autopilot
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:2462351f96a9a67eebebfe2b73941daf2c89bb87da3f6d295e5da4a2e355b2be
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:bc264534da16a3a0bb0b47423255a1f2e5304bc1a4c4599ce1617155f6f866cd
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -633,15 +633,23 @@ spec:
         # simplesalt/brain gbrain-addon: channel-neutral loop jobs (addon-loop-open, addon-loop-recheck)
         # on Minion queue "addon" (simplesalt/projects#838).
         - name: addon-worker
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:2462351f96a9a67eebebfe2b73941daf2c89bb87da3f6d295e5da4a2e355b2be
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:bc264534da16a3a0bb0b47423255a1f2e5304bc1a4c4599ce1617155f6f866cd
           imagePullPolicy: IfNotPresent
           command: ["gbrain-addon-worker"]
+          # No readinessProbe on purpose: a failing add-on must not take gbrain's MCP off the Service.
+          ports:
+            - name: addon
+              containerPort: 3140
           env:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: gbrain-pg-app
                   key: uri
+            - name: ADDON_HTTP_TOKEN
+              value: "gbrain-addon"
+            - name: ADDON_DEFAULT_SOURCE
+              value: "google"
           resources:
             requests:
               memory: 64Mi
@@ -871,6 +879,9 @@ spec:
     - name: admin
       port: 3132
       targetPort: 3132
+    - name: addon
+      port: 3140
+      targetPort: 3140
 ---
 apiVersion: apps/v1
 kind: Deployment
