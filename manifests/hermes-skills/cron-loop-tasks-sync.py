@@ -50,6 +50,9 @@ CLOSED_STATUSES = ("done", "dropped", "stale")
 KIND = {"unanswered_inbound": "unanswered_inbound", "decision_pending": "decision_pending",
         "commitment_owed_by_me": "commitment"}
 CHANNEL = {"gmail": "email", "google": "email"}
+# The source whose loops key rows and get closed: Hermes's write token is scoped to it, and the older
+# gmail/gcal sources are archived once its backfill catches up. Its ids win over twins from other sources.
+PRIMARY_SOURCE = os.environ.get("LOOP_TASKS_PRIMARY_SOURCE", "google")
 MAX_CREATE = int(os.environ.get("LOOP_TASKS_MAX_CREATE", "60"))
 BATCH = int(os.environ.get("LOOP_TASKS_BATCH", "5"))
 LIMIT = 500
@@ -156,11 +159,17 @@ def wanted_loops(loops, now=None):
             if loop.get("loop_type") in OWED_TYPES and loop.get("status") == "open"}
 
 
+def key_order(loops):
+    """Sort key for picking the id that keys a row: primary-source loops first, then lowest id."""
+    return lambda i: (loops[i].get("source_id") != PRIMARY_SOURCE, int(i))
+
+
 def merge_twins(loops):
     """Fold loops that several sources hold for the same thread into one.
 
     Two sources can ingest the same mailbox (gmail and google do), each opening its own loop for the same
-    thread. Twins share page, loop type, counterparty and opened_at. The lowest id is kept; if any twin is
+    thread. Twins share page, loop type, counterparty and opened_at. The primary-source twin (else the lowest
+    id) is kept; if any twin is
     closed the kept loop takes that closing status, since a close in one source is the settled answer.
     Returns (merged loops, {twin id: kept id})."""
     groups = {}
@@ -174,7 +183,7 @@ def merge_twins(loops):
     for ids in groups.values():
         if len(ids) < 2:
             continue
-        ids.sort(key=int)
+        ids.sort(key=key_order(loops))
         keep = dict(loops[ids[0]])
         closed = [loops[i]["status"] for i in ids if loops[i].get("status") in CLOSED_STATUSES]
         if closed:
@@ -190,8 +199,9 @@ def group_threads(loops):
     """One task per email thread: fold every owed loop on the same page into the thread's lowest id.
 
     gbrain often opens several loops for one thread (a reply owed plus a decision or two, re-extracted by each
-    source). The kept loop is open while any member is open; its summary names how many more asks the thread
-    holds, and `open_ids` lists every open member so Hermes can settle them all.
+    source). The key is the thread's lowest primary-source id, else its lowest id. The kept loop is open while
+    any member is open; its summary names how many more asks the thread holds, and `open_ids` lists the open
+    members Hermes can close (primary-source ones when the thread has any).
     Returns (grouped loops, {member id: kept id})."""
     pages = {}
     for lid, loop in loops.items():
@@ -199,9 +209,10 @@ def group_threads(loops):
             pages.setdefault(loop["page_slug"], []).append(lid)
     out, member_of = dict(loops), {}
     for ids in pages.values():
-        ids.sort(key=int)
-        open_ids = [i for i in ids if loops[i].get("status") == "open"]
-        keep = dict(loops[ids[0]], open_ids=open_ids or [])
+        ids.sort(key=key_order(loops))
+        open_ids = sorted((i for i in ids if loops[i].get("status") == "open"), key=key_order(loops))
+        closable = [i for i in open_ids if loops[i].get("source_id") == PRIMARY_SOURCE] or open_ids
+        keep = dict(loops[ids[0]], open_ids=closable)
         if open_ids:
             first = loops[open_ids[0]]
             keep.update(status="open", loop_type=first.get("loop_type"), summary=first.get("summary"),
@@ -510,13 +521,34 @@ def main(dry_run):
         state["pending"].pop(str(e.get("item")), None)
 
     users = [u for u in notion_paged(write_tok, "GET", "/users")]
-    rows = {}
+    rows, tag_early = {}, "[dry-run] " if dry_run else ""
     for page in notion_paged(write_tok, "POST", f"/databases/{DB_ID}/query"):
         r = row_view(page)
         if r["loop_id"]:
             rows[r["loop_id"]] = r
 
-    cache, actions = {}, {"created": [], "closed": [], "repaired": [], "trashed": [], "handed": [], "noted": []}
+    # Re-key: a row whose Loop ID is now folded into another loop (a gmail id whose google twin keys the
+    # thread) takes the key, so it survives the gmail source being archived. Extra rows for a thread are
+    # trashed in the existing-rows pass below.
+    rekeyed = []
+    for lid in sorted(rows, key=lambda i: int(i) if i.isdigit() else 0):
+        key = twin_of.get(lid)
+        if not key or key in rows:
+            continue
+        row = rows.pop(lid)
+        print(f"{tag_early}re-key row for loop {lid} to loop {key}")
+        try:
+            if not dry_run:
+                notion(write_tok, "PATCH", f"/pages/{row['id']}", {"properties": props(schema, {"Loop ID": key})})
+            row["loop_id"] = key
+            rows[key] = row
+            rekeyed.append(lid)
+        except NotionError as e:
+            log(f"re-key loop {lid} failed: {e}")
+            rows[lid] = row
+
+    cache, actions = {}, {"created": [], "rekeyed": rekeyed, "closed": [], "repaired": [], "trashed": [], "handed": [],
+                          "noted": []}
     tag = "[dry-run] " if dry_run else ""
 
     def write(method, path, body):
@@ -709,13 +741,16 @@ def self_test():
              "50": {"id": 50, "loop_type": "decision_pending", "status": "open", "page_slug": "e/b",
                     "counterparty_email": "a@b.c", "opened_at": "t2", "source_id": "google"}}
     m, tw = merge_twins(twins)
-    assert tw == {"20": "10", "40": "30"}, tw
-    assert m["10"]["status"] == "done" and m["30"]["status"] == "open" and "50" in m and twins["10"]["status"] == "done"
-    assert sorted(wanted_loops(m)) == ["30", "50"]
+    assert tw == {"10": "20", "30": "40"}, tw
+    assert m["20"]["status"] == "done" and m["40"]["status"] == "open" and "50" in m and twins["20"]["status"] == "open"
+    assert sorted(wanted_loops(m)) == ["40", "50"]
     g, mo = group_threads(m)
-    assert mo == {"50": "30"} and sorted(wanted_loops(g)) == ["30"], (mo, sorted(wanted_loops(g)))
-    assert g["30"]["open_ids"] == ["30", "50"] and g["30"]["summary"].endswith("(+1 more on this thread)")
-    assert g["10"]["status"] == "done" and g["10"]["open_ids"] == []
+    assert mo == {"50": "40"} and sorted(wanted_loops(g)) == ["40"], (mo, sorted(wanted_loops(g)))
+    assert g["40"]["open_ids"] == ["40", "50"] and g["40"]["summary"].endswith("(+1 more on this thread)")
+    assert g["20"]["status"] == "done" and g["20"]["open_ids"] == []
+    mixed = {"5": dict(twins["30"], id=5, loop_type="decision_pending", opened_at="t9"), "40": twins["40"]}
+    g2, mo2 = group_threads(mixed)
+    assert mo2 == {"5": "40"} and g2["40"]["open_ids"] == ["40"], (mo2, g2["40"]["open_ids"])
     users = [{"id": "u1", "type": "person", "name": "Dylan E", "person": {"email": DYLAN_ACCOUNT}},
              {"id": "u2", "type": "person", "name": "Other", "person": {"email": "o@x.com"}}]
     assert find_user(users, DYLAN_ACCOUNT) == "u1" and find_user(users, "o@x.com") == "u2" and find_user(users, "z@x.com") is None
