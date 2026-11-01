@@ -1,0 +1,17 @@
+{
+  "name": "gbrain-addon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Host-side Minion job handlers that open and close gbrain open loops from non-Gmail channels",
+  "scripts": {
+    "worker": "bun run src/worker.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "gbrain": "github:garrytan/gbrain#23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
