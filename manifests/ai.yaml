@@ -99,10 +99,12 @@ data:
     const iss = process.env.GOOGLE_CLIENT_EMAIL, sub = process.env.WORK_EMAIL;
     if (!privKey || !iss || !sub) { console.error('google-token: GOOGLE_PRIVATE_KEY_B64, GOOGLE_CLIENT_EMAIL and WORK_EMAIL must be set'); process.exit(1); }
     const b64url = s => Buffer.from(s).toString('base64url');
+    // argv[2] is a comma list of services (gmail,calendar,contacts); none means gmail+calendar.
+    const scopes = { gmail: 'https://www.googleapis.com/auth/gmail.modify', calendar: 'https://www.googleapis.com/auth/calendar.events', contacts: 'https://www.googleapis.com/auth/contacts.readonly' };
+    const scope = (process.argv[2] || 'gmail,calendar').split(',').map(x => scopes[x]).filter(Boolean).join(' ');
     const now = Math.floor(Date.now() / 1000);
     const unsigned = `${b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: process.env.GOOGLE_PRIVATE_KEY_ID ?? '' }))}.${b64url(JSON.stringify({
-      iss, sub, scope: process.argv[2] === 'contacts' ? 'https://www.googleapis.com/auth/contacts.readonly'
-        : 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.events',
+      iss, sub, scope,
       aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600,
     }))}`;
     const jwt = `${unsigned}.${createSign('RSA-SHA256').update(unsigned).sign(privKey, 'base64url')}`;
@@ -213,52 +215,88 @@ spec:
                 || echo "WARN: config set autopilot.incremental_extract_include_frontmatter failed (non-fatal)"
               GOOGLE_SOURCES=""
               if [ -n "$WORK_EMAIL" ] && [ -n "$GOOGLE_CLIENT_EMAIL" ] && [ -n "$GOOGLE_PRIVATE_KEY_B64" ]; then
-                EXISTING="$($GBRAIN sources list 2>/dev/null)"
-                for svc in gcontacts:contacts gmail:gmail gcal:calendar; do
-                  id="${svc%%:*}"; service="${svc#*:}"
-                  token_cmd="bun /google/google-token.mjs"
-                  if [ "$service" = contacts ]; then
-                    token_cmd="bun /google/google-token.mjs contacts"
-                    if ! $token_cmd >/dev/null 2>&1; then
-                      echo "WARN: contacts.readonly not granted to the service account yet; skipping gcontacts"
-                      continue
-                    fi
-                  fi
-                  if echo "$EXISTING" | grep -qw "$id"; then
-                    GOOGLE_SOURCES="$GOOGLE_SOURCES,$id"
-                  elif $GBRAIN sources add "$id" --kind google --account "$WORK_EMAIL" --services "$service" \
-                      --history-days 90 --dir "/install/google-$id" \
-                      --access command --token-command "$token_cmd"; then
-                    GOOGLE_SOURCES="$GOOGLE_SOURCES,$id"
-                  else
-                    echo "WARN: gbrain $id source add failed (non-fatal)"
-                  fi
-                done
+                # one source carries every granted service; contacts is optional until contacts.readonly is granted
+                services="gmail,calendar"
+                if bun /google/google-token.mjs contacts >/dev/null 2>&1; then
+                  services="gmail,calendar,contacts"
+                else
+                  echo "WARN: contacts.readonly not granted to the service account yet; google source has no contacts"
+                fi
+                token_cmd="bun /google/google-token.mjs $services"
+                # asks the database, not `sources list --json`: that output has no archived flag
+                if [ "$(bun -e 'import { SQL } from "bun"; const db = new SQL(process.env.DATABASE_URL); const r = await db`SELECT 1 AS x FROM sources WHERE id = ${"google"} AND archived IS NOT TRUE`; console.log(r.length); await db.end()' 2>/dev/null)" = 1 ]; then
+                  GOOGLE_SOURCES="google"
+                elif $GBRAIN sources add google --kind google --account "$WORK_EMAIL" --services "$services" \
+                    --contacts-dir contacts --history-days 90 --dir /install/google-google \
+                    --access command --token-command "$token_cmd"; then
+                  GOOGLE_SOURCES="google"
+                else
+                  echo "WARN: gbrain google source add failed (non-fatal)"
+                fi
               fi
-              GOOGLE_SOURCES="${GOOGLE_SOURCES#,}" bun -e '
+              # Token grants live in access_tokens columns (source_grant, source_id, federated_read) and a
+              # permissions JSON mirror. gbrain authorizes from the columns and denies the whole source axis
+              # ("granted no sources") when the mirror disagrees, so a grant is only ever written with
+              # `gbrain auth rescope`, which writes both. This block creates the bearer rows and prints one
+              # tab-separated line per grant that must change; the loop after it applies them.
+              PLAN="$(GOOGLE_SOURCES="$GOOGLE_SOURCES" bun -e '
                 import { SQL } from "bun";
                 const t = process.env.GBRAIN_REMOTE_TOKEN;
                 if (!t) { console.error("FATAL: GBRAIN_REMOTE_TOKEN unset"); process.exit(1); }
-                const h = new Bun.CryptoHasher("sha256").update(t).digest("hex");
+                const hash = s => new Bun.CryptoHasher("sha256").update(s).digest("hex");
                 const db = new SQL(process.env.DATABASE_URL);
-                await db`INSERT INTO access_tokens (name, token_hash) VALUES (${"hermes-mcp"}, ${h}) ON CONFLICT (token_hash) DO NOTHING`;
-                if (process.env.GOOGLE_SOURCES) {
-                  const sources = "default," + process.env.GOOGLE_SOURCES;
-                  await db`UPDATE access_tokens SET permissions = (CASE WHEN jsonb_typeof(permissions) = ${"object"} THEN permissions ELSE jsonb_build_object() END) || jsonb_build_object(${"source_id"}::text, to_jsonb(string_to_array(${sources}::text, ${","}::text))) WHERE name = ${"hermes-mcp"}`;
-                  const [row] = await db`SELECT jsonb_typeof(permissions) AS t, permissions->${"source_id"} AS s FROM access_tokens WHERE name = ${"hermes-mcp"}`;
-                  console.log("gbrain: hermes-mcp permissions " + row?.t + " source_id=" + JSON.stringify(row?.s));
-                  console.log("gbrain: hermes-mcp granted read on " + process.env.GOOGLE_SOURCES);
-                }
+                await db`INSERT INTO access_tokens (name, token_hash) VALUES (${"hermes-mcp"}, ${hash(t)}) ON CONFLICT (token_hash) DO NOTHING`;
                 const mt = process.env.GBRAIN_MAIL_TOKEN;
-                if (mt && (process.env.GOOGLE_SOURCES || "").split(",").includes("gmail")) {
-                  const mh = new Bun.CryptoHasher("sha256").update(mt).digest("hex");
-                  await db`INSERT INTO access_tokens (name, token_hash) VALUES (${"hermes-mail"}, ${mh}) ON CONFLICT (token_hash) DO NOTHING`;
-                  await db`UPDATE access_tokens SET permissions = (CASE WHEN jsonb_typeof(permissions) = ${"object"} THEN permissions ELSE jsonb_build_object() END) || jsonb_build_object(${"source_id"}::text, ${"gmail"}::text) WHERE name = ${"hermes-mail"}`;
-                  console.log("gbrain: hermes-mail bearer asserted, scoped to gmail");
+                const active = (await db`SELECT id FROM sources WHERE archived IS NOT TRUE`).map(r => r.id);
+                const google = Boolean(process.env.GOOGLE_SOURCES) && active.includes("google");
+                if (mt && google) await db`INSERT INTO access_tokens (name, token_hash) VALUES (${"hermes-mail"}, ${hash(mt)}) ON CONFLICT (token_hash) DO NOTHING`;
+                const OLD = ["gmail", "gcal", "gcontacts"];
+                const list = v => Array.isArray(v) ? v.filter(x => typeof x === "string")
+                  : typeof v === "string" && /^[{].*[}]$/.test(v) ? v.slice(1, -1).split(",").filter(Boolean)
+                  : typeof v === "string" ? [v] : null;
+                const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+                const reads = r => {
+                  let p = r.permissions;
+                  try { if (typeof p === "string") p = JSON.parse(p); } catch { p = null; }
+                  const mirror = list(p?.source_id) ?? ["default"];
+                  const cols = r.source_grant == null ? mirror
+                    : r.source_grant === "federated" ? list(r.federated_read) ?? []
+                    : r.source_grant === "scalar" ? [r.source_id]
+                    : r.source_grant === "none" ? [] : ["default"];
+                  return { cols, mirror };
+                };
+                const want = {};
+                if (google) {
+                  want["hermes-mcp"] = ["default", "google", ...active.filter(x => OLD.includes(x))];
+                  if (mt) want["hermes-mail"] = ["google"];
+                }
+                for (const r of await db`SELECT name, source_grant, source_id, federated_read, permissions FROM access_tokens WHERE revoked_at IS NULL`) {
+                  const { cols, mirror } = reads(r);
+                  let w = want[r.name];
+                  // any other bearer that reads the old gmail/gcal sources (the claude.ai connector) keeps its grant and gains google
+                  if (!w && google && cols.some(x => OLD.includes(x)) && !cols.includes("google")) w = [...cols, "google"];
+                  if (w && !(same(cols, w) && same(mirror, w))) console.log(["token", r.name, w.join(",")].join("\t"));
+                }
+                if (google) {
+                  for (const c of await db`SELECT client_id, federated_read FROM oauth_clients WHERE deleted_at IS NULL`) {
+                    const fr = list(c.federated_read) ?? [];
+                    if (fr.some(x => OLD.includes(x)) && !fr.includes("google")) console.log(["client", c.client_id, [...fr, "google"].join(",")].join("\t"));
+                  }
                 }
                 await db.end();
-                console.log("gbrain: hermes-mcp bearer asserted");
-              ' || echo "WARN: token seed failed; hermes /mcp calls will 401"
+              ')" || echo "WARN: token seed failed; hermes /mcp calls will 401"
+              printf '%s\n' "$PLAN" | while IFS="$(printf '\t')" read -r kind name grant; do
+                [ -n "$kind" ] || continue
+                if [ "$kind" = client ]; then
+                  $GBRAIN auth rescope --client "$name" --read-sources "$grant" </dev/null \
+                    || echo "WARN: rescope of OAuth client $name failed (non-fatal)"
+                else
+                  $GBRAIN auth rescope --token "$name" --sources "$grant" </dev/null \
+                    || $GBRAIN auth rescope --token "$name" --sources "$grant" --adopt-columns </dev/null \
+                    || echo "WARN: rescope of token $name failed; its calls may be refused"
+                fi
+              done
+              echo "gbrain: bearers asserted"
               exec $GBRAIN serve --http --bind 0.0.0.0
           env:
             - name: DATABASE_URL

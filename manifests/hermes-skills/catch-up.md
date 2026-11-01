@@ -11,7 +11,7 @@ blocks. Nothing here is pushed to him unprompted.
 ## 1. Gather
 
 - Email and commitments: `mcp__gbrain__open_loops` with
-  `{"source_id": "gmail", "group_by": "none", "limit": 200}`. Each loop has an
+  `{"source_id": "google", "group_by": "none", "limit": 200}`. Each loop has an
   `id`, `loop_type` (`unanswered_inbound`, `unanswered_outbound`,
   `commitment_owed_by_me`, `commitment_owed_to_me`, `decision_pending`),
   `summary`, `counterparty_email`, `due_at` and `page_slug` (the email thread).
