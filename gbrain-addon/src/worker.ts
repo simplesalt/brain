@@ -10,6 +10,7 @@ import { MinionWorker } from 'gbrain/minions';
 import { createEngine } from 'gbrain/engine-factory';
 import { loadConfig, toEngineConfig } from 'gbrain/config';
 import { JOB_OPEN, JOB_RECHECK, loopOpen, loopRecheck } from './jobs.ts';
+import { makeHandler } from './http.ts';
 
 async function main() {
   const config = loadConfig();
@@ -20,6 +21,14 @@ async function main() {
   const worker = new MinionWorker(engine, { queue: process.env.ADDON_QUEUE ?? 'addon' });
   worker.register(JOB_OPEN, async (ctx) => loopOpen(engine, ctx.data));
   worker.register(JOB_RECHECK, async (ctx) => loopRecheck(engine, ctx.data));
+  // HTTP front for in-cluster callers that cannot queue jobs (remote MCP only).
+  const port = Number(process.env.ADDON_HTTP_PORT ?? 3140);
+  const handler = makeHandler(engine, {
+    token: process.env.ADDON_HTTP_TOKEN || undefined,
+    defaultSource: process.env.ADDON_DEFAULT_SOURCE || 'google',
+  });
+  Bun.serve({ port, fetch: handler });
+  console.log(`gbrain-addon http listening on :${port}`);
   // start() only after every handler is registered.
   await worker.start();
 }

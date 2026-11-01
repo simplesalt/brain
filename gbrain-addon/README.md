@@ -26,6 +26,20 @@ Commitment and decision loops stay open and are listed in `needs_review`. Closin
 gbrain's `loops_close` operation, so a fact-linked loop retires its fact as `gbrain loops done` does.
 Result: `{closed, left_open, needs_review}`.
 
+## HTTP endpoint
+
+The worker process also serves HTTP (`Bun.serve`, port `ADDON_HTTP_PORT`, default 3140), because
+in-cluster callers reach gbrain only over remote MCP, which cannot queue these jobs.
+
+- `GET /health` -> `{"ok":true}`
+- `POST /loops/open` -> body = `addon-loop-open` params; runs `loopOpen` synchronously, returns its result
+- `POST /loops/recheck` -> body = `addon-loop-recheck` params; returns `loopRecheck`'s result
+
+`source_id` defaults to `ADDON_DEFAULT_SOURCE` (default `google`) when omitted. When
+`ADDON_HTTP_TOKEN` is set, requests need `Authorization: Bearer <token>` (401 otherwise). Errors:
+400 `{"error"}` for bad params or invalid JSON, 404 unknown path, 405 wrong method, 413 body over
+256 KB, 500 `{"error"}` otherwise. The handler is `makeHandler(engine, opts)` in `src/http.ts`.
+
 ## Upgrading gbrain
 
 All gbrain-internal imports are in `src/gbrain-internal.ts`: `src/core/loops/loops-store.ts`
