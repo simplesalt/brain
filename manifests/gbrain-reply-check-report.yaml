@@ -45,3 +45,47 @@ spec:
               memory: 32Mi
             limits:
               memory: 128Mi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # One-shot, read-only: when LinkedIn message events arrived, to size the conversation sweep.
+  name: duxsoup-message-age-report-1
+  namespace: ssint-main-msg
+  labels:
+    entity: ssint
+    env: main
+    capability: msg
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: duxsoup-message-age-report
+        entity: ssint
+        env: main
+        capability: msg
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: report
+          image: postgres:17-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -P pager=off -c "
+                SELECT date_trunc('week', received_at)::date AS week, coalesce(event, '?') AS event, count(*)
+                  FROM events WHERE type = 'message' GROUP BY 1, 2 ORDER BY 1 DESC LIMIT 30;"
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: duxsoup-ingest-pg-app
+                  key: uri
+          resources:
+            requests:
+              memory: 32Mi
+            limits:
+              memory: 128Mi
