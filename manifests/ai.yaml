@@ -281,6 +281,15 @@ spec:
                 else
                   echo "WARN: gbrain google source add failed (non-fatal)"
                 fi
+                # the google source replaces gmail and gcal (simplesalt/projects#832, dylan 2026-11-01): once it
+                # holds pages, carry the last loop closes over and archive the old two (restorable with
+                # `gbrain sources restore`). Runs before the grant plan so tokens stop listing them.
+                if [ -n "$GOOGLE_SOURCES" ] && [ "$(bun -e 'import { SQL } from "bun"; const db = new SQL(process.env.DATABASE_URL); const r = await db`SELECT 1 AS x FROM pages WHERE source_id = ${"google"} LIMIT 1`; console.log(r.length); await db.end()' 2>/dev/null)" = 1 ]; then
+                  GBRAIN="$GBRAIN" bun /google/loops-carry.mjs </dev/null
+                  for old in gmail gcal; do
+                    $GBRAIN sources archive "$old" </dev/null || echo "WARN: gbrain sources archive $old failed (non-fatal)"
+                  done
+                fi
                 # autopilot leaves a connector source idle until one manual sync has run; run it in the
                 # background so serve starts now, and again on each start so a failed first sync retries
                 if [ -n "$GOOGLE_SOURCES" ]; then
