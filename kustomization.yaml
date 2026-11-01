@@ -22,6 +22,7 @@ resources:
   - manifests/fireflies-ingest.yaml
   - manifests/lease-sweep.yaml
   - manifests/discovery-to-notion.yaml
+  - manifests/notion-tasks-access-check.yaml
   - manifests/hermes-msg.yaml
   - manifests/duxsoup-ingest.yaml
   - manifests/coding.yaml

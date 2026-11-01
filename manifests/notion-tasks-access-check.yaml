@@ -1,0 +1,93 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # One-shot: the fixed name makes Flux apply it once. Bump the suffix to run it again.
+  name: notion-tasks-access-check-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: notion-tasks-access-check
+        entity: ssint
+        env: main
+        capability: ai
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: notion-tasks-access-check
+          image: oven/bun:1-alpine
+          imagePullPolicy: IfNotPresent
+          # Logs only HTTP status, object type, error code and the created page id; never a token or a body.
+          # Both keys read the Agent workspace page and the Tasks database. Only the hermes key creates a
+          # test row (the deletion-review key is read-only by design). The row is left in place on purpose.
+          command:
+            - bun
+            - -e
+            - |
+              const V = "2025-09-03";
+              const PAGE = "40be6a5b97798123969cd810f1d123cd";
+              const DB = "8bf70b963c9a458389a8690ae286520c";
+              const DYLAN = "10ad872b-594c-8193-80de-0002a4b8ebfb";
+              async function call(token, method, path, body) {
+                const res = await fetch("https://api.notion.com/v1" + path, {
+                  method,
+                  headers: {
+                    Authorization: "Bearer " + token,
+                    "Notion-Version": V,
+                    "Content-Type": "application/json",
+                  },
+                  body: body ? JSON.stringify(body) : undefined,
+                });
+                let j = {};
+                try { j = await res.json(); } catch (e) {}
+                return { status: res.status, json: j };
+              }
+              function show(label, what, r) {
+                console.log(label, what, "status=" + r.status, "object=" + (r.json.object || "-"), "code=" + (r.json.code || "-"));
+              }
+              async function check(label, token, create) {
+                if (!token) { console.log(label, "token not set; skipped"); return; }
+                show(label, "GET page", await call(token, "GET", "/pages/" + PAGE));
+                const db = await call(token, "GET", "/databases/" + DB);
+                show(label, "GET database", db);
+                if (!create) return;
+                const ds = db.json.data_sources && db.json.data_sources[0] && db.json.data_sources[0].id;
+                if (!ds) { console.log(label, "no data source id; row not created"); return; }
+                const row = await call(token, "POST", "/pages", {
+                  parent: { type: "data_source_id", data_source_id: ds },
+                  properties: {
+                    Task: { title: [{ text: { content: "Access check (" + label + ") — delete me" } }] },
+                    Assignee: { people: [{ id: DYLAN }] },
+                    Status: { status: { name: "Not started" } },
+                  },
+                });
+                show(label, "POST row", row);
+                if (row.json.id) console.log(label, "created page id=" + row.json.id);
+              }
+              await check("hermes", process.env.NOTION_TOKEN_HERMES, true);
+              await check("deletion-review", process.env.NOTION_TOKEN_DELETION_REVIEW, false);
+          env:
+            - name: NOTION_TOKEN_HERMES
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-proxy-secrets
+                  key: NOTION_TOKEN
+            - name: NOTION_TOKEN_DELETION_REVIEW
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: NOTION_DELETION_REVIEW_TOKEN
+                  optional: true
+          resources:
+            requests:
+              memory: 32Mi
+            limits:
+              memory: 128Mi
