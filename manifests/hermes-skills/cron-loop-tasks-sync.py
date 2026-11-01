@@ -89,19 +89,28 @@ def call(tool, args):
     req = urllib.request.Request(URL, data=body, headers={
         "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
         "Authorization": "Bearer " + TOKEN})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        for line in r.read().decode().splitlines():
-            if line.startswith("data: "):
-                msg = json.loads(line[6:])
-                if "error" in msg:
-                    raise RuntimeError(f"{tool}: {msg['error']}")
-                text = msg["result"]["content"][0]["text"]
-                if msg["result"].get("isError"):
-                    raise RuntimeError(f"{tool}: {text[:300]}")
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    return text
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                raw = r.read().decode()
+            break
+        except urllib.error.URLError as e:
+            if isinstance(e, urllib.error.HTTPError) or attempt == 3:
+                raise
+            log(f"gbrain unreachable ({e.reason}); retrying in {15 * (attempt + 1)}s")
+            time.sleep(15 * (attempt + 1))
+    for line in raw.splitlines():
+        if line.startswith("data: "):
+            msg = json.loads(line[6:])
+            if "error" in msg:
+                raise RuntimeError(f"{tool}: {msg['error']}")
+            text = msg["result"]["content"][0]["text"]
+            if msg["result"].get("isError"):
+                raise RuntimeError(f"{tool}: {text[:300]}")
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return text
     raise RuntimeError(f"{tool}: no response")
 
 
