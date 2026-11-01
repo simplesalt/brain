@@ -194,7 +194,7 @@ spec:
         # add-on pin in simplesalt/oci gbrain/pins.env); nothing is installed at start. This only copies
         # the image's admin dashboard assets out for admin-gate, which runs on a plain python image.
         - name: seed-admin-assets
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:b1084f3b2fb1b7ac3f16664db839ed670147d3b0229108d262acba034deeef0c
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:260fcc993a2f179254146f8bfb1e1b94795d91986bd7c3a3745a915a804257e4
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -207,7 +207,7 @@ spec:
               mountPath: /out
       containers:
         - name: gbrain
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:b1084f3b2fb1b7ac3f16664db839ed670147d3b0229108d262acba034deeef0c
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:260fcc993a2f179254146f8bfb1e1b94795d91986bd7c3a3745a915a804257e4
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -497,7 +497,7 @@ spec:
               mountPath: /google
               readOnly: true
         - name: autopilot
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:b1084f3b2fb1b7ac3f16664db839ed670147d3b0229108d262acba034deeef0c
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:260fcc993a2f179254146f8bfb1e1b94795d91986bd7c3a3745a915a804257e4
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -633,7 +633,7 @@ spec:
         # simplesalt/brain gbrain-addon: channel-neutral loop jobs (addon-loop-open, addon-loop-recheck)
         # on Minion queue "addon" (simplesalt/projects#838).
         - name: addon-worker
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:b1084f3b2fb1b7ac3f16664db839ed670147d3b0229108d262acba034deeef0c
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:260fcc993a2f179254146f8bfb1e1b94795d91986bd7c3a3745a915a804257e4
           imagePullPolicy: IfNotPresent
           command: ["gbrain-addon-worker"]
           # No readinessProbe on purpose: a failing add-on must not take gbrain's MCP off the Service.

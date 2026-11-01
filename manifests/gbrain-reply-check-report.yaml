@@ -3,7 +3,7 @@ kind: Job
 metadata:
   # One-shot, read-only: prints the add-on's reply-needed verdicts with each loop's summary.
   # Bump the suffix to run it again.
-  name: gbrain-reply-check-report-1
+  name: gbrain-reply-check-report-2
   namespace: ssint-main-ai
   labels:
     entity: ssint
