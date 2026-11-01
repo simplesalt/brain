@@ -13,10 +13,12 @@ calls are marked handled without being handed out. With nothing to do it prints 
 skips the model call. MEETING_INGEST_DRY_RUN=1 prints the pick without marking anything.
 """
 import datetime
+import hashlib
 import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 
 URL = os.environ.get("GBRAIN_URL", "http://gbrain:3131/mcp")
@@ -28,6 +30,10 @@ OUTPUT_DIR = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "cron", "o
 DONE_MARKER = "MEETING-INGEST-DONE"
 RETRY_AFTER = datetime.timedelta(hours=1)
 MAX_TRIES = 2
+ADDON_URL = os.environ.get("ADDON_URL", "http://gbrain.ssint-main-ai:3140").rstrip("/")
+ADDON_TOKEN = os.environ.get("ADDON_TOKEN", "gbrain-addon")
+DYLAN_NAMES = {"dylan", "dylan evans", "dylan e", "dylan e.", "me", "i"}
+DYLAN_EMAILS = {"dylan@simple-salt.com", "dylan.evans@simplesalt.company"}
 DRY_RUN = os.environ.get("MEETING_INGEST_DRY_RUN") == "1"
 
 
@@ -132,6 +138,129 @@ def finished_slugs():
     return found
 
 
+def addon_post(path, body):
+    req = urllib.request.Request(ADDON_URL + path, data=json.dumps(body).encode(), headers={
+        "Content-Type": "application/json", "Authorization": "Bearer " + ADDON_TOKEN})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, {"error": e.read().decode()[:200]}
+
+
+def action_items(body):
+    """Parse the '## Action Items' section into [{owner, text, owed_to, due}]. Line format (see the prompt):
+    '- <Owner>: <task> [owed to: <Person>] [due: YYYY-MM-DD]'; owner 'unknown' when not stated."""
+    m = re.search(r"^##\s+Action Items\s*\n(.*?)(?=^##\s|\Z)", body or "", re.S | re.M)
+    items = []
+    for line in (m.group(1) if m else "").splitlines():
+        t = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s*(?:\[[ xX]\]\s*)?", "", line).strip()
+        if not t or t == line.strip() and not line.lstrip().startswith(("-", "*", "+")) and not re.match(r"\s*\d+[.)]", line):
+            continue
+        if t.startswith("_") or re.match(r"(?i)(none|no action items)", t):
+            continue
+        om = re.match(r"\**([^:*]{1,60}?)\**\s*:\s*(.+)$", t)
+        owner, text = (om.group(1).strip(), om.group(2).strip()) if om else ("unknown", t)
+        due = re.search(r"(?i)\bdue\b[^0-9]{0,12}(\d{4}-\d{2}-\d{2})", text)
+        owed = re.search(r"(?i)\[?\bowed to:?\s*([^\]\);]+)", text)
+        items.append({"owner": owner, "text": text, "due": due.group(1) if due else None,
+                      "owed_to": owed.group(1).strip() if owed else None})
+    return items
+
+
+def is_dylan(name):
+    n = (name or "").strip().lower()
+    return n in DYLAN_NAMES or n in DYLAN_EMAILS or n.startswith("dylan ")
+
+
+def person_slug(name):
+    """gbrain person page slug for a name, or None. Pages marked Test contact are returned as 'TEST'."""
+    try:
+        res = call("search", {"query": name, "types": ["person"], "limit": 5})
+    except RuntimeError:
+        return None
+    rows = res.get("results") if isinstance(res, dict) else res
+    for r in rows if isinstance(rows, list) else []:
+        if isinstance(r, dict) and str(r.get("slug", "")).startswith("people/") \
+                and (r.get("title") or "").strip().lower() == name.strip().lower():
+            return r["slug"]
+    return None
+
+
+def is_test_contact(slug):
+    try:
+        page = call("get_page", {"slug": slug, "include_content": True})
+    except RuntimeError:
+        return False
+    return isinstance(page, dict) and "test contact" in json.dumps(page).lower()
+
+
+def open_loops(slug):
+    """Turn the Action Items of a saved meeting page into open loops. Returns the summary string, or None
+    when the addon was unreachable (the caller retries on a later run). Idempotent on the addon side."""
+    page = call("get_page", {"slug": slug, "include_content": True})
+    if not isinstance(page, dict):
+        return "loops: no page"
+    body = page.get("compiled_truth") or page.get("content") or ""
+    # Test contacts get no loops.
+    att = re.search(r"^##\s+Attendees\s*\n(.*?)(?=^##\s|\Z)", body, re.S | re.M)
+    if re.search(r"(?i)test contact", att.group(1) if att else ""):
+        return "loops: skipped (test contact)"
+    attendees = re.findall(r"^-\s+(.+?)\s*<([^>]+)>\s*$", att.group(1) if att else "", re.M)
+    external = [(n, e) for n, e in attendees if e.lower() not in DYLAN_EMAILS]
+    main_ext = external[0] if external else None
+    opened = skipped = failed = 0
+    for it in action_items(body):
+        text = it["text"]
+        eid = slug + "#" + hashlib.sha1(re.sub(r"\s+", " ", text.lower()).encode()).hexdigest()[:12]
+        req = {"channel": "fireflies", "external_id": eid, "thread_id": slug, "summary": text[:500],
+               "evidence": [{"page_slug": slug, "quote": text[:500]}]}
+        if it["due"]:
+            req["due_at"] = it["due"]
+        owner = it["owner"]
+        if re.match(r"(?i)(unknown|unassigned|tbd|n/a|someone|team|everyone)\b", owner):
+            skipped += 1
+            continue
+        if is_dylan(owner):
+            req["loop_type"] = "commitment_owed_by_me"
+            who = it["owed_to"]
+            if who:
+                s = person_slug(who)
+                if s:
+                    req["counterparty_slug"] = s
+            elif main_ext:
+                s = person_slug(main_ext[0])
+                if s:
+                    req["counterparty_slug"] = s
+                req["counterparty_email"] = main_ext[1]
+        else:
+            s = person_slug(owner)
+            if s and is_test_contact(s):
+                skipped += 1
+                continue
+            req["loop_type"] = "commitment_owed_to_me"
+            if s:
+                req["counterparty_slug"] = s
+            else:
+                em = [e for n, e in attendees if n.strip().lower() == owner.strip().lower()]
+                if em:
+                    req["counterparty_email"] = em[0]
+        try:
+            code, resp = addon_post("/loops/open", req)
+        except OSError as e:
+            print(f"meeting-ingest: loops addon unreachable for {slug}: {e}", file=sys.stderr)
+            return None
+        if code == 200:
+            opened += 1
+        elif code == 400:
+            failed += 1
+            print(f"meeting-ingest: loop rejected for {slug}: {resp}", file=sys.stderr)
+        else:
+            print(f"meeting-ingest: loops addon HTTP {code} for {slug}", file=sys.stderr)
+            return None
+    return f"loops: {opened} opened, {skipped} skipped (unknown owner), {failed} rejected"
+
+
 def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     since = (now - datetime.timedelta(days=DAYS)).date().isoformat()
@@ -142,6 +271,18 @@ def main():
     retry = None
     for slug, p in sorted(pending.items(), key=lambda kv: kv[1]["at"]):
         if slug in finished:
+            # Hermes has saved the page: open loops for its action items now (deterministic, idempotent). If
+            # the addon is unreachable, stay pending and try again on the next run.
+            if DRY_RUN:
+                continue
+            try:
+                result = open_loops(slug)
+            except RuntimeError as e:
+                print(f"meeting-ingest: reading {slug} for loops failed: {e}", file=sys.stderr)
+                result = None
+            if result is None:
+                continue
+            print(f"meeting-ingest: {slug} {result}", file=sys.stderr)
             done.add(slug)
         elif now - datetime.datetime.fromisoformat(p["at"]) < RETRY_AFTER:
             continue

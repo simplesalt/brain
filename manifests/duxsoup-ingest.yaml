@@ -101,6 +101,9 @@ data:
 
     const GBRAIN_MCP_URL = process.env.GBRAIN_MCP_URL ?? 'http://gbrain.ssint-main-ai:3131/mcp';
     const GBRAIN_TOKEN = process.env.GBRAIN_REMOTE_TOKEN ?? '';
+    // gbrain add-on (open-loop tracking): /loops/recheck and /loops/open.
+    const ADDON_URL = (process.env.ADDON_URL ?? 'http://gbrain.ssint-main-ai:3140').replace(/\/+$/, '');
+    const ADDON_TOKEN = process.env.ADDON_TOKEN ?? 'gbrain-addon';
 
     const POD_NAME = process.env.POD_NAME ?? 'unknown';
     const HEARTBEAT_MAX_AGE_SEC = Number(process.env.HEARTBEAT_MAX_AGE_SEC ?? 120);
@@ -690,6 +693,26 @@ data:
     // put_raw_data params: { slug, source, data } (raw-data.ts: put_raw_data).
     async function gbrainPutRawData(slug, source, data) {
       return gbrainCall('put_raw_data', { slug, source, data });
+    }
+
+    // POST to the gbrain add-on. A 400 (bad params) is permanent: logged and
+    // returned as null so the event is not retried forever. Anything else
+    // (network error, 5xx, other non-2xx) throws, so the event takes the same
+    // retry/backoff path as a failed gbrain write.
+    async function addonPost(path, body) {
+      const r = await fetch(`${ADDON_URL}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ADDON_TOKEN}` },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const text = await r.text();
+      if (r.status === 400) {
+        console.error(`addon ${path}: 400 (not retried): ${text.slice(0, 300)}`);
+        return null;
+      }
+      if (!r.ok) throw new Error(`addon ${path}: HTTP ${r.status}: ${text.slice(0, 200)}`);
+      try { return JSON.parse(text); } catch { return text; }
     }
 
     // ---------------------------------------------------------------------------
@@ -1601,11 +1624,42 @@ data:
         || (isReceived ? [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim() : '');
       const bullet = buildMessageBullet(row, { isReceived, date, senderName, text: stringifyDetail(d.text ?? '') });
       const slug = await syncPersonPage(profileRow, null, row.id, bullet);
-      return { slug, date, isReceived, text: stringifyDetail(d.text ?? '') };
+      return { slug, date, isReceived, text: stringifyDetail(d.text ?? ''), profileRow, senderName };
+    }
+
+    // Open-loop tracking for one message event, once its person page slug is
+    // known: recheck first (the message may settle the person's open loops),
+    // then, for an inbound message, open an unanswered_inbound loop (so a new
+    // inbound message never closes itself). Dux Soup sends no message or
+    // conversation id, so external_id is a stable hash of the other person's
+    // Dux Soup id + event time + text, and thread_id is that person's id.
+    // Both calls are idempotent, so a retried event replays them harmlessly.
+    async function syncMessageLoops(row, { slug, isReceived, text, profileRow, senderName }) {
+      const sentAtIso = eventIsoTime(row, null);
+      if (!sentAtIso) throw new Error(`message event ${row.id} has no usable time`);
+      const threadId = String(profileRow.dux_id);
+      const messageId = `duxsoup:${shortHash(`${threadId}|${isReceived ? 'in' : 'out'}|${sentAtIso}|${text}`)}`;
+      await addonPost('/loops/recheck', {
+        counterparty_slug: slug,
+        messages: [{ channel: 'linkedin', message_id: messageId, page_slug: slug, from_me: !isReceived, sent_at: sentAtIso, text }],
+      });
+      if (!isReceived) return;
+      const name = senderName || [profileRow.first_name, profileRow.last_name].filter(Boolean).join(' ').trim() || 'Someone';
+      const oneLine = text.replace(/\s+/g, ' ').trim();
+      await addonPost('/loops/open', {
+        channel: 'linkedin',
+        external_id: messageId,
+        thread_id: threadId,
+        loop_type: 'unanswered_inbound',
+        counterparty_slug: slug,
+        summary: `${name} messaged you on LinkedIn: ${oneLine.slice(0, 120)}`,
+        evidence: [{ message_id: messageId, page_slug: slug, quote: oneLine.slice(0, 200) }],
+      });
     }
 
     async function processMessage(row) {
-      const { slug, date, isReceived, text } = await writeMessageToPage(row);
+      const w = await writeMessageToPage(row);
+      const { slug, date, isReceived, text } = w;
       await addTimelineEntryForEvent(row, {
         slug,
         date,
@@ -1613,6 +1667,7 @@ data:
         detail: text,
         source: `duxsoup:message:${row.id}`,
       });
+      await syncMessageLoops(row, w);
     }
 
     // One-time (per process start) pass over stored message events so messages
@@ -1984,6 +2039,10 @@ spec:
               value: http://gbrain.ssint-main-ai:3131/mcp
             - name: GBRAIN_REMOTE_TOKEN
               value: "gbrain-mcp"
+            - name: ADDON_URL
+              value: http://gbrain.ssint-main-ai:3140
+            - name: ADDON_TOKEN
+              value: "gbrain-addon"
           livenessProbe:
             # The container blocks on migrateWithRetry() (schema migration, up to
             # ~120s of retries against a not-yet-ready CNPG cluster) before the
