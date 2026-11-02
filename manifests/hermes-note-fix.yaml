@@ -1,0 +1,91 @@
+# One-shot (projects#858): Hermes removes the false Dux-Soup "outside this token's grant" claim from two
+# 2026-10-29 gbrain notes. No TTL, so Flux does not recreate and rerun it after it finishes.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hermes-note-fix-858
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  activeDeadlineSeconds: 1800
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: hermes-note-fix
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: check
+          image: python:3.12-alpine
+          command: ["python3", "/check/check.py"]
+          env:
+            - name: CHECK_PROMPT
+              value: >-
+                gbrain correction from the coding agent (projects#858). Change nothing except the
+                two gbrain notes named here. Dux-Soup has no gbrain source of its own: it writes into
+                the default source, and Dux-Soup actions are readable in person-page timelines
+                (duxsoup:action:...) and in get_raw_data. Two notes still say the Dux-Soup source is
+                outside the token's grant, and one gives a rescope-token command; that is false.
+                1) notes/2026-10-29-people-added-linkedin-status: get_page with include_content,
+                then put_page with expected_revision. In the section "Dux Soup is not draining the
+                queue", replace the sentence that starts "The authoritative Dux Soup source is
+                outside this token's grant" (including the rescope-token command in brackets) with:
+                "Dux-Soup writes into the default source; connect and accept events are read from
+                each person page's timeline (duxsoup:action:...)." Also replace "and accept events
+                still cannot be read from gbrain" in the line before it with "so no connect event
+                exists yet". Keep everything else, including the Timeline section, word for word.
+                The existing timeline entry dated 2026-10-29 17:45Z repeats the claim; add a timeline
+                entry dated 2026-11-02 saying: "Correction: the Dux-Soup data was never outside the
+                token's grant. It is in the default source; the duxsoup-source and rescope-token
+                lines above were wrong."
+                2) notes/2026-10-29-follow-up-catchup-state: get_page with include_content, then
+                put_page with expected_revision. In the bullet "Dux Soup appears to be draining
+                again", replace "and no accept event can be read — `sources_list` still shows only
+                default/gmail/gcal, so the duxsoup source is outside this token's grant." with "Dux-Soup
+                connect and accept events land in each person page's timeline in the default source
+                (duxsoup:action:...)." Keep everything else word for word.
+                3) get_page both notes again and confirm neither contains "outside this token" or
+                "rescope-token" in its body. Do not save anything to memory about this task. Reply
+                with one line per step: "<step>: OK" or "<step>: FAILED <exact error>".
+            - name: HERMES_URL
+              value: "http://hermes-agent-web:8642"
+            - name: CHECK_DELAY
+              value: "120"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: HERMES_BEARER_TOKEN
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: script
+              mountPath: /check
+      volumes:
+        - name: script
+          configMap:
+            name: hermes-upgrade-check-script
