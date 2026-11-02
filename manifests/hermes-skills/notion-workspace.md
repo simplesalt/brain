@@ -110,6 +110,19 @@ As a row in a database: `{"parent": {"database_id": "<database id>"}, "propertie
 using the database's own property names. Add body text afterwards with
 `update_page_markdown` (`replace_content`).
 
+## Change a database's columns
+
+You can add, rename and remove a database's properties and their select options with
+`mcp_notion_API_update_a_data_source` (the data source id from search):
+```json
+{"data_source_id": "<id>", "properties": {"Stage": {"select": {"options": [
+  {"name": "Lead"}, {"name": "Won"}, {"name": "New option"}]}}}}
+```
+Read the data source first with `retrieve_a_data_source`: the options list replaces the
+old one, so send every option you want to keep. A new database goes under a page with
+`mcp_notion_API_create_a_data_source`. Other edits: `create_a_comment`,
+`patch_block_children` (append blocks), `update_a_block`, `delete_a_block`, `move_page`.
+
 ## Answering
 
 Link the Notion page you used. The Hermes integration sees the whole simplesalt

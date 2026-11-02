@@ -144,6 +144,14 @@ mcp_servers:
         - API-retrieve-a-page
         - API-retrieve-page-markdown
         - API-update-page-markdown
+        # Full write (decision 10-15): database schemas, comments, blocks, moves.
+        - API-update-a-data-source
+        - API-create-a-data-source
+        - API-create-a-comment
+        - API-update-a-block
+        - API-delete-a-block
+        - API-patch-block-children
+        - API-move-page
   hubspot:
     enabled: true
     url: http://mcp-proxy:3002/mcp
