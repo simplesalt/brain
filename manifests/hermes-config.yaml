@@ -9,6 +9,13 @@ model:
 # Provider routing and reasoning effort are not set here: the OpenRouter preset carries them,
 # and anything Hermes sent would override the preset.
 agent:
+  # Loop control (projects#857). Band-aids: they cap runaway turns, not why Hermes over-thinks.
+  # Re-prompt a reply that ends on an announced step ("Let me…") with no tool call, at most twice.
+  stall_guards: true
+  intent_ack_continuation: true
+  # API calls per turn; execute_code calls are not counted. Clean single-turn runs, 10-29..11-02: p95 65.
+  max_turns: 100
+  budget_warning_ratio: 0.8
   environment_hint: |-
     At the start of every session, call hindsight_recall before giving your
     first response. Use it to retrieve context about ongoing work, recent
@@ -37,6 +44,13 @@ agent:
     - feishu_doc
     - feishu_drive
     - spotify
+# Hard-stop repeated failing calls in chats too: Hermes counts api_server as attended, so by
+# default only cron stops (projects#857).
+tool_loop_guardrails:
+  hard_stop_enabled: true
+  hard_stop_after:
+    exact_failure: 3
+    same_tool_failure: 5
 platform_toolsets:
   cli:
     - clarify
