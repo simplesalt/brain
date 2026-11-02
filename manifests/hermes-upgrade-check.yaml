@@ -60,6 +60,10 @@ data:
             if ts.get('enabled'):
                 total += n
             print(f"toolset {ts.get('name')}: enabled={ts.get('enabled')} tools={n}")
+            names = [str(t.get('name') if isinstance(t, dict) else t) for t in (ts.get('tools') or [])]
+            notion = sorted(x for x in names if 'notion' in x.lower())
+            if notion:
+                print('  notion tools: ' + ', '.join(notion))
         print(f'enabled tool total: {total}')
     except Exception as e:
         print('toolsets parse failed', e, b[:500])
