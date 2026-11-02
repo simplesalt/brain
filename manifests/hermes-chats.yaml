@@ -685,5 +685,11 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ssint-main-ai
+        # cloudflared for the ssint-main tunnel: the cluster MCP connector's
+        # read-only hermes-chats tools arrive through a Workers VPC service
+        # (simplesalt/cloud-basis 30-mcp, simplesalt/projects#854).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cluster-named-routing
       ports:
         - port: 8080
