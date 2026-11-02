@@ -1180,7 +1180,7 @@ spec:
                         "Ignore chat mechanics: what the assistant asked, offered, planned or explained, which tools it "
                         "called and whether they worked, requests to name or title a chat, that a message had an image, "
                         "turn or session counts, and restatements of what the user just asked. Never retain claims about "
-                        "the assistant's own tool access, permissions, token grants, sources, limits or errors (what "
+                        "the tool access, permissions, token grants, sources, limits or errors of the assistant itself (what "
                         "Hermes or its tools can or cannot do, read or reach), nor test, check-run or miss-report "
                         "messages and the replies to them. Ignore routine greetings, "
                         "transient operational details, ephemeral system-state snapshots, one-off command output, and "
