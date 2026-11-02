@@ -1,3 +1,5 @@
+Script error: if a `## Script Error` section is above, the script failed. Answer only a line reading exactly `MEETING-INGEST-SCRIPT-ERROR`, then the last 20 lines of the error, and call no tool. Do not do the task, read pages, retry, or try to fix or run anything; a coding agent fixes the script.
+
 Meeting ingest: turn one recorded Fireflies call into a worked-up meeting page in gbrain.
 
 The script output above names one meeting page in gbrain (a slug under `meetings/`). Load gbrain's `meeting-ingestion` skill and follow it for that meeting. The meeting page was drafted by the Fireflies import with `facts_backstop: false`; the raw transcript is on a linked sidecar page of type `source` (its slug is in the meeting page's `transcript` frontmatter field and its first line). Skip the skill's steps to normalize the input, split recordings, check for duplicates across recorders, and file a transcript page: the sidecar already exists.

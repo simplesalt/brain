@@ -62,6 +62,14 @@ platform_toolsets:
     - terminal
     - vision
     - web
+  # Scheduled jobs get skills and the MCP servers their prompts use, nothing else: no terminal,
+  # code_execution, delegation or web, so a run cannot patch or redo a job's work (projects#856).
+  cron:
+    - skills
+    - gbrain
+    - gbrain-mail
+    - hermes-msg
+    - notion
 terminal:
   backend: local
   env_passthrough:

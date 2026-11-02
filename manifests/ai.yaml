@@ -1247,6 +1247,10 @@ spec:
                 echo "WARN: cron timeline-sweep not scheduled (non-fatal)"
               fi
               chown -R -h 10000:10000 /opt/data 2>/dev/null || true
+              # Job scripts come from this repo: root-owned and read-only, so Hermes cannot patch them (projects#856).
+              chown -R -h 0:0 /opt/data/scripts
+              chmod 755 /opt/data/scripts
+              chmod 644 /opt/data/scripts/*
 
               cp /seed/SOUL.md /opt/data/SOUL.md
 

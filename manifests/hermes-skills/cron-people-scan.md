@@ -1,3 +1,5 @@
+Script error: if a `## Script Error` section is above, the script failed. Answer only a line reading exactly `PEOPLE-SCAN-SCRIPT-ERROR`, then the last 20 lines of the error, and call no tool. Do not do the task, read pages, retry, or try to fix or run anything; a coding agent fixes the script.
+
 People scan: pick out the real people in these meetings and email threads, so gbrain gets a page for each one.
 
 The script output above lists meetings and email threads from gbrain as JSON. You only read and judge; a script writes the pages from your answer. Work through every item before answering:

@@ -1,3 +1,5 @@
+Script error: if a `## Script Error` section is above, the script failed. Answer only a line reading exactly `DAILY-BRIEF-SCRIPT-ERROR`, then the last 20 lines of the error, and call no tool. Do not do the task, read pages, retry, or try to fix or run anything; a coding agent fixes the script.
+
 Daily brief: email Dylan one short morning brief of today's meetings and who is waiting on him.
 
 1. Today's meetings are listed above as JSON (from the script). For each meeting, for each address in `people`, find their person page (`mcp__gbrain__search` with the email, then the name) and take who they are and the last time Dylan met or emailed them (`mcp__gbrain__get_timeline`). Leave out conference sessions with no other attendees and reminders such as travel, unless they need preparation.

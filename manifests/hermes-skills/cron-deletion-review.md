@@ -1,3 +1,5 @@
+Script error: if a `## Script Error` section is above, the script failed. Answer only a line reading exactly `DELETION-REVIEW-SCRIPT-ERROR`, then the last 20 lines of the error, and call no tool. Do not do the task, read pages, retry, or try to fix or run anything; a coding agent fixes the script.
+
 Deletion review: judge how much was lost when these Notion items were moved to the trash.
 
 The script output above lists trashed Notion items as JSON. Each has the text it held (`content_excerpt`), how many child pages or rows it had, who deleted it and when, its original parent, `replacement_candidates` (live pages that may replace it) and `explanation_candidates` (comments on it or its parent that may say why it was removed). You only read and judge; a script computes the risk and keeps the log. Work through every item, using only what the batch shows:
