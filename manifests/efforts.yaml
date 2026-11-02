@@ -1,0 +1,178 @@
+# Cluster-local Effort MCP server (simplesalt/projects#865).
+# Runs the builder image's own Effort scripts, so its rules are exactly the builders' rules;
+# bump the image digest below together with the builder deployments when the scripts change.
+# Callers: the cloud-basis MCP Worker through the ssint-main tunnel (simplesalt/projects#859),
+# at http://efforts.ssint-main-efforts.svc.k.famevans.win:8080/mcp/{coordinator,doer}.
+# Cluster-local resources never go in crossplane-system.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ssint-main-efforts
+  labels:
+    name: ssint-main-efforts
+    entity: ssint
+    env: main
+    capability: efforts
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# A copy of the builders' GitHub token (ssint-main-coding/gh-auth), placed by hand.
+# Flux owns only the shell; the GITHUB_TOKEN key is merged in out of band.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gh-auth
+  namespace: ssint-main-efforts
+  labels:
+    entity: ssint
+    env: main
+    capability: efforts
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: efforts
+  namespace: ssint-main-efforts
+  labels:
+    entity: ssint
+    env: main
+    capability: efforts
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: efforts
+  template:
+    metadata:
+      labels:
+        app: efforts
+        entity: ssint
+        env: main
+        capability: efforts
+        scheduling.simplesalt.company/class: work
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: efforts
+          image: ghcr.io/simplesalt/oci/builder-sb@sha256:29fdb7c89f8b4384ad7a6d1dd0788d55a689ac714928bbc6ffdce61ef863b288
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/app/effort-mcp.mjs"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: HOME
+              value: /state
+            - name: SCRIPTS_DIR
+              value: /etc/claude-code/scripts
+            - name: HOLDER_HOST
+              value: efforts
+            - name: GH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gh-auth
+                  key: GITHUB_TOKEN
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 20m
+              memory: 96Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: app
+              mountPath: /app
+              readOnly: true
+            - name: state
+              mountPath: /state
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: app
+          configMap:
+            name: effort-mcp-script
+        - name: state
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: efforts
+  namespace: ssint-main-efforts
+  labels:
+    entity: ssint
+    env: main
+    capability: efforts
+spec:
+  selector:
+    app: efforts
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: efforts-allow-callers
+  namespace: ssint-main-efforts
+  labels:
+    entity: ssint
+    env: main
+    capability: efforts
+spec:
+  podSelector:
+    matchLabels:
+      app: efforts
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # cloudflared for the ssint-main tunnel: the cluster MCP connector's Effort tools
+        # arrive through a Workers VPC service (simplesalt/projects#859).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cluster-named-routing
+        # builder sessions, for in-cluster checks
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ssint-main-coding
+      ports:
+        - port: 8080
