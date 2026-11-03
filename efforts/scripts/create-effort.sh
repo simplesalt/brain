@@ -78,6 +78,7 @@ PARENT_NODE_ID=""
 FIT_FOUND="false"
 FIT_SCORE=""
 FIT_MATCHED=""
+PARENT_SUGGESTION=""
 
 if [ -n "$PARENT_REF" ]; then
   resolve_ref "$PARENT_REF"
@@ -140,10 +141,11 @@ score, matched = float(\"$BEST_SCORE\"), int(\"$BEST_MATCHED\")
 print(1 if (score >= $PARENT_FIT_MIN_SCORE and matched >= $PARENT_FIT_MIN_MATCHED) else 0)
 ")
     if [ "$CLEARS_FLOOR" = "1" ]; then
-      resolve_ref "$DEFAULT_REPO#$BEST_NUMBER"
-      PARENT_CANON="$REF_CANON"
-      PARENT_NODE_ID=$(issue_node_id)
-      FIT_FOUND="true"
+      # A parent is never guessed (simplesalt/projects#885): the closest related Effort is
+      # only suggested. Pass --parent to nest the new Effort, or move it later with
+      # update-effort.sh --parent.
+      PARENT_SUGGESTION="$DEFAULT_REPO#$BEST_NUMBER"
+      echo "note: created top-level; the most related existing Effort is $PARENT_SUGGESTION (score $BEST_SCORE) — pass --parent to nest under it" >&2
     else
       echo "note: no existing Effort is related enough to be the parent (best candidate $DEFAULT_REPO#$BEST_NUMBER scored $BEST_SCORE); created top-level" >&2
     fi
@@ -171,9 +173,10 @@ if [ "$DRY_RUN" = "true" ]; then
   jq -n \
     --arg parent "${PARENT_CANON:-}" \
     --argjson fit "$FIT_FOUND" \
+  --arg suggestion "$PARENT_SUGGESTION" \
     --argjson score "${FIT_SCORE:-null}" \
     --argjson matched "${FIT_MATCHED:-null}" \
-    '{ref: null, url: null, parent: (if $parent == "" then null else $parent end), parent_via_fit_finding: $fit, parent_fit_score: $score, parent_fit_matched: $matched}'
+    '{ref: null, url: null, parent: (if $parent == "" then null else $parent end), parent_via_fit_finding: $fit, parent_suggestion: (if $suggestion == "" then null else $suggestion end), parent_fit_score: $score, parent_fit_matched: $matched}'
   exit 0
 fi
 
@@ -261,6 +264,7 @@ jq -n \
   --arg url "$NEW_URL" \
   --arg parent "${PARENT_CANON:-}" \
   --argjson fit "$FIT_FOUND" \
+  --arg suggestion "$PARENT_SUGGESTION" \
   --argjson score "${FIT_SCORE:-null}" \
   --argjson matched "${FIT_MATCHED:-null}" \
-  '{ref: $ref, url: $url, parent: (if $parent == "" then null else $parent end), parent_via_fit_finding: $fit, parent_fit_score: $score, parent_fit_matched: $matched}'
+  '{ref: $ref, url: $url, parent: (if $parent == "" then null else $parent end), parent_via_fit_finding: $fit, parent_suggestion: (if $suggestion == "" then null else $suggestion end), parent_fit_score: $score, parent_fit_matched: $matched}'

@@ -25,7 +25,8 @@ SECTIONS = [
     "Title", "Assigned", "Parent", "Blockers", "Why", "What", "Indicators",
     "Gaps", "Where", "Facts", "Unknowns", "How", "Tags",
 ]
-WRITE_OPS = {"create_issue", "patch_issue", "set_field", "add_blocked_by", "remove_blocked_by"}
+WRITE_OPS = {"create_issue", "patch_issue", "set_field", "add_blocked_by", "remove_blocked_by",
+             "add_board_item", "add_sub_issue", "remove_sub_issue", "set_type"}
 
 
 def ref(number):
@@ -105,12 +106,13 @@ class Board:
             json.dump(state, handle)
 
     def add(self, number, status, title=None, state="OPEN", parent=None, blocked_by=(), body=None,
-            in_use="", priority=None, assigned="ssint-build-oci"):
+            in_use="", priority=None, assigned="ssint-build-oci", on_board=True, state_reason=None):
         state_doc = self.load()
         state_doc["issues"][str(number)] = {
             "title": title or f"[Feature] Effort {number}",
             "state": state,
-            "state_reason": None,
+            "state_reason": state_reason,
+            "on_board": on_board,
             "body": body if body is not None else render_body(),
             "parent": str(parent) if parent is not None else None,
             "blocked_by": [str(b) for b in blocked_by],
@@ -135,7 +137,8 @@ class Board:
     def field_writes(self, number, field):
         return [e for e in self.calls("set_field") if e["item"] == number and e["field"] == field]
 
-    def run(self, script, *args, session=SESSION):
+    def run(self, script, *args, session=SESSION, env=None):
+        extra = env or {}
         env = dict(os.environ)
         env.update({
             "HOME": self.home,
@@ -144,6 +147,7 @@ class Board:
             "FAKE_GH_STATE": self.state_path,
             "FAKE_GH_LOG": self.log_path,
         })
+        env.update(extra)
         process = subprocess.run(
             [os.path.join(SCRIPT_DIR, script), *[str(a) for a in args]],
             capture_output=True, text=True, env=env, timeout=180,
@@ -466,6 +470,99 @@ class ListingTest(FlowCase):
         roots = result.json[0]["roots"]
         self.assertEqual([(r["ref"], r["classification"]) for r in roots], [(ref(98), "root-deferred")])
 
+
+
+
+PREAMBLE = "<!-- attribution -->\n_Requested by **someone**_"
+
+
+class AdoptOnFirstUseTest(FlowCase):
+    def test_select_adds_an_off_board_issue_and_update_writes_it(self):
+        body = PREAMBLE + "\n\n" + render_body(Assigned="ssint-build-brain")
+        self.board.add(50, "", on_board=False, body=body, assigned="")
+        self.succeeded(self.board.run("select-effort.sh", 50))
+        issue = self.board.issue(50)
+        self.assertEqual((issue["on_board"], issue["status"], issue["assigned"], issue["in_use"]),
+                         (True, "Planning", "ssint-build-brain", HOLDER))
+        self.succeeded(self.board.run("update-effort.sh", 50, "--add-fact", "the loader loads",
+                                      "--evidence", "https://example.com/run/1"))
+        issue = self.board.issue(50)
+        self.assertTrue(issue["body"].startswith(PREAMBLE + "\n\n### Title"), issue["body"][:120])
+        self.assertIn("the loader loads", section(issue["body"], "Facts"))
+        self.assertEqual(self.board.calls("create_issue"), [])
+
+    def test_get_adopts_a_closed_issue_with_its_closing_status(self):
+        self.board.add(51, "", on_board=False, state="CLOSED", state_reason="DUPLICATE", assigned="")
+        out = self.succeeded(self.board.run("get-effort.sh", 51)).json
+        self.assertEqual((out["status"], out["on_board"], out["item_id"]), ("Cancelled", True, "PVTI_51"))
+
+    def test_without_adoption_get_reads_the_issue_and_writes_nothing(self):
+        self.board.add(52, "", on_board=False, assigned="")
+        out = self.succeeded(self.board.run("get-effort.sh", 52, env={"EFFORT_NO_ADOPT": "1"})).json
+        self.assertEqual((out["on_board"], out["status"], out["item_id"]), (False, "", ""))
+        self.assertEqual(self.board.writes(), [])
+
+
+class MoveParentTest(FlowCase):
+    def seed(self):
+        self.board.add(60, "Doing", title="[Feature] Old parent", blocked_by=[62], in_use=OTHER_HOLDER)
+        self.board.add(61, "Doing", title="[Feature] New parent", in_use=OTHER_HOLDER)
+        self.board.add(62, "Planning", title="[Feature] Child", parent=60, in_use=HOLDER,
+                       body=render_body(Title="Child", Parent=ref(60)))
+
+    def test_moving_a_child_moves_its_link_edge_and_body(self):
+        self.seed()
+        out = self.succeeded(self.board.run("update-effort.sh", 62, "--parent", ref(61))).json
+        self.assertIn("parent", out["updated"])
+        child = self.board.issue(62)
+        self.assertEqual(child["parent"], "61")
+        self.assertEqual(section(child["body"], "Parent"), ref(61))
+        self.assertEqual(self.board.issue(60)["blocked_by"], [])
+        self.assertEqual(self.board.issue(61)["blocked_by"], ["62"])
+
+    def test_clearing_the_parent_makes_it_top_level(self):
+        self.seed()
+        self.succeeded(self.board.run("update-effort.sh", 62, "--no-parent"))
+        child = self.board.issue(62)
+        self.assertEqual((child["parent"], section(child["body"], "Parent")), (None, "none"))
+        self.assertEqual(self.board.issue(60)["blocked_by"], [])
+
+    def test_a_descendant_cannot_become_the_parent(self):
+        self.seed()
+        self.board.add(63, "Planning", title="[Feature] Grandchild", parent=62)
+        self.board.add(64, "Planning", title="[Feature] Top", in_use=HOLDER)
+        state = self.board.load()
+        state["issues"]["62"]["in_use"] = OTHER_HOLDER
+        state["issues"]["60"]["in_use"] = HOLDER
+        self.board.save(state)
+        result = self.board.run("update-effort.sh", 60, "--parent", ref(63))
+        self.assertEqual(result.code, 1)
+        self.assertIn("descendant", result.err)
+        self.assertEqual(self.board.writes(), [])
+
+    def test_title_and_type_change_in_place(self):
+        self.seed()
+        self.succeeded(self.board.run("update-effort.sh", 62, "--title", "Renamed child", "--type", "Bug",
+                                      "--what", "a new future state"))
+        child = self.board.issue(62)
+        self.assertEqual((child["title"], child.get("type")), ("[Bug] Renamed child", "Bug"))
+        self.assertEqual(section(child["body"], "Title"), "Renamed child")
+        self.assertEqual(section(child["body"], "What"), "a new future state")
+        self.assertEqual(section(child["body"], "Facts"), "none")
+
+
+class CreateNeverGuessesAParentTest(FlowCase):
+    def test_a_related_effort_is_only_suggested(self):
+        self.board.add(70, "Doing", title="[Feature] Loader pipeline",
+                       body=render_body(Title="Loader pipeline", Why="loader pipeline ingest batches",
+                                        What="loader pipeline ingest batches nightly"))
+        result = self.succeeded(self.board.run(
+            "create-effort.sh", "--title", "Loader retries", "--type", "Feature", "--assigned", "ssint-build-oci",
+            "--why", "loader pipeline ingest batches fail", "--what", "loader pipeline ingest batches retry",
+            "--indicators", "retries happen", "--where", "loader pipeline ingest batches", "--tags", "loader"))
+        out = result.json
+        self.assertEqual(out["parent"], None)
+        self.assertEqual(self.board.issue(100)["parent"], None)
 
 if __name__ == "__main__":
     unittest.main()

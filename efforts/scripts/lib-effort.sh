@@ -286,6 +286,81 @@ set_singleselect_field() {
     --jq '.data.updateProjectV2ItemFieldValue.projectV2Item.id' >/dev/null
 }
 
+# Every issue in $DEFAULT_REPO is an Effort (simplesalt/projects#885). An issue there that
+# has no board row yet is adopted on first use: the row is added, Status is set from the
+# issue's state (open -> Planning, closed completed -> Done, closed otherwise -> Cancelled)
+# and Assigned from the body's Assigned section when that names a known bank. Issues in
+# other repos are never adopted. EFFORT_NO_ADOPT=1 (the read-only doer endpoint) forbids it.
+adoption_allowed() {
+  [ "$REF_OWNER/$REF_REPO" = "$DEFAULT_REPO" ] && [ "${EFFORT_NO_ADOPT:-}" != "1" ]
+}
+
+adopt_board_item() {
+  local raw node state reason body content_id pid item_id status assigned name
+  raw=$(gh api graphql -f query='
+    query($owner:String!, $repo:String!, $number:Int!) {
+      repository(owner:$owner, name:$repo) { issue(number:$number) { id state stateReason body } }
+    }' -f owner="$REF_OWNER" -f repo="$REF_REPO" -F number="$REF_NUMBER" 2>/dev/null) || {
+    echo "error: could not read $REF_CANON to add it to the SimpleSalt Delivery board (API call failed)" >&2
+    return 1
+  }
+  node=$(jq -c '.data.repository.issue // empty' <<<"$raw" 2>/dev/null)
+  if [ -z "$node" ]; then
+    echo "error: $REF_CANON could not be fetched" >&2
+    return 1
+  fi
+  content_id=$(jq -r '.id' <<<"$node")
+  state=$(jq -r '.state // ""' <<<"$node")
+  reason=$(jq -r '.stateReason // ""' <<<"$node")
+  body=$(jq -r '.body // ""' <<<"$node")
+  pid=$(project_id)
+  item_id=$(gh api graphql -f query='
+    mutation($project:ID!, $content:ID!) {
+      addProjectV2ItemById(input:{projectId:$project, contentId:$content}) { item { id } }
+    }' -f project="$pid" -f content="$content_id" --jq '.data.addProjectV2ItemById.item.id' 2>/dev/null) || item_id=""
+  if [ -z "$item_id" ]; then
+    echo "error: could not add $REF_CANON to the SimpleSalt Delivery board" >&2
+    return 1
+  fi
+  case "$state:$reason" in
+    OPEN:*)             status="Planning" ;;
+    CLOSED:COMPLETED)   status="Done" ;;
+    *)                  status="Cancelled" ;;
+  esac
+  set_singleselect_field "$item_id" "Status" "$status" || return 1
+  assigned=$(python3 -c '
+import re, sys
+m = re.search(r"^### Assigned[ \t]*\n+([^\n#][^\n]*)", sys.argv[1], re.M)
+print(m.group(1).strip() if m else "")
+' "$body" 2>/dev/null) || assigned=""
+  if [ -n "$assigned" ]; then
+    for name in $EFFORT_BANKS; do
+      if [ "$name" = "$assigned" ]; then
+        set_singleselect_field "$item_id" "Assigned" "$assigned" || return 1
+        break
+      fi
+    done
+  fi
+  echo "note: $REF_CANON was not on the SimpleSalt Delivery board; added it with Status $status" >&2
+  printf '%s' "$item_id"
+}
+
+# Board row id for $REF_*, adopting the issue when it has none. Returns 1 when the issue
+# has no row and may not be adopted, 2 when the board cannot be read.
+ensure_board_item() {
+  local id rc
+  if id=$(project_item_id); then
+    printf '%s' "$id"
+    return 0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 2 ] && return 2
+  adoption_allowed || return 1
+  id=$(adopt_board_item) || return 2
+  printf '%s' "$id"
+}
+
 effort_body_field() {
   local body="$1" heading="$2" tmpfile result
   tmpfile=$(mktemp)

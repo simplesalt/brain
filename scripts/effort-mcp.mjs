@@ -45,7 +45,7 @@ function holderParts(label) {
 
 class UserError extends Error {}
 
-function run(script, args, label) {
+function run(script, args, label, role) {
   const env = {
     PATH: `${SHIM_DIR}:${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}`,
     HOME: STATE,
@@ -56,6 +56,9 @@ function run(script, args, label) {
     LC_ALL: 'C.UTF-8',
     EFFORT_HOLDER_HOST: DEFAULT_HOST,
   };
+  // Every simplesalt/projects issue is an Effort; the scripts add one to the board on first
+  // use (simplesalt/projects#885). Doers never write, so they read such an issue as-is.
+  if (role !== 'coordinator') env.EFFORT_NO_ADOPT = '1';
   if (label !== undefined) {
     const { host, session } = holderParts(label);
     env.EFFORT_HOLDER_HOST = host;
@@ -107,7 +110,7 @@ const STATUSES = ['Planning', 'Doing', 'Blocked', 'Review', 'Done', 'Paused', 'D
 
 const TOOLS = {
   effort_find: {
-    description: 'Find open Efforts on the SimpleSalt Delivery board related to a Why/What/Where (find-effort).',
+    description: 'Find open Efforts in simplesalt/projects related to a Why/What/Where (find-effort).',
     inputSchema: { type: 'object', properties: { why: S, what: S, where: S, limit: { type: 'integer' } } },
     write: false,
     argv: (a) => {
@@ -117,7 +120,7 @@ const TOOLS = {
     },
   },
   effort_get: {
-    description: 'Read one Effort record: status, assigned, In Use, parent, blockers, body, children (get-effort).',
+    description: 'Read one Effort record: status, assigned, In Use, parent, blockers, body, children (get-effort). Every simplesalt/projects issue is an Effort; one not yet on the board is added on first use (coordinator), or read with on_board false (doer).',
     inputSchema: { type: 'object', properties: { ref: REF }, required: ['ref'] },
     write: false,
     argv: (a) => ['get-effort.sh', need(a, 'ref')],
@@ -129,7 +132,7 @@ const TOOLS = {
       properties: {
         title: S, type: { type: 'string', enum: ['Feature', 'Bug', 'Analysis', 'Advisory'] }, assigned: S,
         why: S, what: S, indicators: S, where: S, gaps: S, facts: S, unknowns: S, how: S, tags: S,
-        parent: { type: 'string', description: 'Parent ref, or "none" for no parent; omitted = auto-fit' },
+        parent: { type: 'string', description: 'Parent ref, or "none". Omitted = top-level; the most related open Effort, if any, is returned as parent_suggestion and never applied' },
         blockers: { type: 'array', items: S }, status: { type: 'string', enum: ['Planning', 'Deferred'] },
         dry_run: { type: 'boolean' },
       },
@@ -165,12 +168,15 @@ const TOOLS = {
     argv: (a) => ['release-effort.sh', need(a, 'ref')],
   },
   effort_update: {
-    description: 'Update an Effort the session holds: status (gated, force overrides), assigned, and item operations, run in the order given (update-effort).',
+    description: 'Update an Effort the session holds: status (gated, force overrides), assigned, title, type, parent ("none" clears it), the Why/What/Where/Tags text (each replaced whole, schema-checked), and item operations, run in the order given (update-effort).',
     inputSchema: {
       type: 'object',
       properties: {
         ref: REF, session: SESSION,
         status: { type: 'string', enum: STATUSES }, force: { type: 'boolean' }, assigned: S, reconcile: { type: 'boolean' },
+        title: S, type: { type: 'string', enum: ['Feature', 'Bug', 'Analysis', 'Advisory'] },
+        parent: { type: 'string', description: 'New parent ref, or "none" to make it top-level. Moves the sub-issue link and the parent blocker edge' },
+        why: S, what: S, where: S, tags: S,
         add_gap: { anyOf: [S, { type: 'array', items: S }] }, resolve_gap: CLOSE, cancel_gap: CLOSE,
         add_unknown: { anyOf: [S, { type: 'array', items: S }] }, resolve_unknown: CLOSE, cancel_unknown: CLOSE,
         add_fact: { type: 'object', properties: { text: S, evidence: S }, required: ['text'] },
@@ -192,6 +198,15 @@ const TOOLS = {
           case 'force': if (val === true) v.push('--force'); break;
           case 'reconcile': if (val === true) v.push('--reconcile'); break;
           case 'assigned': v.push('--assigned', String(val)); break;
+          case 'title': case 'type': case 'why': case 'what': case 'where': case 'tags':
+            v.push(`--${k}`, String(val));
+            break;
+          case 'parent': {
+            const p = String(val).trim();
+            if (!p) throw new UserError('error: parent must be a ref or "none"');
+            if (p.toLowerCase() === 'none') v.push('--no-parent'); else v.push('--parent', p);
+            break;
+          }
           case 'add_gap': case 'add_unknown': case 'add_indicator':
             for (const t of list(val)) v.push(`--${k.replace('_', '-')}`, String(t));
             break;
@@ -258,7 +273,7 @@ async function callTool(role, name, args) {
     if (e instanceof UserError) return errResult(e.message);
     throw e;
   }
-  const exec = () => run(argv[0], argv.slice(1), held ? a.session : undefined);
+  const exec = () => run(argv[0], argv.slice(1), held ? a.session : undefined, role);
   const r = t.write ? await serial(exec) : await exec();
   const out = r.out.trim(), err = r.err.trim();
   console.log(JSON.stringify({ at: new Date().toISOString(), role, tool: name, session: held ? a.session : undefined, ref: a.ref, code: r.code }));

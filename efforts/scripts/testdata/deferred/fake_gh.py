@@ -162,8 +162,12 @@ def child_node(number):
         **issue_ref(number),
         "title": item["title"],
         "state": item["state"],
-        "projectItems": {"nodes": [project_item(number, item)]},
+        "projectItems": {"nodes": board_rows(number, item)},
     }
+
+
+def board_rows(number, item):
+    return [project_item(number, item)] if item.get("on_board", True) else []
 
 
 def issue_node(number):
@@ -184,13 +188,15 @@ def issue_node(number):
             for b in item["blocked_by"]
         ]},
         "subIssues": {"nodes": [child_node(c) for c in children_of(number)]},
-        "projectItems": {"nodes": [project_item(number, item)]},
+        "projectItems": {"nodes": board_rows(number, item)},
     }
 
 
 def board_items():
     nodes = []
     for number, item in STATE["issues"].items():
+        if not item.get("on_board", True):
+            continue
         node = issue_node(number)
         nodes.append({
             "id": "PVTI_" + number,
@@ -306,8 +312,65 @@ def aliased_nodes(query, variables):
     finish({"data": data})
 
 
+def add_board_item(variables):
+    if variables.get("project") != PROJECT_ID:
+        fail("Could not resolve to a ProjectV2")
+    number = number_of(variables["content"])
+    item = issue_of(number)
+    if item is None:
+        fail("Could not resolve to an issue")
+    item["on_board"] = True
+    save()
+    log("add_board_item", number=int(number))
+    finish({"data": {"addProjectV2ItemById": {"item": {"id": "PVTI_" + number}}}})
+
+
+def change_sub_issue(query, variables):
+    adding = "addSubIssue(" in query
+    parent = number_of(variables["parent"])
+    child = number_of(variables["child"])
+    item = issue_of(child)
+    if item is None or issue_of(parent) is None:
+        fail("Could not resolve to an issue")
+    if adding:
+        if item.get("parent") and "replaceParent:true" not in query.replace(" ", ""):
+            fail("Issue may not contain duplicate sub-issues / already has a parent")
+        item["parent"] = parent
+    else:
+        if item.get("parent") != parent:
+            fail("the issue is not a sub-issue of this parent")
+        item["parent"] = None
+    save()
+    log("add_sub_issue" if adding else "remove_sub_issue", parent=int(parent), child=int(child))
+    finish({"data": {"addSubIssue" if adding else "removeSubIssue": {"issue": {"id": variables["parent"]}}}})
+
+
+def update_issue_type(variables):
+    number = number_of(variables["id"])
+    item = issue_of(number)
+    if item is None:
+        fail("Could not resolve to an issue")
+    item["type"] = variables["type"].split("_", 1)[1]
+    save()
+    log("set_type", number=int(number), type=item["type"])
+    finish({"data": {"updateIssue": {"issue": {"id": variables["id"]}}}})
+
+
 def graphql(query, variables):
     q = " ".join(query.split())
+    if "... on ProjectV2Item { fieldValueByName(name:$field)" in q:
+        item = issue_of(number_of(variables["item"]))
+        if item is None or not item.get("on_board", True):
+            finish({"data": {"node": None}})
+        key = {"Status": "status", "Assigned": "assigned", "In Use": "in_use"}[variables["field"]]
+        value = item.get(key)
+        finish({"data": {"node": {"fieldValueByName": ({"text": value, "name": value} if value else None)}}})
+    if "addProjectV2ItemById(" in q:
+        add_board_item(variables)
+    if "addSubIssue(" in q or "removeSubIssue(" in q:
+        change_sub_issue(q, variables)
+    if "updateIssue(input" in q:
+        update_issue_type(variables)
     if "createIssue(input" in q:
         create_issue(variables)
     if "addBlockedBy(" in q or "removeBlockedBy(" in q:
@@ -343,10 +406,12 @@ def patch_issue(number, fields):
     item = issue_of(number)
     if item is None:
         fail("Not Found (HTTP 404)")
-    if not set(fields) <= {"body", "state", "state_reason"}:
+    if not set(fields) <= {"body", "state", "state_reason", "title"}:
         unhandled("PATCH with fields " + ",".join(sorted(fields)))
     if "body" in fields:
         item["body"] = fields["body"]
+    if "title" in fields:
+        item["title"] = fields["title"]
     if "state" in fields:
         item["state"] = fields["state"].upper()
         item["state_reason"] = fields["state_reason"].upper() if item["state"] == "CLOSED" and "state_reason" in fields else None
@@ -368,6 +433,13 @@ def rest(opts):
                 fail("Not Found (HTTP 404)")
             log("read_issue_id", number=int(number))
             finish({"node_id": "I_" + number, "number": int(number), "state": item["state"]})
+    if endpoint == "search/issues" and opts["method"] == "GET":
+        log("search")
+        items = [
+            {"number": int(n), "title": i["title"], "html_url": f"https://github.com/{REPO}/issues/{n}", "body": i["body"]}
+            for n, i in STATE["issues"].items() if i["state"] == "OPEN"
+        ]
+        finish({"items": items})
     if re.fullmatch(r"repos/[^/]+/[^/]+", endpoint) and endpoint[len("repos/"):] == REPO and opts["method"] == "GET":
         log("read_repo_id")
         finish({"node_id": REPO_NODE_ID})

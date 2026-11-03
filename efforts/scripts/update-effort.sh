@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/lib-effort.sh"
 EFFORT_SCHEMA="$SCRIPT_DIR/effort_schema.py"
 
-USAGE="usage: update-effort.sh <owner/repo#N> [--status <Planning|Doing|Blocked|Review|Done|Paused|Deferred|Cancelled>] [--force] [--reconcile] [--assigned <bank>] [--why <text>] [--what <text>] [--indicators <text>] [--gaps <text>] [--where <text>] [--facts <text>] [--unknowns <text>] [--how <text>] [--tags <text>] [--add-gap <text>] [--resolve-gap <id> [--note <text>]] [--cancel-gap <id> [--note <text>]] [--add-unknown <text>] [--resolve-unknown <id> [--note <text>]] [--cancel-unknown <id> [--note <text>]] [--add-fact <text> --evidence <ref>] [--add-indicator <text>] [--add-task <text> [--task-blockers <none|refs>] [--task-indicators <text>]] [--check-task <id>] [--cancel-task <id> [--note <text>]]"
+USAGE="usage: update-effort.sh <owner/repo#N> [--status <Planning|Doing|Blocked|Review|Done|Paused|Deferred|Cancelled>] [--force] [--reconcile] [--assigned <bank>] [--title <text>] [--type <Feature|Bug|Analysis|Advisory>] [--parent <ref> | --no-parent] [--why <text>] [--what <text>] [--indicators <text>] [--gaps <text>] [--where <text>] [--facts <text>] [--unknowns <text>] [--how <text>] [--tags <text>] [--add-gap <text>] [--resolve-gap <id> [--note <text>]] [--cancel-gap <id> [--note <text>]] [--add-unknown <text>] [--resolve-unknown <id> [--note <text>]] [--cancel-unknown <id> [--note <text>]] [--add-fact <text> --evidence <ref>] [--add-indicator <text>] [--add-task <text> [--task-blockers <none|refs>] [--task-indicators <text>]] [--check-task <id>] [--cancel-task <id> [--note <text>]]"
 
 case "${1:-}" in
   -h|--help) echo "$USAGE"; exit 0 ;;
@@ -16,6 +16,10 @@ shift
 
 STATUS=""
 ASSIGNED=""
+NEW_TYPE=""
+PARENT_CHANGE=0
+PARENT_FLAGS=0
+NEW_PARENT_REF=""
 FORCE=0
 RECONCILE=0
 declare -A NEWVAL=()
@@ -106,6 +110,10 @@ while [ $# -gt 0 ]; do
     --status)           STATUS="${2:?--status requires a value}"; shift 2 ;;
     --assigned)         ASSIGNED="${2:?--assigned requires a value}"; shift 2 ;;
     --force)            FORCE=1; shift ;;
+    --title)            NEWVAL[Title]="${2:?--title requires a value}"; ISSET[Title]=1; shift 2 ;;
+    --type)             NEW_TYPE="${2:?--type requires a value}"; shift 2 ;;
+    --parent)           NEW_PARENT_REF="${2:?--parent requires a value}"; PARENT_CHANGE=1; PARENT_FLAGS=$((PARENT_FLAGS + 1)); shift 2 ;;
+    --no-parent)        NEW_PARENT_REF=""; PARENT_CHANGE=1; PARENT_FLAGS=$((PARENT_FLAGS + 1)); shift ;;
     --reconcile)        RECONCILE=1; shift ;;
     --why)              NEWVAL[Why]="${2:?--why requires a value}"; ISSET[Why]=1; shift 2 ;;
     --what)             NEWVAL[What]="${2:?--what requires a value}"; ISSET[What]=1; shift 2 ;;
@@ -135,7 +143,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$STATUS" ] && [ -z "$ASSIGNED" ] && [ "${#ISSET[@]}" -eq 0 ] && [ "${#OP_KIND[@]}" -eq 0 ] && [ "$RECONCILE" -eq 0 ]; then
+if [ "$PARENT_FLAGS" -gt 1 ]; then
+  echo "error: pass --parent or --no-parent once" >&2
+  echo "$USAGE" >&2
+  exit 1
+fi
+
+if [ -n "$NEW_TYPE" ]; then
+  validate_effort_type "$NEW_TYPE" || exit 1
+fi
+
+if [ -z "$STATUS" ] && [ -z "$ASSIGNED" ] && [ -z "$NEW_TYPE" ] && [ "$PARENT_CHANGE" -eq 0 ] && [ "${#ISSET[@]}" -eq 0 ] && [ "${#OP_KIND[@]}" -eq 0 ] && [ "$RECONCILE" -eq 0 ]; then
   echo "error: nothing to update — pass at least one field, or --reconcile to re-evaluate status alone" >&2
   echo "$USAGE" >&2
   exit 1
@@ -167,7 +185,30 @@ rm -f "$GET_ERR_TMP"
 ITEM_ID=$(jq -r '.item_id' <<<"$RECORD_JSON")
 IN_USE=$(jq -r '.in_use' <<<"$RECORD_JSON")
 RECORD_STATUS=$(jq -r '.status' <<<"$RECORD_JSON")
-BODY=$(jq -r '.body' <<<"$RECORD_JSON")
+BODY_FULL=$(jq -r '.body' <<<"$RECORD_JSON")
+# Text above the first '### ' heading (such as a requester attribution line) is not part of
+# the Effort schema: it is set aside here and written back unchanged above the record.
+PREAMBLE=$(python3 -c '
+import re, sys
+m = re.search(r"^### ", sys.argv[1], re.M)
+print(sys.argv[1][:m.start()].strip("\n") if m else "")
+' "$BODY_FULL")
+if [ -n "$PREAMBLE" ]; then
+  BODY=$(python3 -c '
+import re, sys
+m = re.search(r"^### ", sys.argv[1], re.M)
+sys.stdout.write(sys.argv[1][m.start():])
+' "$BODY_FULL")
+else
+  BODY="$BODY_FULL"
+fi
+with_preamble() {
+  if [ -n "$PREAMBLE" ]; then
+    printf '%s\n\n%s' "$PREAMBLE" "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
 OPEN_CHILDREN=$(jq -r '.open_children' <<<"$RECORD_JSON")
 OPEN_DEFERRED_CHILDREN=$(jq -r '.open_deferred_children' <<<"$RECORD_JSON")
 GATE_OPEN_CHILDREN=$((OPEN_CHILDREN - OPEN_DEFERRED_CHILDREN))
@@ -183,6 +224,59 @@ HOLDER="$(hostname)/${CLAUDE_CODE_SESSION_ID:?CLAUDE_CODE_SESSION_ID not set}"
 if [ "$IN_USE" != "$HOLDER" ]; then
   echo "error: $REF_CANON must be selected by this session before updating (run select-effort.sh first) — currently ${IN_USE:-unselected}" >&2
   exit 1
+fi
+
+SELF_CANON="$REF_CANON"
+SELF_ID=""
+OLD_PARENT_ID=""
+NEW_PARENT_ID=""
+NEW_PARENT_CANON=""
+if [ "$PARENT_CHANGE" -eq 1 ]; then
+  SELF_ID=$(issue_node_id)
+  if [ -n "$PARENT_ORIG" ]; then
+    resolve_ref "$PARENT_ORIG"
+    OLD_PARENT_ID=$(issue_node_id)
+  fi
+  if [ -n "$NEW_PARENT_REF" ]; then
+    resolve_ref "$NEW_PARENT_REF"
+    NEW_PARENT_CANON="$REF_CANON"
+    if [ "$REF_OWNER/$REF_REPO" != "$DEFAULT_REPO" ]; then
+      echo "error: refused — the parent must be an Effort in $DEFAULT_REPO (got $NEW_PARENT_CANON)" >&2
+      exit 1
+    fi
+    NEW_PARENT_ID=$(issue_node_id 2>/dev/null) || NEW_PARENT_ID=""
+    if [ -z "$NEW_PARENT_ID" ]; then
+      echo "error: parent '$NEW_PARENT_REF' does not exist" >&2
+      exit 1
+    fi
+    if [ "$NEW_PARENT_ID" = "$SELF_ID" ]; then
+      echo "error: refused — $SELF_CANON cannot be its own parent" >&2
+      exit 1
+    fi
+    if [ "$NEW_PARENT_CANON" = "$PARENT_ORIG" ]; then
+      echo "note: $SELF_CANON is already a child of $NEW_PARENT_CANON; parent unchanged" >&2
+      PARENT_CHANGE=0
+    else
+      if descendant_chain_contains "$SELF_ID" "$NEW_PARENT_ID"; then
+        echo "error: refused — $NEW_PARENT_CANON is a descendant of $SELF_CANON, so making it the parent would close a loop" >&2
+        exit 1
+      fi
+      guard_policy_depth "$NEW_PARENT_ID" "$NEW_PARENT_CANON" "$(height_of "$SELF_ID")" "$SELF_CANON" "moving" || exit 1
+      guard_fanout "$NEW_PARENT_ID" "$NEW_PARENT_CANON" || exit 1
+    fi
+  elif [ -z "$PARENT_ORIG" ]; then
+    echo "note: $SELF_CANON has no parent; nothing to clear" >&2
+    PARENT_CHANGE=0
+  fi
+  resolve_ref "$SELF_CANON"
+  if [ "$PARENT_CHANGE" -eq 1 ]; then
+    ISSET[Parent]=1
+    NEWVAL[Parent]="${NEW_PARENT_CANON:-none}"
+  fi
+  if [ "$PARENT_CHANGE" -eq 0 ] && [ -z "$STATUS" ] && [ -z "$ASSIGNED" ] && [ -z "$NEW_TYPE" ] && [ "${#ISSET[@]}" -eq 0 ] && [ "${#OP_KIND[@]}" -eq 0 ] && [ "$RECONCILE" -eq 0 ]; then
+    jq -n --arg ref "$SELF_CANON" '{ref: $ref, updated: []}'
+    exit 0
+  fi
 fi
 
 schema_call() {
@@ -245,7 +339,7 @@ if [ "$HAS_BODY_CHANGES" -eq 1 ]; then
     declare "CUR_$name=$val"
   done
 
-  for name in Assigned Why What Indicators Gaps Where Facts Unknowns How Tags; do
+  for name in Title Assigned Parent Why What Indicators Gaps Where Facts Unknowns How Tags; do
     if [ -n "${ISSET[$name]:-}" ]; then
       declare "CUR_$name=${NEWVAL[$name]}"
       case "$name" in
@@ -491,6 +585,49 @@ if [ "$STATUS" = "Done" ] && { [ "${GATE_RC:-1}" -eq 0 ] || [ "$FORCE" -eq 1 ]; 
   DONE_REDIRECTED=1
 fi
 
+if [ "$PARENT_CHANGE" -eq 1 ]; then
+  if [ -n "$NEW_PARENT_ID" ]; then
+    gh api graphql -f query='
+      mutation($parent:ID!, $child:ID!) {
+        addSubIssue(input:{issueId:$parent, subIssueId:$child, replaceParent:true}) { issue { id } }
+      }' -f parent="$NEW_PARENT_ID" -f child="$SELF_ID" >/dev/null
+  else
+    gh api graphql -f query='
+      mutation($parent:ID!, $child:ID!) {
+        removeSubIssue(input:{issueId:$parent, subIssueId:$child}) { issue { id } }
+      }' -f parent="$OLD_PARENT_ID" -f child="$SELF_ID" >/dev/null
+  fi
+  mark_updated parent
+fi
+
+TITLE_FINAL="$TITLE_ORIG"
+if [ -n "${ISSET[Title]:-}" ] || [ -n "$NEW_TYPE" ]; then
+  read -r CUR_TYPE TITLE_TEXT < <(python3 -c '
+import re, sys
+m = re.match(r"\[(\w+)\] (.*)", sys.argv[1], re.S)
+print((m.group(1) + " " + m.group(2)) if m else ("- " + sys.argv[1]))
+' "$TITLE_ORIG")
+  [ "$CUR_TYPE" = "-" ] && CUR_TYPE=""
+  [ -n "${ISSET[Title]:-}" ] && TITLE_TEXT="${NEWVAL[Title]}"
+  TYPE_FINAL="${NEW_TYPE:-$CUR_TYPE}"
+  if [ -n "$TYPE_FINAL" ]; then TITLE_FINAL="[$TYPE_FINAL] $TITLE_TEXT"; else TITLE_FINAL="$TITLE_TEXT"; fi
+  if [ -n "$NEW_TYPE" ]; then
+    TYPE_ID=$(resolve_issue_type_id "$NEW_TYPE")
+    if [ -z "$TYPE_ID" ]; then
+      echo "error: no issue type named '$NEW_TYPE' in org $ORG" >&2
+      exit 1
+    fi
+    [ -n "$SELF_ID" ] || SELF_ID=$(issue_node_id)
+    gh api graphql -f query='
+      mutation($id:ID!, $type:ID!) { updateIssue(input:{id:$id, issueTypeId:$type}) { issue { id } } }' \
+      -f id="$SELF_ID" -f type="$TYPE_ID" >/dev/null
+    mark_updated type
+  fi
+  if [ "$TITLE_FINAL" != "$TITLE_ORIG" ]; then
+    gh api -X PATCH "repos/$REF_OWNER/$REF_REPO/issues/$REF_NUMBER" -f title="$TITLE_FINAL" >/dev/null
+  fi
+fi
+
 if [ -n "$STATUS" ]; then
   case "$STATUS" in
     Done)      gh api -X PATCH "repos/$REF_OWNER/$REF_REPO/issues/$REF_NUMBER" -f state=closed -f state_reason=completed >/dev/null ;;
@@ -508,7 +645,7 @@ if [ -n "$ASSIGNED" ]; then
 fi
 
 if [ "$HAS_BODY_CHANGES" -eq 1 ]; then
-  gh api -X PATCH "repos/$REF_OWNER/$REF_REPO/issues/$REF_NUMBER" -f body="$FINAL_BODY" >/dev/null
+  gh api -X PATCH "repos/$REF_OWNER/$REF_REPO/issues/$REF_NUMBER" -f body="$(with_preamble "$FINAL_BODY")" >/dev/null
 fi
 
 if [ "$DONE_REDIRECTED" -eq 1 ] && [ -n "$REDIRECT_PRIORITY" ]; then
@@ -533,6 +670,29 @@ if [ "$DERIVED" != "${RESULTING_STATUS:-Empty}" ]; then
   FINAL_STATUS="$DERIVED"
   set_singleselect_field "$ITEM_ID" "Status" "$DERIVED"
   mark_updated status
+fi
+
+PARENT_FINAL="$PARENT_ORIG"
+if [ "$PARENT_CHANGE" -eq 1 ]; then
+  PARENT_FINAL="$NEW_PARENT_CANON"
+  OLD_PARENT_BLOCKERS=""
+  [ -n "$OLD_PARENT_ID" ] && OLD_PARENT_BLOCKERS=$(node_blocker_ids "$OLD_PARENT_ID")
+  if [ -n "$OLD_PARENT_ID" ] && grep -qxF "$SELF_ID" <<<"$OLD_PARENT_BLOCKERS"; then
+    "$SCRIPT_DIR/project-depend.sh" remove "$PARENT_ORIG" --blocked-by "$SELF_CANON" >&2 || \
+      echo "warning: could not remove $SELF_CANON as a blocker of its old parent $PARENT_ORIG" >&2
+  fi
+  if [ -n "$NEW_PARENT_ID" ]; then
+    case "$FINAL_STATUS" in
+      Deferred|Done|Cancelled) ;;
+      *)
+        "$SCRIPT_DIR/project-depend.sh" add "$NEW_PARENT_CANON" --blocked-by "$SELF_CANON" >&2 || \
+          echo "warning: could not record $SELF_CANON as a blocker of its new parent $NEW_PARENT_CANON" >&2
+        ;;
+    esac
+  fi
+  if [ "$FINAL_STATUS" = "Deferred" ] && [ -n "$PARENT_ORIG" ]; then
+    echo "note: $SELF_CANON is Deferred; its old parent $PARENT_ORIG may still name it in its Gaps or How" >&2
+  fi
 fi
 
 SHOW_RECORD=0
@@ -560,14 +720,14 @@ OUT=$(jq -n --arg ref "$REF_CANON" --argjson fields "$FIELDS_JSON" '{ref: $ref, 
 if [ "$SHOW_RECORD" -eq 1 ]; then
   RECORD_JSON_OUT=$(jq -n \
     --arg ref "$REF_CANON" \
-    --arg title "$TITLE_ORIG" \
+    --arg title "$TITLE_FINAL" \
     --arg state "$STATE_FOR_RECORD" \
     --arg status "$FINAL_STATUS" \
     --arg assigned "$ASSIGNED_FOR_RECORD" \
     --arg in_use "$IN_USE" \
-    --arg parent "$PARENT_ORIG" \
+    --arg parent "$PARENT_FINAL" \
     --argjson blockers "$BLOCKERS_ORIG" \
-    --arg body "$FINAL_BODY" \
+    --arg body "$(with_preamble "$FINAL_BODY")" \
     --argjson open_children "$OPEN_CHILDREN" \
     --argjson open_blockers "$OPEN_BLOCKERS" \
     --arg item_id "$ITEM_ID" \
@@ -585,7 +745,7 @@ if [ "$DONE_REDIRECTED" -eq 1 ]; then
 fi
 
 SYNC_NEEDED=0
-if [ -n "$PARENT_ORIG" ]; then
+if [ -n "$PARENT_FINAL" ]; then
   if [ "$FINAL_STATUS" = "Deferred" ] && [ "$RECORD_STATUS" != "Deferred" ]; then
     SYNC_NEEDED=1
   elif [ "$RECORD_STATUS" = "Deferred" ]; then
@@ -610,8 +770,8 @@ if [ "$SYNC_NEEDED" -eq 1 ]; then
     OUT=$(jq --argjson sync "$SYNC_OUT" '. + {parent_sync: $sync}' <<<"$OUT")
   else
     SYNC_FAILED=1
-    echo "error: $REF_CANON itself was updated, but syncing its parent $PARENT_ORIG failed (exit $SYNC_RC) — the parent still shows the old state; re-run: sync-deferred-parent.sh $REF_CANON" >&2
-    OUT=$(jq --arg parent "$PARENT_ORIG" --argjson rc "$SYNC_RC" --arg err "$SYNC_ERR" \
+    echo "error: $REF_CANON itself was updated, but syncing its parent $PARENT_FINAL failed (exit $SYNC_RC) — the parent still shows the old state; re-run: sync-deferred-parent.sh $REF_CANON" >&2
+    OUT=$(jq --arg parent "$PARENT_FINAL" --argjson rc "$SYNC_RC" --arg err "$SYNC_ERR" \
       '. + {parent_sync: {parent: $parent, exit_code: $rc, error: (if $err == "" then "sync-deferred-parent.sh failed without output" else $err end)}}' <<<"$OUT")
   fi
 fi

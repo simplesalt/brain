@@ -90,9 +90,22 @@ ITEM=$(echo "$ISSUE" | jq -c --argjson n "$BOARD_NUMBER" '
   [(.projectItems.nodes // [])[] | select(.project.number == $n)] | first // empty
 ' 2>/dev/null)
 
+ON_BOARD=true
 if [ -z "$ITEM" ]; then
-  echo "error: $REF_CANON is not on the SimpleSalt Delivery board (number $BOARD_NUMBER)" >&2
-  exit 1
+  if adoption_allowed; then
+    if [ -n "${EFFORT_ADOPTED:-}" ]; then
+      echo "error: $REF_CANON was added to the SimpleSalt Delivery board but its row is not visible yet — retry" >&2
+      exit 1
+    fi
+    adopt_board_item >/dev/null || exit 1
+    EFFORT_ADOPTED=1 exec "$0" "$REF_CANON"
+  elif [ "$REF_OWNER/$REF_REPO" = "$DEFAULT_REPO" ]; then
+    ON_BOARD=false
+    ITEM='{}'
+  else
+    echo "error: $REF_CANON is not on the SimpleSalt Delivery board (number $BOARD_NUMBER), and only $DEFAULT_REPO issues are Efforts" >&2
+    exit 1
+  fi
 fi
 
 field_value_from_item() {
@@ -169,4 +182,5 @@ jq -n \
   --arg item_id "$ITEM_ID" \
   --argjson children "$CHILDREN" \
   --argjson open_deferred_children "$OPEN_DEFERRED_CHILDREN" \
-  '{ref: $ref, title: $title, state: $state, status: $status, assigned: $assigned, in_use: $in_use, parent: $parent, blockers: $blockers, body: $body, open_children: $open_children, open_blockers: $open_blockers, item_id: $item_id, children: $children, open_deferred_children: $open_deferred_children}'
+  --argjson on_board "$ON_BOARD" \
+  '{ref: $ref, title: $title, state: $state, status: $status, assigned: $assigned, in_use: $in_use, parent: $parent, blockers: $blockers, body: $body, open_children: $open_children, open_blockers: $open_blockers, item_id: $item_id, children: $children, open_deferred_children: $open_deferred_children, on_board: $on_board}'

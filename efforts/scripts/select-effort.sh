@@ -12,7 +12,7 @@ REF="${1:?usage: select-effort.sh <owner/repo#N>}"
 
 resolve_ref "$REF"
 
-if ITEM_ID=$(project_item_id); then
+if ITEM_ID=$(ensure_board_item); then
   ITEM_RC=0
 else
   ITEM_RC=$?
