@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Cluster-local Effort MCP server (simplesalt/projects#865).
-// Runs inside the builder image and executes the SAME Effort scripts the builder sessions
-// run (/etc/claude-code/scripts), so every schema rule, refusal message and status
-// transition is the scripts' own. This file only maps MCP tool calls onto script argv
+// Executes the Effort scripts in efforts/scripts of this repo, mounted at /opt/efforts/scripts:
+// the only copy of the Effort logic (simplesalt/projects#868), so every schema rule, refusal
+// message and status transition is the scripts' own. The pinned builder image is only the
+// bash/gh/jq/python3/node runtime. This file only maps MCP tool calls onto script argv
 // (no shell) and returns stdout, or stderr as an isError result on a non-zero exit.
 //
 // Endpoints (Streamable HTTP, stateless, JSON responses):
@@ -16,7 +17,7 @@ import { mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 
 const PORT = Number(process.env.PORT ?? 8080);
-const SCRIPTS = process.env.SCRIPTS_DIR ?? '/etc/claude-code/scripts';
+const SCRIPTS = process.env.SCRIPTS_DIR ?? '/opt/efforts/scripts';
 const STATE = process.env.HOME ?? '/state';
 const DEFAULT_HOST = process.env.HOLDER_HOST ?? 'efforts';
 const TIMEOUT_MS = Number(process.env.SCRIPT_TIMEOUT_MS ?? 120_000);

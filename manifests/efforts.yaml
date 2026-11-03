@@ -78,8 +78,10 @@ spec:
               value: "8080"
             - name: HOME
               value: /state
+            # The server's own copy of the Effort scripts (efforts/scripts in this repo, the
+            # only copy: simplesalt/projects#868). The image is just the bash/gh/jq/python3/node runtime.
             - name: SCRIPTS_DIR
-              value: /etc/claude-code/scripts
+              value: /opt/efforts/scripts
             - name: HOLDER_HOST
               value: efforts
             - name: GH_TOKEN
@@ -116,6 +118,9 @@ spec:
             - name: app
               mountPath: /app
               readOnly: true
+            - name: scripts
+              mountPath: /opt/efforts/scripts
+              readOnly: true
             - name: state
               mountPath: /state
             - name: tmp
@@ -124,6 +129,10 @@ spec:
         - name: app
           configMap:
             name: effort-mcp-script
+        - name: scripts
+          configMap:
+            name: effort-scripts
+            defaultMode: 0555
         - name: state
           emptyDir:
             sizeLimit: 64Mi
@@ -170,9 +179,13 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: cluster-named-routing
-        # builder sessions, for in-cluster checks
+        # builder sessions: their Effort tools are this server's /mcp/coordinator
+        # (simplesalt/projects#867)
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ssint-main-coding
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fe-main-coding
       ports:
         - port: 8080

@@ -139,6 +139,27 @@ configMapGenerator:
         entity: ssint
         env: main
         capability: voice
+  - name: effort-scripts
+    namespace: ssint-main-efforts
+    options:
+      labels:
+        entity: ssint
+        env: main
+        capability: efforts
+    files:
+      - create-effort.sh=efforts/scripts/create-effort.sh
+      - find-effort.sh=efforts/scripts/find-effort.sh
+      - get-effort.sh=efforts/scripts/get-effort.sh
+      - select-effort.sh=efforts/scripts/select-effort.sh
+      - release-effort.sh=efforts/scripts/release-effort.sh
+      - update-effort.sh=efforts/scripts/update-effort.sh
+      - project-depend.sh=efforts/scripts/project-depend.sh
+      - lib-effort.sh=efforts/scripts/lib-effort.sh
+      - lib-project.sh=efforts/scripts/lib-project.sh
+      - effort_schema.py=efforts/scripts/effort_schema.py
+      - sync-deferred-parent.sh=efforts/scripts/sync-deferred-parent.sh
+      - find-stalled-efforts.sh=efforts/scripts/find-stalled-efforts.sh
+      - explain-blocked-effort.sh=efforts/scripts/explain-blocked-effort.sh
 generatorOptions:
   labels:
     entity: ssint
