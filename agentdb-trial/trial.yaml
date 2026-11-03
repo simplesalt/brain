@@ -1,0 +1,201 @@
+# Trial agentdb instance and its end-to-end probes (applied by the agentdb-trial
+# Kustomization in manifests/agentdb.yaml). The probe admin is bound through GitOps
+# (admin grants are GitOps-managed by design); the probe reader gets its access only
+# from the MCP grant tool, which the setup probe calls.
+apiVersion: agentdb.simplesalt.company/v1alpha1
+kind: AgentDatabase
+metadata:
+  name: trial
+  namespace: ssint-main-agentdb
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+spec:
+  instances: 2
+  storage:
+    size: 5Gi
+  postgres:
+    imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+  history:
+    retention: 30d
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentdb-probe-admin
+  namespace: ssint-main-agentdb
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentdb-probe-reader
+  namespace: ssint-main-agentdb
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agentdb-probe-admin
+  namespace: ssint-main-agentdb
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agentdb-admin
+subjects:
+  - kind: ServiceAccount
+    name: agentdb-probe-admin
+    namespace: ssint-main-agentdb
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: agentdb-probe-setup
+  namespace: ssint-main-agentdb
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            entity: ssint
+            env: main
+            capability: agentdb
+        spec:
+          serviceAccountName: agentdb-probe-admin
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: probe
+              image: python:3.12-alpine
+              command: ["python3", "/probe/probe.py", "setup"]
+              env:
+                - name: AGENTDB_ENDPOINT
+                  value: http://trial-mcp.ssint-main-agentdb.svc/mcp
+                - name: PYTHONDONTWRITEBYTECODE
+                  value: "1"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  memory: 128Mi
+              volumeMounts:
+                - name: probe
+                  mountPath: /probe
+                - name: agentdb-token
+                  mountPath: /var/run/secrets/agentdb
+                  readOnly: true
+          volumes:
+            - name: probe
+              configMap:
+                name: agentdb-probe
+            - name: agentdb-token
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      audience: agentdb
+                      expirationSeconds: 3600
+                      path: token
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: agentdb-probe-check
+  namespace: ssint-main-agentdb
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+spec:
+  schedule: "5,35 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            entity: ssint
+            env: main
+            capability: agentdb
+        spec:
+          serviceAccountName: agentdb-probe-reader
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: probe
+              image: python:3.12-alpine
+              command: ["python3", "/probe/probe.py", "check"]
+              env:
+                - name: AGENTDB_ENDPOINT
+                  value: http://trial-mcp.ssint-main-agentdb.svc/mcp
+                - name: PYTHONDONTWRITEBYTECODE
+                  value: "1"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  memory: 128Mi
+              volumeMounts:
+                - name: probe
+                  mountPath: /probe
+                - name: agentdb-token
+                  mountPath: /var/run/secrets/agentdb
+                  readOnly: true
+          volumes:
+            - name: probe
+              configMap:
+                name: agentdb-probe
+            - name: agentdb-token
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      audience: agentdb
+                      expirationSeconds: 3600
+                      path: token

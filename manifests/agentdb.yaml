@@ -1,0 +1,78 @@
+# Trial instance of the agentdb product: an operator-managed Postgres database with an
+# MCP endpoint, http://trial-mcp.ssint-main-agentdb.svc/mcp.
+# The chart (operator, CRD, ClusterRoles) is installed here; the AgentDatabase itself and
+# its probes live in ./agentdb-trial, applied by the agentdb-trial Kustomization below.
+# Cluster-local resources never go in crossplane-system.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ssint-main-agentdb
+  labels:
+    name: ssint-main-agentdb
+    entity: ssint
+    env: main
+    capability: agentdb
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: agentdb-main
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+spec:
+  interval: 12h
+  url: oci://ghcr.io/simplesalt/charts/agentdb
+  ref:
+    tag: "0.1.0-11"
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: agentdb-main
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+spec:
+  interval: 5m
+  chartRef:
+    kind: OCIRepository
+    name: agentdb-main
+    namespace: flux-system
+  targetNamespace: ssint-main-agentdb
+  install:
+    createNamespace: false
+    crds: Create
+  upgrade:
+    crds: CreateReplace
+  values:
+    image:
+      digest: "sha256:08afb4ae6440a53b1b1a48f2fd2f0ba212bead0705daecd330876e78f10d88d2"
+---
+# Separate from the root kustomization because the AgentDatabase kind exists only once
+# the HelmRelease above has installed the CRD; until then its applies fail and retry.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: agentdb-trial
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+spec:
+  interval: 10m
+  retryInterval: 1m
+  sourceRef:
+    kind: GitRepository
+    name: brain
+  path: ./agentdb-trial
+  prune: true
+  wait: false

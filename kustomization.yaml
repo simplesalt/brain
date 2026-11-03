@@ -34,6 +34,7 @@ resources:
   - manifests/cloudflare-zero-trust-main.yaml
   - manifests/gcp-sso.yaml
   - manifests/efforts.yaml
+  - manifests/agentdb.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
