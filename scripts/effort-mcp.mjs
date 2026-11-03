@@ -248,18 +248,19 @@ async function callTool(role, name, args) {
   if (!ROLES[role].includes(name)) return errResult(`error: tool '${name}' is not available on the ${role} endpoint`);
   const t = TOOLS[name];
   const a = args && typeof args === 'object' ? args : {};
+  const held = t.inputSchema.required.includes('session');
   let argv;
   try {
     argv = t.argv(a);
-    if (t.write) holderParts(a.session);
+    if (held) holderParts(a.session);
   } catch (e) {
     if (e instanceof UserError) return errResult(e.message);
     throw e;
   }
-  const exec = () => run(argv[0], argv.slice(1), t.write ? a.session : undefined);
+  const exec = () => run(argv[0], argv.slice(1), held ? a.session : undefined);
   const r = t.write ? await serial(exec) : await exec();
   const out = r.out.trim(), err = r.err.trim();
-  console.log(JSON.stringify({ at: new Date().toISOString(), role, tool: name, session: t.write ? a.session : undefined, ref: a.ref, code: r.code }));
+  console.log(JSON.stringify({ at: new Date().toISOString(), role, tool: name, session: held ? a.session : undefined, ref: a.ref, code: r.code }));
   if (r.code !== 0) return errResult([err, out].filter(Boolean).join('\n') || `error: ${argv[0]} exited ${r.code}`);
   const content = [{ type: 'text', text: out || '{}' }];
   if (err) content.push({ type: 'text', text: err });
