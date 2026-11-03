@@ -551,6 +551,18 @@ class MoveParentTest(FlowCase):
         self.assertEqual(section(child["body"], "Facts"), "none")
 
 
+class ReplaceWhereTest(FlowCase):
+    def test_where_alone_is_replaced_and_nothing_else_moves(self):
+        before = render_body(Gaps=gap(1, "a gap"), Facts="- [F1] a fact " + DASH + " evidence: https://example.com/1",
+                             How=task(1, "a task"))
+        self.board.add(65, "Planning", in_use=HOLDER, body=before)
+        self.succeeded(self.board.run("update-effort.sh", 65, "--where", "the new current state"))
+        after = self.board.issue(65)["body"]
+        self.assertEqual(section(after, "Where"), "the new current state")
+        for name in ("What", "Gaps", "Unknowns", "Facts", "Indicators", "How"):
+            self.assertEqual(section(after, name), section(before, name), name)
+
+
 class CreateNeverGuessesAParentTest(FlowCase):
     def test_a_related_effort_is_only_suggested(self):
         self.board.add(70, "Doing", title="[Feature] Loader pipeline",
