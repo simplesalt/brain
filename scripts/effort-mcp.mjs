@@ -248,7 +248,7 @@ async function callTool(role, name, args) {
   if (!ROLES[role].includes(name)) return errResult(`error: tool '${name}' is not available on the ${role} endpoint`);
   const t = TOOLS[name];
   const a = args && typeof args === 'object' ? args : {};
-  const held = t.inputSchema.required.includes('session');
+  const held = (t.inputSchema.required ?? []).includes('session');
   let argv;
   try {
     argv = t.argv(a);
