@@ -27,7 +27,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.30.0"
+      version: "0.35.3"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -77,7 +77,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.30.0"
+      version: "0.35.3"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -129,7 +129,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.30.0"
+      version: "0.35.3"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -179,7 +179,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.30.0"
+      version: "0.35.3"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -225,7 +225,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.30.0"
+      version: "0.35.3"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
