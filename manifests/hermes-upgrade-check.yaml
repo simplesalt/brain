@@ -160,10 +160,10 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "hindsight-1.0.0"
+              value: "hindsight-1.1.0"
             - name: CHECK_PROMPT
               value: >-
-                Hindsight upgrade health check (1.0.0). Make exactly these two read-only calls with your hindsight tools, one each, then reply with one line per call in the form "<tool>: OK <result count or one-line summary>" or "<tool>: FAILED <exact error>": 1) hindsight recall for "gbrain upgrade"; 2) hindsight reflect on "what is the state of the brain upgrade" (say how long it took). Do not write, retain, send or change anything.
+                Hindsight upgrade health check (1.1.0). Make exactly these two read-only calls with your hindsight tools, one each, then reply with one line per call in the form "<tool>: OK <result count or one-line summary>" or "<tool>: FAILED <exact error>": 1) hindsight recall for "gbrain upgrade"; 2) hindsight reflect on "what is the state of the brain upgrade" (say how long it took). Do not write, retain, send or change anything.
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: PROXY_URL

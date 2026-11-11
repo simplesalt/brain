@@ -112,6 +112,7 @@ spec:
               echo "precheck entity_maintenance_queue primary key: $(q "SELECT coalesce(string_agg(conname, ','), 'MISSING') FROM pg_constraint WHERE conrelid = to_regclass('public.entity_maintenance_queue') AND contype = 'p'")"
               echo "precheck memory_units placeholder event_date rows: $(q "SELECT count(*) FROM memory_units WHERE event_date < '0002-01-01T00:00:00Z'::timestamptz OR event_date >= '9999-01-01T00:00:00Z'::timestamptz")"
               echo "precheck memory_units non-partial vector indexes: $(q "SELECT coalesce(string_agg(indexname, ','), 'none') FROM pg_indexes WHERE tablename = 'memory_units' AND indexdef ~* '(hnsw|vchordrq|diskann|scann)' AND indexdef !~* ' WHERE '")"
+              echo "precheck mental_models.last_full_refreshed_at column: $(q "SELECT coalesce(string_agg(data_type, ','), 'absent') FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'mental_models' AND column_name = 'last_full_refreshed_at'")"
 
               BEFORE=$(snapshot before) || fail "could not read row counts"
               echo "$BEFORE"
@@ -148,7 +149,7 @@ spec:
               echo "hindsight-pg-dump: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           env:
             - name: DUMP_LABEL
-              value: "pre-1.1.0"
+              value: "post-1.1.0"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -307,7 +308,7 @@ spec:
                   name: gbrain-pg-rehearsal-app
                   key: password
             - name: DUMP_LABEL
-              value: "pre-1.1.0"
+              value: "post-1.1.0"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
