@@ -19,6 +19,8 @@ spec:
     imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
   history:
     retention: 30d
+  mcp:
+    replicas: 1
 ---
 apiVersion: v1
 kind: ServiceAccount
