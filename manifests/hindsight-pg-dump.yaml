@@ -148,7 +148,7 @@ spec:
               echo "hindsight-pg-dump: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           env:
             - name: DUMP_LABEL
-              value: "pre-1.0.0"
+              value: "pre-1.1.0"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -307,7 +307,7 @@ spec:
                   name: gbrain-pg-rehearsal-app
                   key: password
             - name: DUMP_LABEL
-              value: "pre-1.0.0"
+              value: "pre-1.1.0"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
