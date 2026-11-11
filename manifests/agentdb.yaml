@@ -29,7 +29,7 @@ spec:
   interval: 12h
   url: oci://ghcr.io/simplesalt/charts/agentdb
   ref:
-    tag: "0.1.0-11"
+    tag: "0.1.0-12"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -54,7 +54,7 @@ spec:
     crds: CreateReplace
   values:
     image:
-      digest: "sha256:08afb4ae6440a53b1b1a48f2fd2f0ba212bead0705daecd330876e78f10d88d2"
+      digest: "sha256:5cd951ac71365456dfa33a42631f620892e535832e22cdb3c6fbe8b5900b7d8a"
 ---
 # Separate from the root kustomization because the AgentDatabase kind exists only once
 # the HelmRelease above has installed the CRD; until then its applies fail and retry.
