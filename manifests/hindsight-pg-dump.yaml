@@ -109,6 +109,9 @@ spec:
               public_tables=$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
               public_indexes=$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public'")
               echo "locale: $db_locale; extensions: $extensions; tables: $public_tables; indexes: $public_indexes"
+              echo "precheck entity_maintenance_queue primary key: $(q "SELECT coalesce(string_agg(conname, ','), 'MISSING') FROM pg_constraint WHERE conrelid = to_regclass('public.entity_maintenance_queue') AND contype = 'p'")"
+              echo "precheck memory_units placeholder event_date rows: $(q "SELECT count(*) FROM memory_units WHERE event_date < '0002-01-01T00:00:00Z'::timestamptz OR event_date >= '9999-01-01T00:00:00Z'::timestamptz")"
+              echo "precheck memory_units non-partial vector indexes: $(q "SELECT coalesce(string_agg(indexname, ','), 'none') FROM pg_indexes WHERE tablename = 'memory_units' AND indexdef ~* '(hnsw|vchordrq|diskann|scann)' AND indexdef !~* ' WHERE '")"
 
               BEFORE=$(snapshot before) || fail "could not read row counts"
               echo "$BEFORE"
@@ -145,7 +148,7 @@ spec:
               echo "hindsight-pg-dump: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           env:
             - name: DUMP_LABEL
-              value: "pre-0.9.2b"
+              value: "pre-0.10.3"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -304,7 +307,7 @@ spec:
                   name: gbrain-pg-rehearsal-app
                   key: password
             - name: DUMP_LABEL
-              value: "pre-0.9.2b"
+              value: "pre-0.10.3"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
