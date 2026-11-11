@@ -160,26 +160,16 @@ spec:
           command: ["python3", "/check/check.py"]
           env:
             - name: CHECK_STOP
-              value: "notion-full-write-2026-11-02"
+              value: "hindsight-0.10.3"
             - name: CHECK_PROMPT
               value: >-
-                Notion write test from the coding agent (projects#855). Touch nothing in Notion
-                except the scratch database named below. Steps: 1) List every Notion tool in your
-                tool list, by exact name. 2) Call the Notion retrieve-a-data-source tool for
-                data_source_id 124bdb3c-5281-44ad-a8c4-633215849c8c ("Hermes write check
-                (scratch)") and note the options of its select property Stage. 3) Call the Notion
-                update-a-data-source tool on it to set Stage's options to the existing ones plus
-                a new option "C". 4) Retrieve it again and confirm C is there. 5) Call
-                update-a-data-source again to set Stage's options back to the existing ones
-                without C. 6) Retrieve it again and confirm C is gone. If C already exists at step
-                2, do steps 5 and 6 only. Reply with the tool list, then one line per step in the
-                form "<step>: OK <Stage options seen>" or "<step>: FAILED <exact error>".
+                Hindsight upgrade health check (0.10.3). Make exactly these two read-only calls with your hindsight tools, one each, then reply with one line per call in the form "<tool>: OK <result count or one-line summary>" or "<tool>: FAILED <exact error>": 1) hindsight recall for "gbrain upgrade"; 2) hindsight reflect on "what is the state of the brain upgrade" (say how long it took). Do not write, retain, send or change anything.
             - name: HERMES_URL
               value: "http://hermes-agent-web:8642"
             - name: PROXY_URL
               value: "http://hermes-proxy:8000"
             - name: CHECK_DELAY
-              value: "120"
+              value: "0"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: API_SERVER_KEY
