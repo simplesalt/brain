@@ -444,9 +444,13 @@ def save_state(state):
                "```json\n" + json.dumps(state, indent=1, sort_keys=True) + "\n```\n")
     args = {"slug": STATE, "content": content}
     try:
-        rev = (call("get_page", {"slug": STATE}) or {}).get("revision")
-        if rev:
-            args["expected_revision"] = rev
+        page = call("get_page", {"slug": STATE})
+        page = page if isinstance(page, dict) else {}
+        if page.get("revision"):
+            args["expected_revision"] = page["revision"]
+        timeline = (page.get("timeline") or "").strip()
+        if timeline:
+            args["content"] = content + "\n" + timeline + "\n"
     except RuntimeError:
         pass
     call("put_page", args)
@@ -465,11 +469,12 @@ def read_results(read):
             if key in read or not f.endswith(".md"):
                 continue
             text = open(os.path.join(d, f), encoding="utf-8", errors="replace").read()
-            if MARKER not in text:
+            if MARKER not in text or "SCRIPT-ERROR" in text:
                 continue
-            m = re.search(r"\[.*\]", text.split(MARKER, 1)[1], re.S)
+            tail = text.split(MARKER, 1)[1]
+            start = tail.find("[")
             try:
-                answer = json.loads(m.group(0)) if m else []
+                answer = json.JSONDecoder().raw_decode(tail[start:])[0] if start >= 0 else []
             except json.JSONDecodeError as e:
                 log(f"unreadable answer in {key}: {e}")
                 answer = []

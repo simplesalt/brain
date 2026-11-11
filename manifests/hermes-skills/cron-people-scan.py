@@ -41,26 +41,76 @@ SELF = re.compile(r"^(dylan[.a-z]*@(simplesalt\.company|simple-salt\.com|saltyon
                   r"|admin@simplesalt\.company)$", re.I)
 
 
+class Unreachable(Exception):
+    pass
+
+
 def call(tool, args):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                        "params": {"name": tool, "arguments": args}}).encode()
     req = urllib.request.Request(URL, data=body, headers={
         "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
         "Authorization": "Bearer " + TOKEN})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        for line in r.read().decode().splitlines():
-            if line.startswith("data: "):
-                msg = json.loads(line[6:])
-                if "error" in msg:
-                    raise RuntimeError(f"{tool}: {msg['error']}")
-                text = msg["result"]["content"][0]["text"]
-                if msg["result"].get("isError"):
-                    raise RuntimeError(f"{tool}: {text[:300]}")
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    return text
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read().decode()
+    except urllib.error.HTTPError as e:
+        if e.code >= 500:
+            raise Unreachable(f"gbrain answered HTTP {e.code} to {tool}") from None
+        raise
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        raise Unreachable(f"gbrain unreachable on {tool}: {getattr(e, 'reason', e)}") from None
+    for line in raw.splitlines():
+        if line.startswith("data: "):
+            msg = json.loads(line[6:])
+            if "error" in msg:
+                raise RuntimeError(f"{tool}: {msg['error']}")
+            text = msg["result"]["content"][0]["text"]
+            if msg["result"].get("isError"):
+                raise RuntimeError(f"{tool}: {text[:300]}")
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return text
     raise RuntimeError(f"{tool}: no response")
+
+
+def put_state(slug, content):
+    args = {"slug": slug, "content": content}
+    try:
+        page = call("get_page", {"slug": slug})
+    except RuntimeError as e:
+        if "not_found" not in str(e):
+            raise
+        page = None
+    if isinstance(page, dict):
+        if page.get("revision"):
+            args["expected_revision"] = page["revision"]
+        timeline = (page.get("timeline") or "").strip()
+        if timeline:
+            args["content"] = content.rstrip("\n") + "\n\n" + timeline + "\n"
+    call("put_page", args)
+
+
+def first_json(text, opener="["):
+    start = text.find(opener)
+    if start < 0:
+        return None
+    return json.JSONDecoder().raw_decode(text[start:])[0]
+
+
+def answer_after(text, marker):
+    if marker not in text or "SCRIPT-ERROR" in text:
+        return None
+    return first_json(text.split(marker, 1)[1])
+
+
+def run(main, name):
+    try:
+        main()
+    except Unreachable as e:
+        print(f"{name}: {e}; the next run retries", file=sys.stderr)
+        print(json.dumps({"wakeAgent": False}))
 
 
 def all_pages(**filters):
@@ -143,7 +193,7 @@ def save_state(done):
     content = ("---\ntype: note\ntitle: People scan state\n---\n\n# People scan state\n\n"
                "Meetings and email threads the people-scan job has handled. Kept by cron-people-scan.py.\n\n"
                "```json\n" + json.dumps(sorted(done)) + "\n```\n")
-    call("put_page", {"slug": STATE, "content": content})
+    put_state(STATE, content)
 
 
 def page_slug(name):
@@ -317,9 +367,8 @@ def apply_results(state_files):
             text = open(os.path.join(d, f), encoding="utf-8", errors="replace").read()
             if MARKER not in text:
                 continue
-            m = re.search(r"\[.*\]", text.split(MARKER, 1)[1], re.S)
             try:
-                people = json.loads(m.group(0)) if m else []
+                people = answer_after(text, MARKER) or []
             except json.JSONDecodeError:
                 people = []
             for p in people if isinstance(people, list) else []:
@@ -372,4 +421,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run(main, "people-scan")

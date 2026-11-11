@@ -74,7 +74,7 @@ def save_state(done):
                "Emails and meetings the timeline-sweep job has added to people's timelines, with the page's "
                "updated time when it did. Kept by cron-timeline-sweep.py.\n\n"
                "```json\n" + json.dumps(done, sort_keys=True) + "\n```\n")
-    scan.call("put_page", {"slug": STATE, "content": content})
+    scan.put_state(STATE, content)
 
 
 def describe(page, now):

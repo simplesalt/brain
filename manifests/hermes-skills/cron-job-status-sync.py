@@ -19,7 +19,11 @@ import json
 import os
 import re
 import sys
-import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from importlib import import_module
+
+scan = import_module("cron-people-scan")
 
 URL = os.environ.get("GBRAIN_URL", "http://gbrain:3131/mcp")
 TOKEN = os.environ.get("GBRAIN_REMOTE_TOKEN", "gbrain-mcp")
@@ -50,26 +54,7 @@ SUBJECT = re.compile(r"(your application|application (received|submitted|update|
                      r"position|role at|opportunity at)", re.I)
 
 
-def call(tool, args):
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                       "params": {"name": tool, "arguments": args}}).encode()
-    req = urllib.request.Request(URL, data=body, headers={
-        "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
-        "Authorization": "Bearer " + TOKEN})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        for line in r.read().decode().splitlines():
-            if line.startswith("data: "):
-                msg = json.loads(line[6:])
-                if "error" in msg:
-                    raise RuntimeError(f"{tool}: {msg['error']}")
-                text = msg["result"]["content"][0]["text"]
-                if msg["result"].get("isError"):
-                    raise RuntimeError(f"{tool}: {text[:300]}")
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    return text
-    raise RuntimeError(f"{tool}: no response")
+call = scan.call
 
 
 def all_pages(**filters):
@@ -113,7 +98,7 @@ def save_state(state):
                "Email threads the job-status-sync job has examined and handed to Hermes, and what Hermes did "
                "with each (updated, unchanged, unmatched or not a job email). Kept by cron-job-status-sync.py.\n\n"
                "```json\n" + json.dumps(state, indent=1, sort_keys=True) + "\n```\n")
-    call("put_page", {"slug": STATE, "content": content})
+    scan.put_state(STATE, content)
 
 
 def read_results(read):
@@ -132,9 +117,8 @@ def read_results(read):
             text = open(os.path.join(d, f), encoding="utf-8", errors="replace").read()
             if MARKER not in text:
                 continue
-            m = re.search(r"\[.*\]", text.split(MARKER, 1)[1], re.S)
             try:
-                answer = json.loads(m.group(0)) if m else []
+                answer = scan.answer_after(text, MARKER) or []
             except json.JSONDecodeError as e:
                 print(f"job-status-sync: unreadable answer in {key}: {e}", file=sys.stderr)
                 answer = []
@@ -208,4 +192,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    scan.run(main, "job-status-sync")
