@@ -44,6 +44,7 @@ agent:
     - feishu_doc
     - feishu_drive
     - spotify
+    - connections
 # Hard-stop repeated failing calls in chats too: Hermes counts api_server as attended, so by
 # default only cron stops (projects#857).
 tool_loop_guardrails:
@@ -207,5 +208,7 @@ mcp_servers:
     url: http://mcp-proxy:3003/mcp
     timeout: 60
 tools:
+  connectors:
+    enabled: false
   tool_search:
     enabled: off
