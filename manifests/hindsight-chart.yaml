@@ -37,7 +37,7 @@ spec:
     timeout: 20m
   values:
     image:
-      digest: "sha256:a88678c038b0e4340822b02a5efc566c56d8176b5bffa731bc433fd37f978e4c"
+      digest: "sha256:50311d02b4d5d2b7c5242bd336edf8735df8374eaad496a92f49c83b37d2aa06"
   postRenderers:
     - kustomize:
         patches:
