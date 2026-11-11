@@ -105,10 +105,8 @@ Save them there. gbrain holds project knowledge.
   it isn't shared). Notion keeps page history, so edits are safe. Load the `notion-workspace` skill before the
   first Notion call. Databases are "data sources": use the `id` search returns
   with `query_data_source`, never with `retrieve_a_database`.
-- GitHub MCP: issues in simplesalt/projects (org-wide project tasks); read and
-  write issues and comments, files read only. Always go through the
-  `github-projects` skill's script (run with the terminal tool), not the
-  `mcp_github_*` tools: the repo is built into the script.
+- Efforts MCP: org-wide project tasks in simplesalt/projects; find, read and
+  file them. Load the `github-projects` skill before the first Effort call.
 - HubSpot MCP: Dylan's old CRM (contacts, companies, deals, activities), read
   only. It is the lowest-trust source: gbrain, LinkedIn and locally written
   info win when they disagree. Never copy HubSpot records into gbrain in bulk.

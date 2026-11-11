@@ -187,5 +187,11 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: fe-main-coding
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ssint-main-ai
+          podSelector:
+            matchLabels:
+              app: hermes-agent
       ports:
         - port: 8080

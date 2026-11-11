@@ -62,6 +62,16 @@ platform_toolsets:
     - terminal
     - vision
     - web
+  api_server:
+    - memory
+    - skills
+    - vision
+    - web
+  webhook:
+    - memory
+    - skills
+    - vision
+    - web
   # Scheduled jobs get skills and the MCP servers their prompts use, nothing else: no terminal,
   # code_execution, delegation or web, so a run cannot patch or redo a job's work (projects#856).
   cron:
@@ -102,6 +112,15 @@ platforms:
     extra:
       port: 8644
 mcp_servers:
+  efforts:
+    enabled: true
+    url: http://efforts.ssint-main-efforts:8080/mcp/coordinator
+    timeout: 120
+    tools:
+      include:
+        - effort_find
+        - effort_get
+        - effort_create
   flux:
     enabled: false
     url: http://mcp-flux.flux-system:9090/mcp

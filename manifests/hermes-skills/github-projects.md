@@ -1,50 +1,45 @@
 ---
 name: github-projects
-description: Use when finding, reading, creating or commenting on Simple Salt's org-wide project tasks (Efforts) in the simplesalt/projects GitHub repo. Run the gh_projects.py script with the terminal tool; the repo is built in.
+description: Use when finding, reading or filing Simple Salt's org-wide project tasks (Efforts) in the simplesalt/projects GitHub repo, with the Effort tools mcp__efforts__effort_find, mcp__efforts__effort_get and mcp__efforts__effort_create.
 ---
 
 # GitHub: simplesalt/projects
 
-GitHub access is limited to one repo, `simplesalt/projects`. It holds Simple Salt's
-org-wide project tasks ("Efforts") as GitHub issues. There is no code in it: the
-`issues/` folder is a version-controlled JSON copy of each issue (`issues/760.json`).
-You can read and write issues and their comments; the repo's files are read only.
+Simple Salt's org-wide project tasks ("Efforts") are GitHub issues in
+`simplesalt/projects`. You reach them only through three Effort tools:
 
-## How to call it
+| To | Tool | Arguments |
+|---|---|---|
+| Find Efforts related to a need | `mcp__efforts__effort_find` | `why` (required), `what`, `where`, `limit` |
+| Read one Effort | `mcp__efforts__effort_get` | `ref`: `simplesalt/projects#760` |
+| File a new Effort | `mcp__efforts__effort_create` | see below |
 
-Run this script with the terminal tool. The repo is built into it, so never pass an
-owner or repo, and do not call the `mcp_github_*` tools directly.
+## Filing an Effort
 
-```
-python3 /opt/data/skills/simplesalt/github-projects/scripts/gh_projects.py <command> ...
-```
+Before filing, `effort_find` with the same Why: if an open Effort already covers it, link
+that one instead of filing a second.
 
-| To | Command |
-|---|---|
-| Find issues by words | `search "hubspot export"` (add `--limit 20`) |
-| List newest issues | `list` (add `--state open` or `--state closed`, `--limit 20`) |
-| Read an issue | `read 760` |
-| Read its comments | `comments 760` |
-| Comment on an issue | `comment 760 "Comment text in Markdown"` |
-| Create an issue | `create --title "[Feature] Short outcome-focused title" --body "..."` |
-| Change an issue | `update 760 --state closed` (or `--title`, `--body`) |
-| Read a repo file | `file issues/760.json` (no path lists the top folder) |
+`effort_create` takes:
 
-For long text, pass `-` and pipe it in: `printf '%s' "$TEXT" | ... comment 760 -`.
-Output is the GitHub result as JSON. On failure the script prints `error: ...` and exits
-1: read the error and fix the command, do not rerun it unchanged.
+- `title`: short and outcome-focused.
+- `type`: `Feature` (something new), `Bug` (something broken), `Analysis` or `Advisory`.
+- `assigned`: `ssint-build-brain` for Hermes, gbrain, Hindsight, Notion or cron work;
+  ask Dylan when you cannot tell.
+- `why`: the problem in Dylan's words, one or two sentences.
+- `what`: the outcome when it is done.
+- `indicators`: how anyone can check it is done, one per line starting with `- `.
+- `where`: what you saw: the chat, the tool and its exact error, page slugs, dates.
+- `tags`: optional, comma-separated.
 
-## Rules
+Pass `dry_run: true` first when unsure; it shows the gate's checks without filing.
+The tool answers with the new ref, or an error naming the field to fix: fix that field
+and call again.
 
-- An Effort's body has fixed sections: Title, Assigned, Parent, Blockers, Why, What,
-  Indicators, Gaps, Where, Facts, Unknowns, How, Tags. Status lives on the project
-  board, not in the body.
-- Comments are visible to everyone with repo access and notify watchers: comment only
-  when asked, and say who it is from if you write for someone.
-- Do not rewrite an Effort's body unless asked: coding agents keep it as their
-  source of truth.
-- Prefer `read` for current issue text; the JSON copy under `issues/` can lag.
+## What these tools do not do
+
+There is no tool to comment on, edit, close or reassign an Effort. When Dylan asks for
+one of those, tell him which Effort and what change, and that a coding agent or he makes it.
 
 ## Answering
 
-Link the issue you used: `https://github.com/simplesalt/projects/issues/<number>`.
+Link the Effort you used: `https://github.com/simplesalt/projects/issues/<number>`.
