@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: hermes-rehearsal-write-test-2
+  name: hermes-rehearsal-write-test-3
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -184,7 +184,7 @@ spec:
                               out[c] = v
                           print(json.dumps(out, default=str))
               for p in glob.glob("/opt/data/**/*.json*", recursive=True):
-                  if "/skills" in p or p.endswith("config.json"):
+                  if "/skills" in p or p.endswith("config.json") or "cache" in p or "models" in p or os.path.getsize(p) > 400000:
                       continue
                   print("== json", p)
                   with open(p, errors="replace") as fh:
