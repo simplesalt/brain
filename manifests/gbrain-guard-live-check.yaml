@@ -1,0 +1,104 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-guard-live-check-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-guard-live-check
+        gbrain-access: guard-only
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "-e"]
+          args:
+            - |
+              await Bun.sleep(15000);
+              const TARGET = "people/dylan-evans";
+              const rpc = async (name, args) => {
+                const r = await fetch("http://gbrain:3141/mcp", { method: "POST", signal: AbortSignal.timeout(15000),
+                  headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: "Bearer gbrain-mcp" },
+                  body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) });
+                const t = await r.text();
+                let msg = null;
+                for (const b of t.split("\n\n")) { const d = b.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).join("\n"); if (!d) continue; try { const o = JSON.parse(d); if (o.result || o.error) msg = o; } catch {} }
+                msg = msg ?? JSON.parse(t);
+                return { isError: !!msg.result?.isError, text: (msg.result?.content ?? []).map(c => c.text ?? "").join("\n") };
+              };
+              console.log("pod labelled gbrain-access=guard-only, as the Hermes pod is");
+              try { await fetch("http://gbrain:3131/health", { signal: AbortSignal.timeout(8000) }); console.log("direct gbrain:3131 -> reachable (UNEXPECTED)"); }
+              catch (e) { console.log(`direct gbrain:3131 -> blocked (${e.name}: ${e.message})`); }
+              const b = JSON.parse((await rpc("get_page", { slug: TARGET })).text);
+              console.log(`before: ${TARGET} revision ${b.revision}, updated_at ${b.updated_at}`);
+              const put = await rpc("put_page", { slug: TARGET, content: "guard refusal probe", expected_revision: b.revision });
+              console.log(`put_page ${TARGET} through :3141 -> isError=${put.isError} ${put.text}`);
+              const a = JSON.parse((await rpc("get_page", { slug: TARGET })).text);
+              console.log(`after: ${TARGET} revision ${a.revision}, updated_at ${a.updated_at}, unchanged=${a.revision === b.revision}`);
+              console.log("RESULT: done");
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+        - name: writes
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=60000'
+              case "$DATABASE_URL" in *@gbrain-pg-rw[.:/]*) ;; *) echo "FATAL"; exit 1 ;; esac
+              q() { echo "+ $1"; psql -X -c "$1" "$DATABASE_URL"; }
+              sleep 30
+              q "SELECT operation, state, coalesce(error_code, '-') AS error_code, count(*), min(created_at)::timestamp(0) AS first, max(created_at)::timestamp(0) AS last FROM persistence_requests WHERE created_at >= '2026-11-12 21:07:00+00' AND principal_kind = 'legacy_token' GROUP BY 1,2,3 ORDER BY 1,2"
+              q "SELECT created_at::timestamp(0) AS at, operation, state, slug, coalesce(error_code, '-') AS error_code FROM persistence_requests WHERE created_at >= '2026-11-12 21:07:00+00' AND principal_kind = 'legacy_token' AND (slug LIKE 'ops/%' OR state <> 'committed') ORDER BY created_at"
+              q "SELECT operation, status, count(*), max(created_at)::timestamp(0) AS last FROM mcp_request_log WHERE created_at >= '2026-11-12 21:07:00+00' AND token_name = 'hermes-mcp' GROUP BY 1,2 ORDER BY 3 DESC LIMIT 40"
+              q "SELECT id, kind, slug, reason, created_at::timestamp(0), withdrawn_at::timestamp(0), applied_at::timestamp(0), outcome FROM addon_page_marks ORDER BY id"
+              echo "RESULT: done"
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
