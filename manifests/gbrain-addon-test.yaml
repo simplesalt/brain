@@ -3,7 +3,7 @@ kind: Job
 metadata:
   # One-shot: runs gbrain-addon's tests, then gbrain's own loop tests, against
   # the pinned gbrain. Results are in this Job's logs. Bump the suffix to rerun.
-  name: gbrain-addon-test-7
+  name: gbrain-addon-test-8
   namespace: ssint-main-ai
   labels:
     entity: ssint

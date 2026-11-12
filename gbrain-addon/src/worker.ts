@@ -14,6 +14,7 @@ import { makeHandler } from './http.ts';
 import { setupGateway } from './gbrain-internal.ts';
 import { judgeReplyNeeded, minConfidence, replyCheckEnabled } from './reply-check.ts';
 import { reviewNewLoops } from './reply-review.ts';
+import { MAX_GUARD_BODY_BYTES, engineStore, ensureMarkTable, makeGuardHandler } from './guard.ts';
 
 async function main() {
   const config = loadConfig();
@@ -40,6 +41,14 @@ async function main() {
   });
   Bun.serve({ port, fetch: handler });
   console.log(`gbrain-addon http listening on :${port}`);
+  const guardUpstream = process.env.GUARD_UPSTREAM;
+  if (guardUpstream) {
+    await ensureMarkTable(engine);
+    const guardPort = Number(process.env.GUARD_PORT ?? 3141);
+    const guard = makeGuardHandler(engineStore(engine), { upstream: guardUpstream, defaultSource: process.env.GUARD_DEFAULT_SOURCE || 'default' });
+    Bun.serve({ port: guardPort, fetch: guard, maxRequestBodySize: MAX_GUARD_BODY_BYTES });
+    console.log(`gbrain-addon write guard listening on :${guardPort}, upstream ${guardUpstream}`);
+  }
   if (checkOn) {
     const every = Number(process.env.ADDON_REPLY_CHECK_INTERVAL_MS ?? 60_000);
     const maxPerPass = Number(process.env.ADDON_REPLY_CHECK_MAX_PER_PASS ?? 25);
