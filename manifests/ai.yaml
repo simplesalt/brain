@@ -963,7 +963,7 @@ spec:
                 });
               })();
         - name: install-cli-tools
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -1114,7 +1114,7 @@ spec:
               mountPath: /seed
               readOnly: true
         - name: seed-hermes-config
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -1345,7 +1345,7 @@ spec:
               mountPath: /secrets/team-roster
               readOnly: true
         - name: patch-tool-bridge
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919
           command: ["python3", "-c"]
           args:
             - |
@@ -1410,7 +1410,7 @@ spec:
         # The qr-code skill's decoder (ZXing) and its script, which the patched image
         # description step imports. A failed install only leaves QR decoding off.
         - name: install-qr-decoder
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -1458,7 +1458,7 @@ spec:
               readOnly: true
       containers:
         - name: hermes-agent
-          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919
           imagePullPolicy: IfNotPresent
           args:
             - gateway
@@ -1645,7 +1645,7 @@ spec:
             sizeLimit: 64Mi
         - name: home
           emptyDir:
-            sizeLimit: 5Gi
+            sizeLimit: 10Gi
         - name: config-seed
           configMap:
             name: hermes-config

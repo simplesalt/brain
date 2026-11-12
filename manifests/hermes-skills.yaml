@@ -22,7 +22,6 @@ gbrain:
 bundled:
   - hermes-agent
   - humanizer
-  - youtube-content
   - arxiv
   - maps
 local:
