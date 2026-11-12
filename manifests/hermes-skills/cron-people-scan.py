@@ -92,6 +92,15 @@ def state_body(page, slug):
     return page.get("compiled_truth") or ""
 
 
+STATE_CAP = 128 * 1024
+
+
+def check_cap(slug, content):
+    n = len(content.encode())
+    if n > STATE_CAP:
+        raise StateError(f"state would be {n} bytes, over the 128 KB cap; nothing written ({slug})")
+
+
 def put_state_page(args):
     try:
         return call("put_page", args)
@@ -100,6 +109,7 @@ def put_state_page(args):
 
 
 def put_state(slug, content):
+    check_cap(slug, content)
     args = {"slug": slug, "content": content}
     try:
         page = call("get_page", {"slug": slug})

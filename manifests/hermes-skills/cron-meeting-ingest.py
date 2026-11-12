@@ -110,6 +110,15 @@ def state_body(page, slug):
     return page.get("compiled_truth") or ""
 
 
+STATE_CAP = 128 * 1024
+
+
+def check_cap(slug, content):
+    n = len(content.encode())
+    if n > STATE_CAP:
+        raise StateError(f"state would be {n} bytes, over the 128 KB cap; nothing written ({slug})")
+
+
 def put_state_page(args):
     try:
         return call("put_page", args)
@@ -140,6 +149,7 @@ def save_state(done, pending, revision, keep):
                "Fireflies calls the meeting-ingest job has handed to Hermes: done, or pending until Hermes reports "
                "them done. Kept by cron-meeting-ingest.py.\n\n"
                "```json\n" + json.dumps(state, indent=1) + "\n```\n")
+    check_cap(STATE, content)
     args = {"slug": STATE, "content": content}
     if revision is not None:
         args["expected_revision"] = revision
