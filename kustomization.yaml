@@ -40,7 +40,6 @@ resources:
   - manifests/gbrain-mark-review.yaml
   - manifests/gbrain-networkpolicy.yaml
   - manifests/gbrain-guard-live-check.yaml
-  - manifests/fireflies-ingest-live-test.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
