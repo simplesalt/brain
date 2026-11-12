@@ -1,0 +1,152 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gbrain-rehearsal-guard-only
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  podSelector:
+    matchLabels:
+      app: gbrain-rehearsal
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchExpressions:
+              - key: gbrain-access
+                operator: NotIn
+                values: ["guard-only"]
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              gbrain-access: guard-only
+      ports:
+        - port: 3140
+        - port: 3141
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-netpol-test-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-netpol-test
+        gbrain-access: guard-only
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: guard-only
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "-e"]
+          args:
+            - |
+              await Bun.sleep(20000);
+              const probe = async (url) => {
+                try {
+                  const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+                  return `HTTP ${r.status}`;
+                } catch (e) { return `failed: ${e.name}: ${e.message}`; }
+              };
+              console.log("pod label gbrain-access=guard-only (as Hermes will carry)");
+              console.log("gbrain-rehearsal:3131/health ->", await probe("http://gbrain-rehearsal:3131/health"));
+              console.log("RESULT: done");
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-netpol-control-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-netpol-control
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: control
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "-e"]
+          args:
+            - |
+              await Bun.sleep(20000);
+              const probe = async (url) => {
+                try {
+                  const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+                  return `HTTP ${r.status}`;
+                } catch (e) { return `failed: ${e.name}: ${e.message}`; }
+              };
+              console.log("pod without the gbrain-access label (control)");
+              console.log("gbrain-rehearsal:3131/health ->", await probe("http://gbrain-rehearsal:3131/health"));
+              console.log("RESULT: done");
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
