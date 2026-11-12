@@ -98,6 +98,9 @@ spec:
       owner: fireflies
   storage:
     size: 1Gi
+  inheritedMetadata:
+    annotations:
+      kyverno-relabel: "2026-11-12"
 ---
 apiVersion: v1
 kind: ConfigMap

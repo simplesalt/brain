@@ -72,6 +72,7 @@ metadata:
     entity: ssint
     env: main
     capability: agentdb
+    kyverno-relabel: "2026-11-12"
 spec:
   interval: 10m
   retryInterval: 1m

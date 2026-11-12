@@ -52,6 +52,9 @@ spec:
         - CREATE EXTENSION IF NOT EXISTS vector;
   storage:
     size: 5Gi
+  inheritedMetadata:
+    annotations:
+      kyverno-relabel: "2026-11-12"
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -81,6 +84,9 @@ spec:
           name: gbrain-pg-app
   storage:
     size: 5Gi
+  inheritedMetadata:
+    annotations:
+      kyverno-relabel: "2026-11-12"
 ---
 apiVersion: v1
 kind: ConfigMap

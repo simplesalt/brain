@@ -61,6 +61,9 @@ spec:
   storage:
     size: 10Gi
   enablePDB: false
+  inheritedMetadata:
+    annotations:
+      kyverno-relabel: "2026-11-12"
 ---
 apiVersion: apps/v1
 kind: Deployment

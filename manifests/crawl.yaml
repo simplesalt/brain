@@ -85,6 +85,7 @@ spec:
                 entity: ssint
                 env: main
                 capability: crawl
+                kyverno-relabel: "2026-11-12"
             spec:
               type: LoadBalancer
     roles:
@@ -95,6 +96,9 @@ spec:
           name: crawl-read-login
   storage:
     size: 5Gi
+  inheritedMetadata:
+    annotations:
+      kyverno-relabel: "2026-11-12"
 ---
 apiVersion: v1
 kind: Secret

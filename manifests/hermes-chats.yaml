@@ -15,6 +15,9 @@ spec:
       owner: hermes_chats
   storage:
     size: 5Gi
+  inheritedMetadata:
+    annotations:
+      kyverno-relabel: "2026-11-12"
 ---
 apiVersion: v1
 kind: ConfigMap
