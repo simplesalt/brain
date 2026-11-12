@@ -113,15 +113,14 @@ Save them there. gbrain holds project knowledge.
   first and pass its calendar page's `event_id` (in the page's frontmatter);
   a recurring meeting takes that one occurrence's id.
 - Finding a meeting: gbrain syncs a new invite within about two minutes.
-  Look only at `source_id: "google"`, `type: "meeting"` pages (slugs
-  `calendar/YYYY/MM/<date>-<title>-<hash>`). A new or recent invite:
-  `mcp__gbrain__list_pages` with `{"source_id": "google", "type": "meeting",
-  "sort": "updated_desc", "limit": 20}`. By title or person:
-  `mcp__gbrain__search` with `"source_id": "google"` and `"types":
-  ["meeting"]`, using words from the title or an attendee's name. Then
-  `mcp__gbrain__get_page` for the `event_id`, `start` and `organizer`.
-  Pages named `calendar/<id>` with type `calendar_event` in `default` are
-  old copies last updated in August 2026; never use them.
+  Calendar pages have type `meeting` or `calendar_event`; treat both the
+  same. A new or recent invite: `mcp__gbrain__list_pages` with `{"type":
+  "meeting", "sort": "updated_desc", "limit": 20}`. By title or person:
+  `mcp__gbrain__search` with `"types": ["meeting", "calendar_event"]`,
+  using words from the title or an attendee's name, not generic words like
+  "invite", "organizer" or a month. Then `mcp__gbrain__get_page` for the
+  `event_id`, `start` and `organizer`, and check `start` is the meeting
+  Dylan means.
 - Do what Dylan asked without asking again. When the meeting he means is
   unclear, run with `dry_run: true` and confirm the event with him first.
 - Events show dylan.evans@simplesalt.company as organizer; that is expected.
