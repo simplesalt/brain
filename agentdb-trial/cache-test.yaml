@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: agentdb-cache-test-t1
+  name: agentdb-cache-test-t2
   namespace: ssint-main-agentdb
   labels:
     entity: ssint

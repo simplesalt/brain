@@ -60,11 +60,12 @@ def agree_then_confirm(c, name, args, rounds=5):
             return {"ok": False, "round": rnd, "stage": "preview"}
         r = parse(text)
         rv = r.get("review", {})
-        if rv.get("agreed"):
+        if rv.get("agreed") or "agreed" not in rv:
             err, text = call(c, name, dict(args, confirm=True))
             r2 = parse(text)
             rv2 = r2.get("review", {})
             return {"ok": (not err) and bool(r2.get("applied")), "round": rnd, "stage": "confirm",
+                    "reviewed": "agreed" in rv,
                     "confirm_applied": r2.get("applied"), "confirm_review_agreed": rv2.get("agreed") if rv2 else None,
                     "second_disagreement": bool(rv2) and not rv2.get("agreed", True)}
         if rv.get("proposed_guidance") and "guidance" in args:
