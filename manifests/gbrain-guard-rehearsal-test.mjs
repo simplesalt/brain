@@ -75,7 +75,6 @@ check('mark_page_for_deletion records a mark', !r.isError && r.body?.status === 
 r = await call('get_page', { slug: note });
 check('a marked page is hidden from get_page', r.isError && code(r) === 'page_flagged_for_deletion', r.body);
 r = await call('list_pages', { limit: 500, sort: 'updated_desc' });
-console.log('list_pages raw shape:', typeof r.body, JSON.stringify(r.body).slice(0, 600));
 check('a marked page is left out of list_pages', !JSON.stringify(r.body).includes(note), { contains: JSON.stringify(r.body).includes(note) });
 r = await call('list_pages', { limit: 500, sort: 'updated_desc', include_deleted: true });
 check('list_pages with include_deleted shows it', JSON.stringify(r.body).includes(note), { contains: JSON.stringify(r.body).includes(note) });

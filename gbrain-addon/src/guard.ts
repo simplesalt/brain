@@ -354,9 +354,13 @@ export function makeGuardHandler(store: GuardStore, opts: GuardOpts) {
     if (!parsed || t === null || flagged.size === 0) {
       return new Response(raw, { status: res.status, headers: { 'content-type': res.headers.get('content-type') ?? 'application/json', ...extra } });
     }
-    let inner: unknown;
-    try { inner = JSON.parse(t); } catch { return rpcJson(parsed, extra); }
-    parsed.result.content = [{ type: 'text', text: JSON.stringify(filterFlagged(inner, flagged, opts.defaultSource)) }];
+    parsed.result.content = parsed.result.content.map((c: any) => {
+      if (typeof c?.text !== 'string') return c;
+      let inner: unknown;
+      try { inner = JSON.parse(c.text); } catch { return c; }
+      return { ...c, text: JSON.stringify(filterFlagged(inner, flagged, opts.defaultSource)) };
+    });
+    if (parsed.result.structuredContent !== undefined) parsed.result.structuredContent = filterFlagged(parsed.result.structuredContent, flagged, opts.defaultSource);
     return rpcJson(parsed, extra);
   };
 }

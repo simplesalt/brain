@@ -125,7 +125,10 @@ describe('guard http', () => {
     }
     const name = body.params?.name;
     const result = name === 'search' ? { results: [{ slug: 'notes/old' }, { slug: 'notes/new' }] } : { ok: true };
-    return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: JSON.stringify(result) }] } }), { headers: { 'content-type': 'application/json' } });
+    const content = name === 'list_pages'
+      ? [{ type: 'text', text: JSON.stringify([{ slug: 'notes/old', source_id: 'default' }, { slug: 'notes/new', source_id: 'default' }]) }, { type: 'text', text: 'Showing 2 pages.' }]
+      : [{ type: 'text', text: JSON.stringify(result) }];
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { content } }), { headers: { 'content-type': 'application/json' } });
   }) as unknown as typeof fetch;
   const mem = memStore(pages());
   const handle = makeGuardHandler(mem.store, { upstream: 'http://gbrain:3131/mcp', defaultSource: 'default', fetchImpl: upstream, log: () => {} });
@@ -169,6 +172,9 @@ describe('guard http', () => {
     expect(JSON.parse(s.result.content[0].text).results).toEqual([{ slug: 'notes/new' }]);
     const g = await (await tool('get_page', { slug: 'notes/old' })).json();
     expect(JSON.parse(g.result.content[0].text).error).toBe('page_flagged_for_deletion');
+    const lp = await (await tool('list_pages', {})).json();
+    expect(JSON.parse(lp.result.content[0].text)).toEqual([{ slug: 'notes/new', source_id: 'default' }]);
+    expect(lp.result.content[1].text).toBe('Showing 2 pages.');
     const all = await (await tool('search', { query: 'notes', include_deleted: true })).json();
     expect(JSON.parse(all.result.content[0].text).results).toHaveLength(2);
     expect(calls.every(c => c.body.params.arguments.include_deleted === undefined)).toBe(true);
