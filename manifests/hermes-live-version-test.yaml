@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: hermes-live-version-test-1
+  name: hermes-live-version-test-2
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -159,7 +159,7 @@ spec:
           workingDir: /opt/data
           command: ["/bin/sh", "-c"]
           args:
-            - |
+            - |+
               H=/opt/hermes/.venv/bin/hermes
               PY=/opt/hermes/.venv/bin/python
               trap 'touch /work/done' EXIT
@@ -219,14 +219,16 @@ spec:
               $PY /work/setup.py
               echo
               echo "== meeting-ingest prompt, run from a directory without AGENTS.md (as cron does)"
-              { echo "## Script output"; echo; echo "meetings/2026-11-12-live-version-test-zzyzx-call"; echo; cat /work/cron-meeting-ingest.md; } > /work/meeting-prompt.txt
+              { echo "## Script Output"; echo; echo "The following data was collected by a pre-run script. Use it as context for your analysis."; echo; echo '```'; echo "1 meeting to ingest; 0 more waiting."; printf '{\n "slug": "meetings/2026-11-12-live-version-test-zzyzx-call",\n "title": "Live version test call",\n "date": "2026-11-12"\n}\n'; echo '```'; echo; cat /work/cron-meeting-ingest.md; } > /work/meeting-prompt.txt
+                            echo "-- prompt head:"; head -n 12 /work/meeting-prompt.txt
               (cd /work/cron-cwd && HERMES_ORIG_CWD=/work/cron-cwd timeout 1200 $H chat -Q --query-file /work/meeting-prompt.txt 2>&1 | tail -n 40; echo "[exit $?]")
               echo
-              echo "== note-capture answer, run as chat (AGENTS.md loaded)"
+              echo "== note-capture already proven in run 1; skipped"; if false; then echo
               { echo "Use these skill instructions:"; echo; cat /work/skill-note-capture.md; echo; echo "Dylan says: on notes/2026-11-12-live-version-test, the legacy admin panel is out of scope, and I sent the scoping questionnaire today."; } > /work/note-prompt.txt
-              timeout 900 $H chat -Q --query-file /work/note-prompt.txt 2>&1 | tail -n 30; echo "[exit $?]"
+              timeout 900 $H chat -Q --query-file /work/note-prompt.txt 2>&1 | tail -n 30; echo "[exit $?]"; fi
               echo
               $PY /work/after.py
+
           env:
             - name: HERMES_HOME
               value: /opt/data
