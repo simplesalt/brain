@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: agentdb-mcp-test-t927b
+  name: agentdb-mcp-test-t927c
   namespace: ssint-main-agentdb
   labels:
     entity: ssint

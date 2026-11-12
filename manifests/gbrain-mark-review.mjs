@@ -67,11 +67,11 @@ for (const m of open) {
 
   const [page] = await db`SELECT to_jsonb(p)->>'knowledge_revision' AS revision, p.deleted_at FROM pages p WHERE p.slug = ${m.slug} AND p.source_id = ${m.source_id}`;
   if (!page || page.deleted_at) {
-    await db`UPDATE addon_page_marks SET withdrawn_at = now(), outcome = 'page_gone' WHERE id = ${m.id}`;
+    if (APPLY) await db`UPDATE addon_page_marks SET withdrawn_at = now(), outcome = 'page_gone' WHERE id = ${m.id}`;
     log({ ...base, outcome: 'page_gone' }); bump('page_gone'); continue;
   }
   if (m.page_revision && page.revision !== m.page_revision) {
-    await db`UPDATE addon_page_marks SET withdrawn_at = now(), outcome = 'page_changed_since_mark' WHERE id = ${m.id}`;
+    if (APPLY) await db`UPDATE addon_page_marks SET withdrawn_at = now(), outcome = 'page_changed_since_mark' WHERE id = ${m.id}`;
     log({ ...base, outcome: 'page_changed_since_mark', marked_revision: m.page_revision, current_revision: page.revision }); bump('page_changed_since_mark'); continue;
   }
   if (backupAge === null || backupAge > BACKUP_MAX_AGE_HOURS) {
