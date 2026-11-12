@@ -1,0 +1,70 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-versions-check-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-versions-check
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: check
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=60000'
+              case "$DATABASE_URL" in *@gbrain-pg-rw[.:/]*) ;; *) echo "FATAL: not gbrain-pg-rw"; exit 1 ;; esac
+              q() { echo "+ $1"; psql -X -v ON_ERROR_STOP=0 -c "$1" "$DATABASE_URL"; }
+              q "SHOW default_transaction_read_only"
+              q "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'page_versions' ORDER BY ordinal_position"
+              q "SELECT count(*) AS versions, count(DISTINCT page_id) AS pages_with_versions, min(snapshot_at) AS oldest, max(snapshot_at) AS newest, count(*) FILTER (WHERE is_deleted) AS deleted_snapshots FROM page_versions"
+              q "SELECT date_trunc('day', snapshot_at)::date AS day, count(*) FROM page_versions GROUP BY 1 ORDER BY 1"
+              q "SELECT n AS versions_per_page, count(*) AS pages FROM (SELECT page_id, count(*) n FROM page_versions GROUP BY 1) x GROUP BY 1 ORDER BY 1 DESC LIMIT 15"
+              q "SELECT count(*) AS live_pages, count(*) FILTER (WHERE id IN (SELECT page_id FROM page_versions)) AS live_with_versions FROM pages WHERE deleted_at IS NULL"
+              q "SELECT p.slug, p.updated_at, (SELECT count(*) FROM page_versions v WHERE v.page_id = p.id) AS versions, (SELECT max(snapshot_at) FROM page_versions v WHERE v.page_id = p.id) AS last_snapshot FROM pages p WHERE p.deleted_at IS NULL ORDER BY p.updated_at DESC LIMIT 15"
+              q "SELECT count(*) AS soft_deleted, min(deleted_at), max(deleted_at) FROM pages WHERE deleted_at IS NOT NULL"
+              q "SELECT key, value FROM config WHERE key ~* 'purge|version|retention|recover|cycle' ORDER BY key"
+              q "SELECT operation, state, count(*), min(created_at), max(created_at) FROM persistence_requests WHERE operation IN ('put_page','edit_page','delete_page','restore_page','revert_version') GROUP BY 1,2 ORDER BY 1,2"
+              q "SELECT pr.operation, count(*) AS writes, count(*) FILTER (WHERE EXISTS (SELECT 1 FROM page_versions v WHERE v.page_id = pr.page_id AND v.snapshot_at BETWEEN pr.created_at - interval '5 seconds' AND pr.created_at + interval '30 seconds')) AS with_snapshot FROM persistence_requests pr WHERE pr.state = 'committed' AND pr.created_at > now() - interval '7 days' AND pr.page_id IS NOT NULL GROUP BY 1"
+              echo "RESULT: done"
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
