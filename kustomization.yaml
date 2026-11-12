@@ -35,7 +35,6 @@ resources:
   - manifests/gcp-sso.yaml
   - manifests/efforts.yaml
   - manifests/agentdb.yaml
-  - manifests/agentdb-crd-retire.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
