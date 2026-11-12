@@ -35,6 +35,7 @@ resources:
   - manifests/gcp-sso.yaml
   - manifests/efforts.yaml
   - manifests/agentdb.yaml
+  - manifests/fireflies-ingest-rehearsal-test.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai

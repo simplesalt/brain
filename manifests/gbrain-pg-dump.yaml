@@ -30,7 +30,6 @@ metadata:
     kustomize.toolkit.fluxcd.io/force: enabled
 spec:
   activeDeadlineSeconds: 1800
-  ttlSecondsAfterFinished: 604800
   backoffLimit: 0
   template:
     metadata:
@@ -288,7 +287,6 @@ metadata:
     kustomize.toolkit.fluxcd.io/force: enabled
 spec:
   activeDeadlineSeconds: 3600
-  ttlSecondsAfterFinished: 604800
   backoffLimit: 0
   template:
     metadata:
