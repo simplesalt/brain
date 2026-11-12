@@ -170,7 +170,7 @@ data:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fireflies-ingest-rehearsal-test-1
+  name: fireflies-ingest-rehearsal-test-2
   namespace: ssint-main-msg
   labels:
     entity: ssint
