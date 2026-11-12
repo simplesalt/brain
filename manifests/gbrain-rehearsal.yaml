@@ -20,6 +20,7 @@ metadata:
     env: main
     capability: ai
     resiliency.simplesalt.company/ha: exempt
+    stateful: "true"
 spec:
   instances: 1
   imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
@@ -61,6 +62,9 @@ spec:
   storage:
     size: 10Gi
   enablePDB: false
+  inheritedMetadata:
+    labels:
+      stateful: "true"
 ---
 apiVersion: apps/v1
 kind: Deployment
