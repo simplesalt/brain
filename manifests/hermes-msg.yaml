@@ -711,7 +711,15 @@ data:
 
 
     const CALENDAR_API = 'https://www.googleapis.com/calendar/v3/calendars/primary/events';
-    const CALENDAR_TZ = 'America/New_York';
+    let _calendarTz = null;
+
+    async function calendarTz() {
+      if (!_calendarTz) {
+        const r = await calendarFetch('', { query: { maxResults: '1' } });
+        _calendarTz = r?.timeZone || 'America/Chicago';
+      }
+      return _calendarTz;
+    }
 
     function calendarOwner() {
       if (!DEFAULT_IMPERSONATE) throw new Error('GOOGLE_IMPERSONATE_EMAIL not configured');
@@ -731,13 +739,13 @@ data:
       return text ? JSON.parse(text) : null;
     }
 
-    function calendarTime(value, field) {
+    async function calendarTime(value, field) {
       const v = String(value ?? '').trim();
       if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return { date: v };
       if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v) || Number.isNaN(Date.parse(v))) {
         throw new Error(`${field} must be an ISO 8601 date-time or a YYYY-MM-DD date`);
       }
-      return { dateTime: v, timeZone: CALENDAR_TZ };
+      return { dateTime: v, timeZone: await calendarTz() };
     }
 
     function calendarEmails(list, field) {
@@ -782,8 +790,8 @@ data:
         if (!start || !end) throw new Error('start and end required for create');
         const body = {
           summary,
-          start: calendarTime(start, 'start'),
-          end: calendarTime(end, 'end'),
+          start: await calendarTime(start, 'start'),
+          end: await calendarTime(end, 'end'),
           ...(location ? { location } : {}),
           ...(description ? { description } : {}),
         };
@@ -827,8 +835,8 @@ data:
       if (location !== undefined) patch.location = location;
       if (start !== undefined || end !== undefined) {
         if (start === undefined || end === undefined) throw new Error('moving an event needs both start and end');
-        patch.start = calendarTime(start, 'start');
-        patch.end = calendarTime(end, 'end');
+        patch.start = await calendarTime(start, 'start');
+        patch.end = await calendarTime(end, 'end');
       }
       const existing = ev.attendees ?? [];
       const have = new Set(existing.map(a => String(a.email).toLowerCase()));
@@ -900,7 +908,7 @@ data:
             action:        { type: 'string', enum: ['create', 'update', 'cancel'] },
             event_id:      { type: 'string', description: "update/cancel: the event_id from the meeting's gbrain calendar page frontmatter" },
             summary:       { type: 'string', description: 'Event title (required for create)' },
-            start:         { type: 'string', description: 'ISO 8601 date-time (offset optional; default zone America/New_York) or YYYY-MM-DD for all-day. Required for create; give with end to move an event' },
+            start:         { type: 'string', description: 'ISO 8601 date-time (offset optional; without one, the calendar time zone) or YYYY-MM-DD for all-day. Required for create; give with end to move an event' },
             end:           { type: 'string', description: 'Same format as start; for all-day events the day after the last day' },
             location:      { type: 'string', description: 'Address, room or video link; empty string clears it on update' },
             description:   { type: 'string', description: 'Event notes' },
@@ -1082,7 +1090,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "11"
+        simplesalt.company/restart-epoch: "12"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
