@@ -1,0 +1,99 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hermes-state-guard-test-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: state-guard
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GBRAIN_URL
+              value: http://gbrain-rehearsal:3131/mcp
+            - name: GBRAIN_REMOTE_TOKEN
+              value: gbrain-mcp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: HERMES_HOME
+              value: /tmp/hermes
+          command: ["python3", "-c"]
+          args:
+            - |
+              import datetime, importlib, json, os, subprocess, sys
+              sys.path.insert(0, "/seed")
+              scan = importlib.import_module("cron-people-scan")
+              SLUG = "ops/timeline-sweep"
+              def info(slug=SLUG):
+                  r = scan.call("get_page", {"slug": slug, "body": "none"})
+                  return r.get("revision"), (r.get("size") or {}).get("total_bytes")
+              print("gbrain:", json.dumps(scan.call("get_brain_identity", {}))[:200])
+              ok = True
+              try:
+                  small = scan.load_state()
+                  print(f"step 0: ops/people-scan read whole on this version, {len(small)} entries")
+              except scan.StateError as e:
+                  print(f"step 0: FAIL small state page refused: {e}")
+                  ok = False
+              today = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              done = {f"emails/2026/11/2026-11-12-state-guard-test-entry-{i:05d}-padding-padding": today for i in range(3000)}
+              content = ("---\ntype: note\ntitle: Timeline sweep state\n---\n\n# Timeline sweep state\n\nprojects#931 rehearsal: a state page over 256 KB.\n\n"
+                         "```json\n" + json.dumps(done, sort_keys=True) + "\n```\n")
+              args = {"slug": SLUG, "content": content}
+              try:
+                  args["expected_revision"] = info()[0]
+              except RuntimeError:
+                  pass
+              scan.call("put_page", args)
+              before = info()
+              print(f"seeded {SLUG}: revision {before[0]}, {before[1]} bytes")
+              env = dict(os.environ)
+              p = subprocess.run([sys.executable, "/seed/cron-timeline-sweep.py"], capture_output=True, text=True, env=env)
+              print(f"step 1: cron-timeline-sweep.py exit {p.returncode}")
+              print("  stdout:", p.stdout.strip()[:500])
+              print("  stderr:", p.stderr.strip()[:800])
+              after1 = info()
+              print(f"  page after: revision {after1[0]}, {after1[1]} bytes")
+              ok &= p.returncode == 1 and "FAILED" in p.stderr and after1 == before
+              code = ("import sys; sys.path.insert(0, '/seed'); import importlib; s = importlib.import_module('cron-people-scan'); "
+                      f"s.run(lambda: s.put_state_page({{'slug': '{SLUG}', 'content': '---\\ntype: note\\n---\\n\\n# shrunk\\n', "
+                      f"'expected_revision': '{before[0]}'}}), 'timeline-sweep')")
+              p2 = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+              print(f"step 2: forced shrinking state write through put_state_page, exit {p2.returncode}")
+              print("  stderr:", p2.stderr.strip()[:800])
+              after2 = info()
+              print(f"  page after: revision {after2[0]}, {after2[1]} bytes")
+              ok &= p2.returncode == 1 and "page_shrink_refused" in p2.stderr and after2 == before
+              print("RESULT:", "PASS" if ok else "FAIL")
+              sys.exit(0 if ok else 1)
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: seed
+              mountPath: /seed
+              readOnly: true
+      volumes:
+        - name: seed
+          configMap:
+            name: hermes-config

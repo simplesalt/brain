@@ -39,6 +39,7 @@ resources:
   - manifests/gbrain-pg-backup.yaml
   - manifests/gbrain-pg-backup-first.yaml
   - manifests/hermes-live-version-test.yaml
+  - manifests/hermes-state-guard-test.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
