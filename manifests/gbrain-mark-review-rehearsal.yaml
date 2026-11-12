@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-mark-review-rehearsal-1
+  name: gbrain-mark-review-rehearsal-2
   namespace: ssint-main-ai
   labels:
     entity: ssint
