@@ -3,20 +3,10 @@ kind: Kustomization
 namespace: ssint-main-agentdb
 resources:
   - trial.yaml
-  - cache-test.yaml
 configMapGenerator:
   - name: agentdb-probe
     files:
       - probe.py
-    options:
-      disableNameSuffixHash: true
-      labels:
-        entity: ssint
-        env: main
-        capability: agentdb
-  - name: agentdb-cache-test
-    files:
-      - cache_test.py
     options:
       disableNameSuffixHash: true
       labels:
