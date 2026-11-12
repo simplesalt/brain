@@ -424,11 +424,34 @@ def row_view(page):
 
 # ---------- state ----------
 
+class StateError(Exception):
+    pass
+
+
+def state_body(page, slug):
+    """compiled_truth of a state page read in full; StateError when gbrain sent an outline or a window instead."""
+    if not isinstance(page, dict):
+        raise StateError(f"{slug}: get_page returned no page; state not read, nothing written")
+    if "compiled_truth" not in page or page.get("auto_reason") or page.get("truncated"):
+        size = (page.get("size") or {}).get("total_bytes")
+        how = page.get("auto_reason") or page.get("body") or "a partial page"
+        raise StateError(f"{slug}: get_page returned {how}{f' ({size} bytes)' if size else ''} instead of the whole "
+                         f"state page; state not read, nothing written")
+    return page.get("compiled_truth") or ""
+
+
+def put_state_page(args):
+    try:
+        return call("put_page", args)
+    except RuntimeError as e:
+        raise StateError(f"{args['slug']}: state write refused: {e}") from None
+
+
 def load_state():
     state = {}
     try:
         page = call("get_page", {"slug": STATE})
-        body = (page.get("compiled_truth") or "") if isinstance(page, dict) else ""
+        body = state_body(page, STATE)
         m = re.search(r"```json\n(.*?)\n```", body, re.S)
         state = json.loads(m.group(1)) if m else {}
     except RuntimeError:
@@ -454,7 +477,7 @@ def save_state(state):
     args = {"slug": STATE, "content": content}
     try:
         page = call("get_page", {"slug": STATE})
-        page = page if isinstance(page, dict) else {}
+        state_body(page, STATE)
         if page.get("revision"):
             args["expected_revision"] = page["revision"]
         timeline = (page.get("timeline") or "").strip()
@@ -462,7 +485,7 @@ def save_state(state):
             args["content"] = content + "\n" + timeline + "\n"
     except RuntimeError:
         pass
-    call("put_page", args)
+    put_state_page(args)
 
 
 def read_results(read):
@@ -782,4 +805,8 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         self_test()
     else:
-        main("--dry-run" in sys.argv)
+        try:
+            main("--dry-run" in sys.argv)
+        except StateError as e:
+            print(f"loop-tasks-sync: FAILED {e}", file=sys.stderr)
+            sys.exit(1)

@@ -64,7 +64,7 @@ def load_state():
         page = scan.call("get_page", {"slug": STATE})
     except RuntimeError:
         return {}
-    body = (page.get("compiled_truth") or "") if isinstance(page, dict) else ""
+    body = scan.state_body(page, STATE)
     m = re.search(r"```json\n(.*?)\n```", body, re.S)
     data = json.loads(m.group(1)) if m else {}
     return data if isinstance(data, dict) else {}
@@ -164,4 +164,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except scan.StateError as e:
+        print(f"timeline-sweep: FAILED {e}", file=sys.stderr)
+        sys.exit(1)

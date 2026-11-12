@@ -284,13 +284,36 @@ def review_item(entry, users):
     }
 
 
+class StateError(Exception):
+    pass
+
+
+def state_body(page, slug):
+    """compiled_truth of a state page read in full; StateError when gbrain sent an outline or a window instead."""
+    if not isinstance(page, dict):
+        raise StateError(f"{slug}: get_page returned no page; state not read, nothing written")
+    if "compiled_truth" not in page or page.get("auto_reason") or page.get("truncated"):
+        size = (page.get("size") or {}).get("total_bytes")
+        how = page.get("auto_reason") or page.get("body") or "a partial page"
+        raise StateError(f"{slug}: get_page returned {how}{f' ({size} bytes)' if size else ''} instead of the whole "
+                         f"state page; state not read, nothing written")
+    return page.get("compiled_truth") or ""
+
+
+def put_state_page(args):
+    try:
+        return call("put_page", args)
+    except RuntimeError as e:
+        raise StateError(f"{args['slug']}: state write refused: {e}") from None
+
+
 def load_state():
     """The saved state, or None when the page does not exist yet (the very first run)."""
     try:
         page = call("get_page", {"slug": STATE})
     except RuntimeError:
         return None
-    body = (page.get("compiled_truth") or "") if isinstance(page, dict) else ""
+    body = state_body(page, STATE)
     m = re.search(r"```json\n(.*?)\n```", body, re.S)
     state = json.loads(m.group(1)) if m else {}
     # gbrain refuses a put_page on an existing page without the revision just read.
@@ -357,7 +380,7 @@ def save_state(state):
     args = {"slug": STATE, "content": content}
     if revision is not None:
         args["expected_revision"] = revision
-    call("put_page", args)
+    put_state_page(args)
 
 
 def apply_results(state, now):
@@ -444,4 +467,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except StateError as e:
+        print(f"deletion-review: FAILED {e}", file=sys.stderr)
+        sys.exit(1)

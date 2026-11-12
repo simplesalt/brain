@@ -76,6 +76,29 @@ def call(tool, args):
     raise RuntimeError(f"{tool}: no response")
 
 
+class StateError(Exception):
+    pass
+
+
+def state_body(page, slug):
+    """compiled_truth of a state page read in full; StateError when gbrain sent an outline or a window instead."""
+    if not isinstance(page, dict):
+        raise StateError(f"{slug}: get_page returned no page; state not read, nothing written")
+    if "compiled_truth" not in page or page.get("auto_reason") or page.get("truncated"):
+        size = (page.get("size") or {}).get("total_bytes")
+        how = page.get("auto_reason") or page.get("body") or "a partial page"
+        raise StateError(f"{slug}: get_page returned {how}{f' ({size} bytes)' if size else ''} instead of the whole "
+                         f"state page; state not read, nothing written")
+    return page.get("compiled_truth") or ""
+
+
+def put_state_page(args):
+    try:
+        return call("put_page", args)
+    except RuntimeError as e:
+        raise StateError(f"{args['slug']}: state write refused: {e}") from None
+
+
 def put_state(slug, content):
     args = {"slug": slug, "content": content}
     try:
@@ -84,13 +107,14 @@ def put_state(slug, content):
         if "not_found" not in str(e):
             raise
         page = None
-    if isinstance(page, dict):
+    if page is not None:
+        state_body(page, slug)
         if page.get("revision"):
             args["expected_revision"] = page["revision"]
         timeline = (page.get("timeline") or "").strip()
         if timeline:
             args["content"] = content.rstrip("\n") + "\n\n" + timeline + "\n"
-    call("put_page", args)
+    put_state_page(args)
 
 
 def first_json(text, opener="["):
@@ -112,6 +136,9 @@ def run(main, name):
     except Unreachable as e:
         print(f"{name}: {e}; the next run retries", file=sys.stderr)
         print(json.dumps({"wakeAgent": False}))
+    except StateError as e:
+        print(f"{name}: FAILED {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def all_pages(**filters):
@@ -181,7 +208,7 @@ def load_state():
         page = call("get_page", {"slug": STATE})
     except RuntimeError:
         return set()
-    body = (page.get("compiled_truth") or "") if isinstance(page, dict) else ""
+    body = state_body(page, STATE)
     m = re.search(r"```json\n(.*?)\n```", body, re.S)
     return set(json.loads(m.group(1))) if m else set()
 

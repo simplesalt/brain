@@ -94,6 +94,29 @@ def is_fireflies(page):
     return bool(head and re.search(r"^fireflies_id:\s*\S", head.group(1), re.M))
 
 
+class StateError(Exception):
+    pass
+
+
+def state_body(page, slug):
+    """compiled_truth of a state page read in full; StateError when gbrain sent an outline or a window instead."""
+    if not isinstance(page, dict):
+        raise StateError(f"{slug}: get_page returned no page; state not read, nothing written")
+    if "compiled_truth" not in page or page.get("auto_reason") or page.get("truncated"):
+        size = (page.get("size") or {}).get("total_bytes")
+        how = page.get("auto_reason") or page.get("body") or "a partial page"
+        raise StateError(f"{slug}: get_page returned {how}{f' ({size} bytes)' if size else ''} instead of the whole "
+                         f"state page; state not read, nothing written")
+    return page.get("compiled_truth") or ""
+
+
+def put_state_page(args):
+    try:
+        return call("put_page", args)
+    except RuntimeError as e:
+        raise StateError(f"{args['slug']}: state write refused: {e}") from None
+
+
 def load_state():
     """Returns (done slugs, pending {slug: {"at", "tries"}}, state page revision or None, whether it exists).
     An older state page holds a plain list of done slugs."""
@@ -103,7 +126,7 @@ def load_state():
         return set(), {}, None, False
     if not isinstance(page, dict):
         return set(), {}, None, False
-    m = re.search(r"```json\n(.*?)\n```", page.get("compiled_truth") or "", re.S)
+    m = re.search(r"```json\n(.*?)\n```", state_body(page, STATE), re.S)
     data = json.loads(m.group(1)) if m else []
     if isinstance(data, list):
         return set(data), {}, page.get("revision"), True
@@ -120,7 +143,7 @@ def save_state(done, pending, revision, keep):
     args = {"slug": STATE, "content": content}
     if revision is not None:
         args["expected_revision"] = revision
-    call("put_page", args)
+    put_state_page(args)
 
 
 def finished_slugs():
@@ -334,4 +357,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except StateError as e:
+        print(f"meeting-ingest: FAILED {e}", file=sys.stderr)
+        sys.exit(1)

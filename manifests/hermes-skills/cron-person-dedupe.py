@@ -357,7 +357,7 @@ def load_state():
         page = call("get_page", {"slug": STATE})
     except RuntimeError:
         return empty
-    body = (page.get("compiled_truth") or "") if isinstance(page, dict) else ""
+    body = scan.state_body(page, STATE)
     m = re.search(r"```json\n(.*?)\n```", body, re.S)
     return dict(empty, **json.loads(m.group(1))) if m else empty
 
@@ -369,11 +369,12 @@ def save_state(state):
     args = {"slug": STATE, "content": content}
     try:
         cur = call("get_page", {"slug": STATE, "include_content": True})
+        scan.state_body(cur, STATE)
         if cur.get("revision"):
             args["expected_revision"] = cur["revision"]
     except RuntimeError:
         pass
-    call("put_page", args)
+    scan.put_state_page(args)
 
 
 # --------------------------------------------------------------------- main
@@ -464,4 +465,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except scan.StateError as e:
+        print(f"person-dedupe: FAILED {e}", file=sys.stderr)
+        sys.exit(1)

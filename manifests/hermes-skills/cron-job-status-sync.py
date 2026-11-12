@@ -83,7 +83,7 @@ def load_state():
     state = {}
     try:
         page = call("get_page", {"slug": STATE})
-        body = (page.get("compiled_truth") or "") if isinstance(page, dict) else ""
+        body = scan.state_body(page, STATE)
         m = re.search(r"```json\n(.*?)\n```", body, re.S)
         state = json.loads(m.group(1)) if m else {}
     except RuntimeError:
