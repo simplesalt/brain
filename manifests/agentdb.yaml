@@ -47,7 +47,7 @@ spec:
   values:
     instanceName: trial
     image:
-      digest: sha256:970b28de15a33ac10477083713f7a2bcc2e63cb72c3d3718b806259a7be04918
+      digest: sha256:d5263a6f571209b9d69088751436667326f6cea0443af3ba0544c21b02d64ddd
     postgres:
       instances: 2
       imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
