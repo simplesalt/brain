@@ -2,17 +2,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import { PGLiteEngine } from 'gbrain/pglite-engine';
 import {
   decide, engineStore, ensureGuardTables, filterFlagged, flagKey, makeGuardHandler,
-  type ArchiveInput, type GuardStore, type MarkInput, type StoredPage,
+  type GuardStore, type MarkInput, type StoredPage,
 } from '../src/guard.ts';
 
 function memStore(pages: Record<string, StoredPage>) {
   const marks: Array<MarkInput & { id: number; withdrawn: boolean }> = [];
-  const archived: ArchiveInput[] = [];
   const store: GuardStore = {
     async page(slug, sourceId) { return pages[`${sourceId}:${slug}`] ?? null; },
-    async snapshot(slug, sourceId) {
-      return pages[`${sourceId}:${slug}`] ? { title: 'T', type: 'note', frontmatter: {}, compiledTruth: 'x'.repeat(pages[`${sourceId}:${slug}`].bytes), timeline: '', bodyStorage: 'inline' } : null;
-    },
     async mark(m) {
       let replaced = 0;
       for (const x of marks) if (x.slug === m.slug && x.sourceId === m.sourceId && !x.withdrawn) { x.withdrawn = true; replaced++; }
@@ -25,12 +21,8 @@ function memStore(pages: Record<string, StoredPage>) {
       return n;
     },
     async flagged() { return new Set(marks.filter(m => m.kind === 'delete' && !m.withdrawn).map(m => flagKey(m.sourceId, m.slug))); },
-    async archive(a) { archived.push(a); return archived.length; },
-    async archives(slug, sourceId) {
-      return archived.filter(a => a.slug === slug && a.sourceId === sourceId).map((a, i) => ({ id: i + 1, slug, source_id: sourceId, tool: a.tool, stored_bytes: a.storedBytes, removed_bytes: a.removedBytes, created_at: 'now', content: a.content, compiled_truth: a.snapshot.compiledTruth }));
-    },
   };
-  return { store, marks, archived };
+  return { store, marks };
 }
 
 const pages = () => ({
@@ -63,7 +55,7 @@ describe('guard decisions: refused', () => {
   });
 });
 
-describe('guard decisions: allowed and archived', () => {
+describe('guard decisions: allowed', () => {
   const { store, marks } = memStore(pages());
   const d = (name: string, args: Record<string, unknown>) => decide(name, args, store, 'default', 'p');
 
@@ -76,17 +68,14 @@ describe('guard decisions: allowed and archived', () => {
     expect(await d('append_page', { slug: 'people/jane', text: 'more', request_id: 'x' })).toEqual({ action: 'forward' });
     expect(await d('add_timeline_entry', { slug: 'people/jane', date: '2026-11-12', summary: 's' })).toEqual({ action: 'forward' });
   });
-  test('edit_page that grows, or shrinks by 30% or less, is not archived', async () => {
+  test('edit_page of any size is forwarded unchanged (gbrain versions the page before every write)', async () => {
     expect(await d('edit_page', { slug: 'people/jane', expected_revision: 'r1', edits: [{ old_text: 'a', new_text: 'abc' }] })).toEqual({ action: 'forward' });
-    expect(await d('edit_page', { slug: 'people/jane', expected_revision: 'r1', edits: [{ old_text: 'a'.repeat(300), new_text: '' }] })).toEqual({ action: 'forward' });
+    expect(await d('edit_page', { slug: 'people/jane', expected_revision: 'r1', edits: [{ old_text: 'a'.repeat(900), new_text: '' }] })).toEqual({ action: 'forward' });
+    expect(await d('edit_page', { slug: 'notes/tiny', expected_revision: 'r2', edits: [{ old_text: 'a'.repeat(99), new_text: '' }] })).toEqual({ action: 'forward' });
   });
-  test('edit_page shrinking by more than 30% is archived first, then forwarded', async () => {
-    const r = await d('edit_page', { slug: 'people/jane', expected_revision: 'r1', edits: [{ old_text: 'a'.repeat(200), new_text: '' }, { old_text: 'b'.repeat(200), new_text: 'c' }] });
-    expect(r).toMatchObject({ action: 'forward', archive: { slug: 'people/jane', storedBytes: 1000, removedBytes: 399 } });
-  });
-  test('edit_page emptying a small page is archived, not refused', async () => {
-    const r = await d('edit_page', { slug: 'notes/tiny', expected_revision: 'r2', edits: [{ old_text: 'a'.repeat(99), new_text: '' }] });
-    expect(r).toMatchObject({ action: 'forward', archive: { slug: 'notes/tiny' } });
+  test('get_versions and revert_version pass through', async () => {
+    expect(await d('get_versions', { slug: 'people/jane' })).toEqual({ action: 'forward' });
+    expect(await d('revert_version', { slug: 'people/jane', version_id: 3 })).toEqual({ action: 'forward' });
   });
   test('reads strip include_deleted and are filtered by default', async () => {
     expect(await d('search', { query: 'jane' })).toEqual({ action: 'forward', args: { query: 'jane' }, filter: true });
@@ -144,7 +133,7 @@ describe('guard http', () => {
   test('tools/list hides refused tools, adds guard tools and include_deleted', async () => {
     const r = await (await rpc('tools/list', {})).json();
     const names = r.result.tools.map((t: { name: string }) => t.name);
-    expect(names).toEqual(['get_page', 'put_page', 'mark_page_for_deletion', 'propose_page_replacement', 'withdraw_page_mark', 'get_page_archives']);
+    expect(names).toEqual(['get_page', 'put_page', 'mark_page_for_deletion', 'propose_page_replacement', 'withdraw_page_mark']);
     expect(r.result.tools[0].inputSchema.properties.include_deleted.type).toBe('boolean');
   });
   test('a refused call never reaches gbrain and returns a tool error', async () => {
@@ -159,14 +148,12 @@ describe('guard http', () => {
     expect(calls[0].auth).toBe('Bearer t');
     expect(r.result.content[0].text).toBe('{"ok":true}');
   });
-  test('a big shrinking edit is archived, then forwarded, and the archive can be read', async () => {
-    const r = await (await tool('edit_page', { slug: 'notes/old', expected_revision: 'r3', edits: [{ old_text: 'x'.repeat(400), new_text: '' }] })).json();
-    expect(r.result.content[0].text).toBe('{"ok":true}');
-    expect(calls).toHaveLength(1);
-    expect(mem.archived).toHaveLength(1);
-    expect(mem.archived[0]).toMatchObject({ slug: 'notes/old', storedBytes: 500, removedBytes: 400 });
-    const a = await (await tool('get_page_archives', { slug: 'notes/old' })).json();
-    expect(JSON.parse(a.result.content[0].text).archives[0].compiled_truth).toHaveLength(500);
+  test('marking a page for deletion never forwards anything to gbrain', async () => {
+    const r = await (await tool('mark_page_for_deletion', { slug: 'notes/old', reason: 'dup' })).json();
+    expect(JSON.parse(r.result.content[0].text).status).toBe('marked');
+    expect(calls).toHaveLength(0);
+    await tool('withdraw_page_mark', { slug: 'notes/old' });
+    expect(calls).toHaveLength(0);
   });
   test('a flagged page is hidden from search results and get_page, visible with include_deleted', async () => {
     await tool('mark_page_for_deletion', { slug: 'notes/old', reason: 'dup' });
@@ -199,25 +186,20 @@ describe('guard store on a gbrain database', () => {
   }, 60_000);
   afterAll(async () => { await engine.disconnect(); });
 
-  test('page lookup, snapshot, mark, flag, supersede, withdraw and archive', async () => {
+  test('page lookup, mark, flag, supersede and withdraw; no archive table', async () => {
     await engine.executeRaw(`INSERT INTO sources (id, name, config) VALUES ('default', 'default', '{}'::jsonb) ON CONFLICT (id) DO NOTHING`);
     await engine.putPage('people/guard-test', { type: 'person', title: 'Guard Test', compiled_truth: 'x'.repeat(500), timeline: '' } as never);
     const store = engineStore(engine, 0);
     const page = await store.page('people/guard-test', 'default');
     expect(page?.bytes).toBeGreaterThanOrEqual(500);
     expect(await store.page('people/none', 'default')).toBeNull();
-    const snap = await store.snapshot('people/guard-test', 'default');
-    expect(snap?.compiledTruth?.length).toBeGreaterThanOrEqual(500);
     await store.mark({ kind: 'delete', slug: 'people/guard-test', sourceId: 'default', reason: 'r', content: null, principal: 'p', page: page! });
     expect((await store.flagged()).has(flagKey('default', 'people/guard-test'))).toBe(true);
     const b = await store.mark({ kind: 'replace', slug: 'people/guard-test', sourceId: 'default', reason: 'r', content: 'new', principal: 'p', page: page! });
     expect(b.replaced).toBe(1);
     expect((await store.flagged()).size).toBe(0);
     expect(await store.withdraw('people/guard-test', 'default', 'p')).toBe(1);
-    const id = await store.archive({ slug: 'people/guard-test', sourceId: 'default', tool: 'edit_page', principal: 'p', storedBytes: 500, removedBytes: 400, revision: page!.revision, snapshot: snap!, content: null });
-    expect(id).toBeGreaterThan(0);
-    const rows = await store.archives('people/guard-test', 'default');
-    expect(rows[0]).toMatchObject({ id, tool: 'edit_page', stored_bytes: 500, removed_bytes: 400 });
-    expect(rows[0].compiled_truth?.length).toBeGreaterThanOrEqual(500);
+    const t = await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM information_schema.tables WHERE table_name = 'addon_page_archives'`);
+    expect(Number(t[0].n)).toBe(0);
   });
 });

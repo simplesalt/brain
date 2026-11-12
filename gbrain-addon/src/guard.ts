@@ -1,6 +1,5 @@
 import type { BrainEngine } from 'gbrain/engine';
 
-export const ARCHIVE_SHRINK_FRACTION = 0.3;
 export const MAX_GUARD_BODY_BYTES = 8 * 1024 * 1024;
 export const REFUSED_OPTIONS = ['allow_shrink', 'force', 'allow_empty', 'drop_timeline'] as const;
 export const REFUSED_TOOLS = ['delete_page', 'put_pages', 'begin_page_upload'] as const;
@@ -9,15 +8,6 @@ export const FILTERED_READ_TOOLS = ['get_page', 'search', 'query', 'list_pages',
 export interface StoredPage {
   bytes: number;
   revision: string | null;
-}
-
-export interface Snapshot {
-  title: string | null;
-  type: string | null;
-  frontmatter: unknown;
-  compiledTruth: string | null;
-  timeline: string | null;
-  bodyStorage: string | null;
 }
 
 export interface MarkInput {
@@ -30,42 +20,15 @@ export interface MarkInput {
   page: StoredPage;
 }
 
-export interface ArchiveInput {
-  slug: string;
-  sourceId: string;
-  tool: string;
-  principal: string;
-  storedBytes: number;
-  removedBytes: number;
-  revision: string | null;
-  snapshot: Snapshot;
-  content: string | null;
-}
-
-export interface ArchiveRow {
-  id: number;
-  slug: string;
-  source_id: string;
-  tool: string;
-  stored_bytes: number;
-  removed_bytes: number;
-  created_at: string;
-  content: string | null;
-  compiled_truth: string | null;
-}
-
 export interface GuardStore {
   page(slug: string, sourceId: string): Promise<StoredPage | null>;
-  snapshot(slug: string, sourceId: string): Promise<Snapshot | null>;
   mark(input: MarkInput): Promise<{ id: number; replaced: number }>;
   withdraw(slug: string, sourceId: string, principal: string): Promise<number>;
   flagged(): Promise<Set<string>>;
-  archive(input: ArchiveInput): Promise<number>;
-  archives(slug: string, sourceId: string): Promise<ArchiveRow[]>;
 }
 
 export type Decision =
-  | { action: 'forward'; args?: Record<string, unknown>; filter?: boolean; archive?: Omit<ArchiveInput, 'snapshot' | 'content'> }
+  | { action: 'forward'; args?: Record<string, unknown>; filter?: boolean }
   | { action: 'refuse'; code: string; message: string }
   | { action: 'answer'; text: string };
 
@@ -110,20 +73,6 @@ export async function decide(name: string, args: Record<string, unknown>, store:
     return { action: 'forward' };
   }
 
-  if (name === 'edit_page') {
-    if (!slug || !Array.isArray(args.edits)) return { action: 'forward' };
-    const page = await store.page(slug, sourceId);
-    if (!page || page.bytes <= 0) return { action: 'forward' };
-    let removed = 0;
-    for (const e of args.edits as Array<Record<string, unknown>>) {
-      const oldText = typeof e?.old_text === 'string' ? e.old_text : '';
-      const newText = typeof e?.new_text === 'string' ? e.new_text : '';
-      removed += Buffer.byteLength(oldText, 'utf8') - Buffer.byteLength(newText, 'utf8');
-    }
-    if (removed <= page.bytes * ARCHIVE_SHRINK_FRACTION) return { action: 'forward' };
-    return { action: 'forward', archive: { slug, sourceId, tool: name, principal, storedBytes: page.bytes, removedBytes: removed, revision: page.revision } };
-  }
-
   if (name === 'mark_page_for_deletion' || name === 'propose_page_replacement') {
     const reason = str(args.reason);
     if (!slug || !reason) return refuse('guard_mark_invalid', `${name} needs slug and reason. Nothing was recorded.`);
@@ -148,12 +97,6 @@ export async function decide(name: string, args: Record<string, unknown>, store:
     if (!slug) return refuse('guard_mark_invalid', 'withdraw_page_mark needs slug. Nothing was changed.');
     const n = await store.withdraw(slug, sourceId, principal);
     return { action: 'answer', text: JSON.stringify({ status: 'withdrawn', slug, source_id: sourceId, withdrawn: n }) };
-  }
-
-  if (name === 'get_page_archives') {
-    if (!slug) return refuse('guard_mark_invalid', 'get_page_archives needs slug.');
-    const rows = await store.archives(slug, sourceId);
-    return { action: 'answer', text: JSON.stringify({ slug, source_id: sourceId, archives: rows }) };
   }
 
   return { action: 'forward' };
@@ -216,18 +159,6 @@ export const GUARD_TOOL_DEFS = [
       required: ['slug'],
     },
   },
-  {
-    name: 'get_page_archives',
-    description: 'Earlier versions of a page, saved automatically before an edit removed more than 30% of it. Newest first, kept 6 months.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        slug: { type: 'string', description: 'Page slug.' },
-        source_id: { type: 'string', description: 'Source (default: default).' },
-      },
-      required: ['slug'],
-    },
-  },
 ];
 
 export async function ensureGuardTables(engine: Pick<BrainEngine, 'executeRaw'>): Promise<void> {
@@ -247,26 +178,6 @@ export async function ensureGuardTables(engine: Pick<BrainEngine, 'executeRaw'>)
     outcome TEXT
   )`);
   await engine.executeRaw(`CREATE INDEX IF NOT EXISTS addon_page_marks_open ON addon_page_marks (source_id, slug) WHERE withdrawn_at IS NULL AND applied_at IS NULL`);
-  await engine.executeRaw(`CREATE TABLE IF NOT EXISTS addon_page_archives (
-    id BIGSERIAL PRIMARY KEY,
-    slug TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    tool TEXT NOT NULL,
-    principal TEXT NOT NULL,
-    stored_bytes BIGINT NOT NULL,
-    removed_bytes BIGINT NOT NULL,
-    page_revision TEXT,
-    title TEXT,
-    type TEXT,
-    frontmatter JSONB,
-    compiled_truth TEXT,
-    timeline TEXT,
-    body_storage TEXT,
-    content TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expired_at TIMESTAMPTZ
-  )`);
-  await engine.executeRaw(`CREATE INDEX IF NOT EXISTS addon_page_archives_slug ON addon_page_archives (source_id, slug, created_at DESC)`);
 }
 
 export const ensureMarkTable = ensureGuardTables;
@@ -283,18 +194,6 @@ export function engineStore(engine: Pick<BrainEngine, 'executeRaw'>, flagTtlMs =
            FROM pages p WHERE p.slug = $1 AND p.source_id = $2 AND p.deleted_at IS NULL`, [slug, sourceId]);
       if (!rows.length) return null;
       return { bytes: Number(rows[0].bytes ?? 0), revision: rows[0].revision == null ? null : String(rows[0].revision) };
-    },
-    async snapshot(slug, sourceId) {
-      const rows = await engine.executeRaw<Record<string, unknown>>(
-        `SELECT p.title, p.type, p.frontmatter, p.compiled_truth, p.timeline, to_jsonb(p)->>'body_storage' AS body_storage
-           FROM pages p WHERE p.slug = $1 AND p.source_id = $2 AND p.deleted_at IS NULL`, [slug, sourceId]);
-      if (!rows.length) return null;
-      const r = rows[0];
-      return {
-        title: r.title == null ? null : String(r.title), type: r.type == null ? null : String(r.type), frontmatter: r.frontmatter ?? null,
-        compiledTruth: r.compiled_truth == null ? null : String(r.compiled_truth), timeline: r.timeline == null ? null : String(r.timeline),
-        bodyStorage: r.body_storage == null ? null : String(r.body_storage),
-      };
     },
     async mark(m) {
       invalidate();
@@ -322,24 +221,6 @@ export function engineStore(engine: Pick<BrainEngine, 'executeRaw'>, flagTtlMs =
         `SELECT slug, source_id FROM addon_page_marks WHERE kind = 'delete' AND withdrawn_at IS NULL AND applied_at IS NULL`);
       cache = { at: Date.now(), set: new Set(rows.map(r => flagKey(r.source_id, r.slug))) };
       return cache.set;
-    },
-    async archive(a) {
-      const rows = await engine.executeRaw<{ id: unknown }>(
-        `INSERT INTO addon_page_archives (slug, source_id, tool, principal, stored_bytes, removed_bytes, page_revision, title, type, frontmatter, compiled_truth, timeline, body_storage, content)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14) RETURNING id`,
-        [a.slug, a.sourceId, a.tool, a.principal, a.storedBytes, a.removedBytes, a.revision, a.snapshot.title, a.snapshot.type,
-          a.snapshot.frontmatter == null ? null : JSON.stringify(a.snapshot.frontmatter), a.snapshot.compiledTruth, a.snapshot.timeline, a.snapshot.bodyStorage, a.content]);
-      return Number(rows[0].id);
-    },
-    async archives(slug, sourceId) {
-      const rows = await engine.executeRaw<Record<string, unknown>>(
-        `SELECT id, slug, source_id, tool, stored_bytes, removed_bytes, created_at::text AS created_at, content, compiled_truth
-           FROM addon_page_archives WHERE slug = $1 AND source_id = $2 AND expired_at IS NULL ORDER BY created_at DESC LIMIT 20`, [slug, sourceId]);
-      return rows.map(r => ({
-        id: Number(r.id), slug: String(r.slug), source_id: String(r.source_id), tool: String(r.tool), stored_bytes: Number(r.stored_bytes),
-        removed_bytes: Number(r.removed_bytes), created_at: String(r.created_at), content: r.content == null ? null : String(r.content),
-        compiled_truth: r.compiled_truth == null ? null : String(r.compiled_truth),
-      }));
     },
   };
 }
@@ -459,25 +340,6 @@ export function makeGuardHandler(store: GuardStore, opts: GuardOpts) {
     if (d.action === 'answer') {
       log({ tool: name, slug: args.slug ?? null, source_id: sourceId, decision: 'answer', principal });
       return rpcJson({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: d.text }] } }, extra);
-    }
-
-    if (d.archive) {
-      try {
-        const snapshot = await store.snapshot(d.archive.slug, d.archive.sourceId);
-        if (!snapshot) throw new Error('page vanished before it could be archived');
-        let content: string | null = null;
-        if (snapshot.bodyStorage === 'segmented' || snapshot.compiledTruth == null) {
-          const got = await call(req, { jsonrpc: '2.0', id: 'guard-archive', method: 'tools/call', params: { name: 'get_page', arguments: { slug: d.archive.slug, source_id: d.archive.sourceId, include_content: true, body: 'full' } } });
-          const t = toolText(got.parsed);
-          if (!t || got.parsed?.result?.isError) throw new Error('could not read the full page to archive it');
-          try { content = String(JSON.parse(t).content ?? t); } catch { content = t; }
-        }
-        const id = await store.archive({ ...d.archive, snapshot, content });
-        log({ tool: name, slug: d.archive.slug, source_id: d.archive.sourceId, decision: 'archived', archive_id: id, stored_bytes: d.archive.storedBytes, removed_bytes: d.archive.removedBytes, principal });
-      } catch (e) {
-        log({ tool: name, slug: args.slug ?? null, decision: 'archive_failed', error: e instanceof Error ? e.message : String(e) });
-        return toolError(msg.id, 'guard_unavailable', `This edit removes more than ${Math.round(ARCHIVE_SHRINK_FRACTION * 100)}% of the page, and the guard could not save the current version first, so nothing was written. Try again later or make a smaller edit.`, extra);
-      }
     }
 
     const outBody = d.args ? JSON.stringify({ ...msg, params: { ...msg.params, arguments: d.args } }) : text;
