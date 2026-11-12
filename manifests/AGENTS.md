@@ -104,6 +104,18 @@ Save them there. gbrain holds project knowledge.
   with the `mcp_hermes_msg_send_message` tool. Only dylan@simple-salt.com and
   russell@simple-salt.com can send.
 
+# Calendar
+
+- `mcp_hermes_msg_calendar_event` changes Dylan's Google calendar: `create`
+  (title, start, end, location, guests), `update` (move with start and end,
+  set location, `add_attendees`) and `cancel` (cancels for everyone when Dylan
+  organized it, declines when he is a guest). Find the meeting in gbrain
+  first and pass its calendar page's `event_id`; a recurring meeting takes
+  that one occurrence's id.
+- Do what Dylan asked without asking again. When the meeting he means is
+  unclear, run with `dry_run: true` and confirm the event with him first.
+- Events show dylan.evans@simplesalt.company as organizer; that is expected.
+
 # Notion, HubSpot and GitHub
 
 - Notion MCP: search, read and edit Dylan's Notion pages and databases (the

@@ -145,18 +145,21 @@ data:
     const _kid = process.env.GOOGLE_PRIVATE_KEY_ID ?? '';
     const _tokenCache = new Map();
 
-    async function getGmailToken(impersonate) {
+    const CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar.events'];
+
+    async function getGmailToken(impersonate, scopes = GMAIL_SCOPES) {
       const sub = impersonate || DEFAULT_IMPERSONATE;
       if (!sub) throw new Error('GOOGLE_IMPERSONATE_EMAIL not configured');
       if (!_privKey) throw new Error('GOOGLE_PRIVATE_KEY_B64 not configured');
       if (!CLIENT_EMAIL) throw new Error('GOOGLE_CLIENT_EMAIL not configured');
-      const cached = _tokenCache.get(sub);
+      const cacheKey = `${sub} ${scopes.join(' ')}`;
+      const cached = _tokenCache.get(cacheKey);
       if (cached && Date.now() < cached.expiresAt) return cached.token;
       const now = Math.floor(Date.now() / 1000);
       const hdr = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: _kid }));
       const pay = b64url(JSON.stringify({
         iss: CLIENT_EMAIL, sub,
-        scope: GMAIL_SCOPES.join(' '),
+        scope: scopes.join(' '),
         aud: 'https://oauth2.googleapis.com/token',
         iat: now, exp: now + 3600,
       }));
@@ -173,7 +176,7 @@ data:
       });
       if (!r.ok) throw new Error(`Google token exchange ${r.status}: ${await r.text()}`);
       const token = (await r.json()).access_token;
-      _tokenCache.set(sub, { token, expiresAt: Date.now() + 3_540_000 });
+      _tokenCache.set(cacheKey, { token, expiresAt: Date.now() + 3_540_000 });
       return token;
     }
 
@@ -639,6 +642,12 @@ data:
         return { default_sender: DEFAULT_SENDER, senders };
       },
 
+      async calendar() {
+        await resolveHosts('https://oauth2.googleapis.com', CALENDAR_API);
+        const r = await calendarFetch('', { query: { maxResults: '1', singleEvents: 'true', timeMin: new Date().toISOString() } });
+        return { calendar: calendarOwner(), upcoming_visible: (r.items ?? []).length > 0 };
+      },
+
       async linkedin() {
         if (!DUXSOUP_USER_ID || !DUXSOUP_API_KEY) {
           throw new Error('DUXSOUP_USER_ID / DUXSOUP_API_KEY not configured');
@@ -701,6 +710,142 @@ data:
     }
 
 
+    const CALENDAR_API = 'https://www.googleapis.com/calendar/v3/calendars/primary/events';
+    const CALENDAR_TZ = 'America/New_York';
+
+    function calendarOwner() {
+      if (!DEFAULT_IMPERSONATE) throw new Error('GOOGLE_IMPERSONATE_EMAIL not configured');
+      return DEFAULT_IMPERSONATE.toLowerCase();
+    }
+
+    async function calendarFetch(path, { method = 'GET', query = {}, body } = {}) {
+      const token = await getGmailToken(calendarOwner(), CALENDAR_SCOPES);
+      const qs = new URLSearchParams(query).toString();
+      const r = await fetch(`${CALENDAR_API}${path}${qs ? `?${qs}` : ''}`, {
+        method,
+        headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`Google Calendar ${method} ${r.status}: ${text}`);
+      return text ? JSON.parse(text) : null;
+    }
+
+    function calendarTime(value, field) {
+      const v = String(value ?? '').trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return { date: v };
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v) || Number.isNaN(Date.parse(v))) {
+        throw new Error(`${field} must be an ISO 8601 date-time or a YYYY-MM-DD date`);
+      }
+      return { dateTime: v, timeZone: CALENDAR_TZ };
+    }
+
+    function calendarEmails(list, field) {
+      if (list == null) return [];
+      if (!Array.isArray(list)) throw new Error(`${field} must be an array of email addresses`);
+      return [...new Set(list.map(e => {
+        const a = String(e).trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(a)) throw new Error(`${field}: ${e} is not an email address`);
+        return a;
+      }))];
+    }
+
+    function eventView(ev) {
+      return {
+        event_id: ev.id,
+        status: ev.status,
+        summary: ev.summary ?? '',
+        start: ev.start?.dateTime ?? ev.start?.date,
+        end: ev.end?.dateTime ?? ev.end?.date,
+        location: ev.location ?? '',
+        organizer: ev.organizer?.email,
+        dylan_is_organizer: Boolean(ev.organizer?.self),
+        recurring_instance: Boolean(ev.recurringEventId),
+        attendees: (ev.attendees ?? []).map(a => ({
+          email: a.email, response: a.responseStatus, ...(a.self ? { self: true } : {}),
+        })),
+        html_link: ev.htmlLink,
+      };
+    }
+
+    async function calendarEvent(args) {
+      const {
+        action, event_id, summary, start, end, location, description,
+        attendees, add_attendees, comment, notify = true, dry_run = false,
+      } = args;
+      const sendUpdates = notify ? 'all' : 'none';
+      const calendar = calendarOwner();
+
+      if (action === 'create') {
+        if (event_id) throw new Error('create makes a new event; omit event_id');
+        if (!summary) throw new Error('summary required for create');
+        if (!start || !end) throw new Error('start and end required for create');
+        const body = {
+          summary,
+          start: calendarTime(start, 'start'),
+          end: calendarTime(end, 'end'),
+          ...(location ? { location } : {}),
+          ...(description ? { description } : {}),
+        };
+        const guests = calendarEmails(attendees, 'attendees');
+        if (guests.length) body.attendees = guests.map(email => ({ email }));
+        if (dry_run) return { dry_run: true, action, calendar, notify, would_create: body };
+        const ev = await calendarFetch('', { method: 'POST', query: { sendUpdates }, body });
+        return { action, calendar, notify, event: eventView(ev) };
+      }
+
+      if (action !== 'update' && action !== 'cancel') throw new Error('action must be create, update or cancel');
+      if (!event_id) throw new Error(`event_id required for ${action}: the event_id on the meeting's calendar page`);
+      const path = `/${encodeURIComponent(event_id)}`;
+      const ev = await calendarFetch(path);
+      if (ev.status === 'cancelled') throw new Error(`event ${event_id} is already cancelled`);
+      if (ev.recurrence) {
+        throw new Error(`event ${event_id} is a whole recurring series; pass one occurrence's event_id (from its calendar page)`);
+      }
+      const organizer = Boolean(ev.organizer?.self);
+
+      if (action === 'cancel') {
+        if (organizer) {
+          if (dry_run) return { dry_run: true, action, calendar, would: 'cancel the event for everyone', notify, event: eventView(ev) };
+          await calendarFetch(path, { method: 'DELETE', query: { sendUpdates } });
+          return { action, calendar, did: 'cancelled the event for everyone', notify, event: { ...eventView(ev), status: 'cancelled' } };
+        }
+        const guestList = ev.attendees ?? [];
+        if (!guestList.some(a => a.self)) throw new Error(`${calendar} is neither the organizer nor a guest of ${event_id}`);
+        if (dry_run) {
+          return { dry_run: true, action, calendar, would: `decline as a guest (organizer ${ev.organizer?.email})`, notify, event: eventView(ev) };
+        }
+        const declined = guestList.map(a => (a.self ? { ...a, responseStatus: 'declined', ...(comment ? { comment } : {}) } : a));
+        const out = await calendarFetch(path, { method: 'PATCH', query: { sendUpdates }, body: { attendees: declined } });
+        return { action, calendar, did: 'declined as a guest', notify, event: eventView(out) };
+      }
+
+      if (attendees !== undefined) throw new Error('update takes add_attendees; existing guests are always kept');
+      const patch = {};
+      if (summary !== undefined) patch.summary = summary;
+      if (description !== undefined) patch.description = description;
+      if (location !== undefined) patch.location = location;
+      if (start !== undefined || end !== undefined) {
+        if (start === undefined || end === undefined) throw new Error('moving an event needs both start and end');
+        patch.start = calendarTime(start, 'start');
+        patch.end = calendarTime(end, 'end');
+      }
+      const existing = ev.attendees ?? [];
+      const have = new Set(existing.map(a => String(a.email).toLowerCase()));
+      const fresh = calendarEmails(add_attendees, 'add_attendees').filter(e => !have.has(e));
+      if (fresh.length) patch.attendees = [...existing, ...fresh.map(email => ({ email }))];
+      if (!Object.keys(patch).length) {
+        throw new Error('nothing to change: give summary, description, location, start and end, or add_attendees not already on the event');
+      }
+      if (!organizer && !ev.guestsCanModify) {
+        throw new Error(`only the organizer (${ev.organizer?.email}) can change this event; ${calendar} is a guest`);
+      }
+      if (dry_run) return { dry_run: true, action, calendar, notify, would_change: patch, event: eventView(ev) };
+      const out = await calendarFetch(path, { method: 'PATCH', query: { sendUpdates }, body: patch });
+      return { action, calendar, notify, changed: Object.keys(patch), event: eventView(out) };
+    }
+
+
     const TOOLS = [
       {
         name: 'send_message',
@@ -742,6 +887,28 @@ data:
             thread_id: { type: 'string', description: 'Gmail thread ID' },
             from_email: { type: 'string', enum: Object.keys(EMAIL_SENDERS.senders),
                           description: `Mailbox to read the thread from (default ${DEFAULT_SENDER})` },
+          },
+        },
+      },
+      {
+        name: 'calendar_event',
+        description: "Create, update (move, set location, add guests) or cancel an event on Dylan's Google calendar. Cancel deletes the event for everyone when Dylan organized it, and declines it when he is a guest. Recurring meetings: pass one occurrence's event_id; a whole series is refused. Use dry_run first when unsure; it returns the planned change and touches nothing.",
+        inputSchema: {
+          type: 'object',
+          required: ['action'],
+          properties: {
+            action:        { type: 'string', enum: ['create', 'update', 'cancel'] },
+            event_id:      { type: 'string', description: "update/cancel: the event_id from the meeting's gbrain calendar page frontmatter" },
+            summary:       { type: 'string', description: 'Event title (required for create)' },
+            start:         { type: 'string', description: 'ISO 8601 date-time (offset optional; default zone America/New_York) or YYYY-MM-DD for all-day. Required for create; give with end to move an event' },
+            end:           { type: 'string', description: 'Same format as start; for all-day events the day after the last day' },
+            location:      { type: 'string', description: 'Address, room or video link; empty string clears it on update' },
+            description:   { type: 'string', description: 'Event notes' },
+            attendees:     { type: 'array', items: { type: 'string' }, description: 'create only: guest email addresses' },
+            add_attendees: { type: 'array', items: { type: 'string' }, description: 'update only: guest emails to add; existing guests are kept' },
+            comment:       { type: 'string', description: 'cancel as a guest: note sent with the decline' },
+            notify:        { type: 'boolean', default: true, description: 'Email guests about the change' },
+            dry_run:       { type: 'boolean', default: false, description: 'Return the planned change without making it' },
           },
         },
       },
@@ -833,6 +1000,7 @@ data:
           let result;
           if      (name === 'send_message')           result = await sendMessage(args);
           else if (name === 'get_thread')              result = await getThread(args);
+          else if (name === 'calendar_event')          result = await calendarEvent(args);
           else if (name === 'linkedin_action')         result = await linkedinAction(args);
           else if (name === 'linkedin_search_results') result = await linkedinSearchResults(args);
           else if (name === 'linkedin_queue')          result = await linkedinQueue(args);
@@ -914,7 +1082,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "10"
+        simplesalt.company/restart-epoch: "11"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
