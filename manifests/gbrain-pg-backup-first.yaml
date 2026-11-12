@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-pg-backup-a-first
+  name: gbrain-pg-backup-restore-check-1
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -11,12 +11,11 @@ metadata:
     kustomize.toolkit.fluxcd.io/force: enabled
 spec:
   activeDeadlineSeconds: 3600
-  backoffLimit: 1
+  backoffLimit: 0
   template:
     metadata:
       labels:
-        app: gbrain-pg-backup
-        copy: a
+        app: gbrain-pg-backup-verify
         entity: ssint
         env: main
         capability: ai
@@ -31,114 +30,41 @@ spec:
         fsGroup: 26
         seccompProfile:
           type: RuntimeDefault
-      affinity:
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - topologyKey: kubernetes.io/hostname
-              labelSelector:
-                matchLabels:
-                  app: gbrain-pg-backup
-                  copy: b
       containers:
-        - name: dump
-          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
-          imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "/scripts/dump.sh"]
-          env:
-            - name: COPY
-              value: a
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: gbrain-pg-app
-                  key: uri
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-          resources:
-            requests:
-              cpu: 25m
-              memory: 64Mi
-            limits:
-              memory: 512Mi
-          volumeMounts:
-            - name: dumps
-              mountPath: /dumps
-            - name: scripts
-              mountPath: /scripts
-              readOnly: true
+        - {"name": "restore-page", "image": "oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f", "imagePullPolicy": "IfNotPresent", "command": ["bun", "-e"], "args": ["const URL_ = 'http://gbrain-rehearsal:3131/mcp';\nconst page = JSON.parse(await Bun.file('/work/page.json').text());\nconst call = async (name, args) => {\n  const r = await fetch(URL_, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: 'Bearer gbrain-mcp' },\n    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) });\n  const t = await r.text();\n  let msg = null;\n  for (const b of t.split('\\n\\n')) { const d = b.split('\\n').filter(l => l.startsWith('data:')).map(l => l.slice(5).trim()).join('\\n'); if (!d) continue; try { const o = JSON.parse(d); if (o.result || o.error) msg = o; } catch {} }\n  if (!msg) msg = JSON.parse(t);\n  const text = (msg.result?.content ?? []).map(c => c.text ?? '').join('\\n');\n  try { return { isError: !!msg.result?.isError, r: JSON.parse(text) }; } catch { return { isError: !!msg.result?.isError, r: text }; }\n};\nconst fm = { ...(page.frontmatter ?? {}), type: page.type, title: page.title };\nconst head = '---\\n' + Object.entries(fm).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join('\\n') + '\\n---\\n\\n';\nconst content = head + (page.compiled_truth ?? '') + (page.timeline ? '\\n\\n## Timeline\\n\\n' + page.timeline : '');\nconsole.log(`backup copy of ${page.slug}: ${page.bytes} body bytes`);\nconst before = await call('get_page', { slug: page.slug, body: 'none' });\nconsole.log('rehearsal before:', JSON.stringify(before.r).slice(0, 400));\nconst rev = before.r?.revision;\nconst put = await call('put_page', { slug: page.slug, content, ...(rev ? { expected_revision: rev } : {}), request_id: crypto.randomUUID() });\nconsole.log('put_page:', put.isError ? 'ERROR' : 'ok', JSON.stringify(put.r).slice(0, 400));\nconst after = await call('get_page', { slug: page.slug, body: 'none' });\nconsole.log('rehearsal after:', JSON.stringify(after.r).slice(0, 400));\nconsole.log(`RESULT: ${put.isError ? 'FAIL' : 'PASS'}`);\nprocess.exit(put.isError ? 1 : 0);\n"], "securityContext": {"runAsNonRoot": true, "runAsUser": 26, "runAsGroup": 26, "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}}, "resources": {"requests": {"cpu": "25m", "memory": "64Mi"}, "limits": {"memory": "256Mi"}}, "volumeMounts": [{"name": "work", "mountPath": "/work", "readOnly": true}]}
       volumes:
         - name: dumps
           persistentVolumeClaim:
             claimName: gbrain-pg-backup-a
+            readOnly: true
         - name: scripts
           configMap:
             name: gbrain-pg-backup-scripts
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: gbrain-pg-backup-b-first
-  namespace: ssint-main-ai
-  labels:
-    entity: ssint
-    env: main
-    capability: ai
-  annotations:
-    kustomize.toolkit.fluxcd.io/force: enabled
-spec:
-  activeDeadlineSeconds: 3600
-  backoffLimit: 1
-  template:
-    metadata:
-      labels:
-        app: gbrain-pg-backup
-        copy: b
-        entity: ssint
-        env: main
-        capability: ai
-        scheduling.simplesalt.company/class: work
-    spec:
-      restartPolicy: Never
-      automountServiceAccountToken: false
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 26
-        runAsGroup: 26
-        fsGroup: 26
-        seccompProfile:
-          type: RuntimeDefault
-      affinity:
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - topologyKey: kubernetes.io/hostname
-              labelSelector:
-                matchLabels:
-                  app: gbrain-pg-backup
-                  copy: a
-      containers:
-        - name: dump
+        - name: work
+          emptyDir:
+            sizeLimit: 64Mi
+      initContainers:
+        - name: verify
           image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
           imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "/scripts/dump.sh"]
+          command: ["/bin/sh", "/scripts/verify.sh"]
           env:
-            - name: COPY
-              value: b
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: DATABASE_URL
+            - name: PGHOST
+              value: gbrain-pg-rehearsal-rw
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
               valueFrom:
                 secretKeyRef:
-                  name: gbrain-pg-app
-                  key: uri
+                  name: gbrain-pg-rehearsal-app
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: password
+            - name: EXTRACT_SLUG
+              value: ops/deletion-review
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -153,13 +79,9 @@ spec:
           volumeMounts:
             - name: dumps
               mountPath: /dumps
+              readOnly: true
             - name: scripts
               mountPath: /scripts
               readOnly: true
-      volumes:
-        - name: dumps
-          persistentVolumeClaim:
-            claimName: gbrain-pg-backup-b
-        - name: scripts
-          configMap:
-            name: gbrain-pg-backup-scripts
+            - name: work
+              mountPath: /work

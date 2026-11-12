@@ -139,6 +139,10 @@ data:
     rv=$(rq "SELECT value FROM config WHERE key = 'version'")
     [ "$rv" = "$(val before_config_version)" ] && echo "  config_version: $rv ok" || { echo "  config_version: restored=$rv MISMATCH"; status=FAIL; }
     echo "  sample pages: $(rq "SELECT string_agg(slug || ' ' || octet_length(compiled_truth), ', ') FROM (SELECT slug, compiled_truth FROM pages WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 3) s")"
+    if [ -n "${EXTRACT_SLUG:-}" ]; then
+      rq "SELECT json_build_object('slug', slug, 'type', type, 'title', title, 'frontmatter', frontmatter, 'compiled_truth', compiled_truth, 'timeline', timeline, 'bytes', octet_length(compiled_truth) + COALESCE(octet_length(timeline), 0)) FROM pages WHERE slug = '$EXTRACT_SLUG' AND deleted_at IS NULL" > /work/page.json || status=FAIL
+      echo "  extracted $EXTRACT_SLUG: $(wc -c < /work/page.json) bytes of JSON"
+    fi
     adm "DROP DATABASE IF EXISTS $DB WITH (FORCE)" || { echo "WARN: could not drop $DB"; status=FAIL; }
     echo "RESULT: $status"
     [ "$status" = PASS ]
