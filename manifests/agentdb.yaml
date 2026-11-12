@@ -68,6 +68,12 @@ spec:
         size: 5Gi
     history:
       retention: 30d
+    reviewer:
+      baseURL: https://openrouter.ai/api/v1
+      model: '@preset/live-reasoning'
+      apiKeySecret:
+        name: agentdb-openrouter
+        key: OPENROUTER_API_KEY
 ---
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
