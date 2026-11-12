@@ -1001,8 +1001,11 @@ spec:
                 && echo "simplesalt skills fetched at $SS_SKILLS_SHA" \
                 || echo "ERROR: simplesalt skills fetch failed"
 
-              python3 -c '
-              import os, re, shutil, yaml
+              /opt/hermes/.venv/bin/python -c '
+              import os, re, shutil
+              from ruamel.yaml import YAML
+              yaml = YAML(typ="safe", pure=True)
+              yaml.version = (1, 1)
 
               seed_path = "/seed/skills.yaml"
               ss_root = "/tmp/ss-skills/skills"
@@ -1018,7 +1021,7 @@ spec:
                           text = f.read()
                       match = re.search(r"\n---\s*\n", text[3:]) if text.startswith("---") else None
                       if match:
-                          name = yaml.safe_load(text[3:match.start() + 3]).get("name")
+                          name = yaml.load(text[3:match.start() + 3]).get("name")
                           if name:
                               return str(name).strip()
                   except Exception:
@@ -1037,7 +1040,7 @@ spec:
 
               try:
                   with open(seed_path) as f:
-                      allow = yaml.safe_load(f)
+                      allow = yaml.load(f)
                   gbrain = allow["gbrain"]
                   bundled = allow["bundled"]
                   local = allow.get("local") or []
@@ -1119,8 +1122,13 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              python3 -c '
-              import os, sys, yaml
+              /opt/hermes/.venv/bin/python -c '
+              import os, sys
+              from ruamel.yaml import YAML
+              yaml = YAML(typ="safe", pure=True)
+              yaml.version = (1, 1)
+              out = YAML(typ="safe", pure=True)
+              out.default_flow_style = False
 
               live_path = "/opt/data/config.yaml"
               seed_path = "/seed/config.yaml"
@@ -1136,11 +1144,11 @@ spec:
                   return merged
 
               with open(seed_path) as f:
-                  seed = yaml.safe_load(f) or {}
+                  seed = yaml.load(f) or {}
 
               if os.path.exists(live_path):
                   with open(live_path) as f:
-                      live = yaml.safe_load(f) or {}
+                      live = yaml.load(f) or {}
               else:
                   live = {}
 
@@ -1159,7 +1167,7 @@ spec:
                   merged["auxiliary"]["vision"].pop("fallback_chain", None)
 
               with open(live_path, "w") as f:
-                  yaml.dump(merged, f, default_flow_style=False, indent=2, allow_unicode=True)
+                  out.dump(merged, f)
               print("merged: seed config overlaid onto live config.yaml")
               ' || { echo "FATAL: python merge failed, falling back to cp"; cp /seed/config.yaml /opt/data/config.yaml; }
               chown 10000:10000 /opt/data/config.yaml
