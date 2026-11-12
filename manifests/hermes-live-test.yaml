@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: hermes-live-test-1
+  name: hermes-live-test-cleanup-1
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -44,6 +44,8 @@ spec:
                 secretKeyRef:
                   name: hermes-secrets
                   key: HERMES_BEARER_TOKEN
+            - name: CLEANUP_ONLY
+              value: "1"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
