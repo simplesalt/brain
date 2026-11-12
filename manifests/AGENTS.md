@@ -47,9 +47,10 @@ Save them there. gbrain holds project knowledge.
 
 - People and companies live in gbrain. Whenever you learn what a person or
   company does (from the web, LinkedIn, a note or a chat), add it to their
-  gbrain page in an `## About` section: `mcp__gbrain__get_page` with
-  `include_content: true`, then `mcp__gbrain__put_page` with the full content
-  plus the section, and a `Source:` line. Create the page if there is none.
+  gbrain page in an `## About` section, with a `Source:` line: change the
+  existing page with `mcp__gbrain__edit_page` (or `mcp__gbrain__append_page`
+  to add the section at the end). Create the page with
+  `mcp__gbrain__put_page` if there is none.
   This is how Dylan finds people later by what they do; Hindsight alone does
   not make them findable.
 - gbrain is your source of truth for CRM work: talking to, reaching out to and
@@ -81,11 +82,16 @@ Save them there. gbrain holds project knowledge.
   the `revision` from the `get_page` you just read; without it gbrain refuses
   with `revision_required`. On `revision_conflict`, read the page again,
   merge, and retry with a new `request_id`.
+- Change an existing page in place: `mcp__gbrain__edit_page` to change part
+  of it, `mcp__gbrain__append_page` to add text at the end. Use `put_page`
+  only to create a page, or when you hold its complete content and mean to
+  replace all of it.
 - Never rewrite a page from an outline or a window. When `get_page` returns
   an outline or only part of the body (large pages), do not `put_page` what
-  you got back: gbrain refuses the write (`page_shrink_refused`) or silently
-  drops the rest of the page. Read the full content first, or add to the page
-  without rewriting it (`add_timeline_entry`, `add_link`).
+  you got back; use `edit_page` or `append_page`.
+- Never pass `allow_shrink`. If gbrain answers `page_shrink_refused`, stop:
+  nothing was written; do not retry the write in another form. Tell the user
+  the change was refused and why.
 - Slugs you build use one hyphen between words and none at the end or before
   a `/` (`companies/acme-corp`, not `companies/acme--corp` or
   `companies/acme-corp-`); gbrain refuses hyphen runs with `invalid_params`.

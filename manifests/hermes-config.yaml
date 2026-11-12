@@ -142,6 +142,8 @@ mcp_servers:
         - query
         - get_page
         - put_page
+        - edit_page
+        - append_page
         - list_pages
         - get_timeline
         - chronicle_day
