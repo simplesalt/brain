@@ -17,6 +17,7 @@ configMapGenerator:
   - name: agentdb-mcp-test
     files:
       - mcp_test.py
+      - mcp_test2.py
     options:
       disableNameSuffixHash: true
       labels:

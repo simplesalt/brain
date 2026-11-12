@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: agentdb-mcp-test-t1
+  name: agentdb-mcp-test-t1b
   namespace: ssint-main-agentdb
   labels:
     entity: ssint
@@ -28,7 +28,7 @@ spec:
       containers:
         - name: test
           image: python:3.12-alpine
-          command: ["python3", "/test/mcp_test.py"]
+          command: [python3, /test/mcp_test2.py]
           env:
             - name: AGENTDB_ENDPOINT
               value: http://trial-mcp.ssint-main-agentdb.svc/mcp
