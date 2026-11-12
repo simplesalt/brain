@@ -1,8 +1,3 @@
-# Trial instance of the agentdb product: an operator-managed Postgres database with an
-# MCP endpoint, http://trial-mcp.ssint-main-agentdb.svc/mcp.
-# The chart (operator, CRD, ClusterRoles) is installed here; the AgentDatabase itself and
-# its probes live in ./agentdb-trial, applied by the agentdb-trial Kustomization below.
-# Cluster-local resources never go in crossplane-system.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -61,8 +56,6 @@ spec:
     history:
       retention: 30d
 ---
-# Separate from the root kustomization because the AgentDatabase kind exists only once
-# the HelmRelease above has installed the CRD; until then its applies fail and retry.
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:
