@@ -439,8 +439,12 @@ def load_state():
 
 def save_state(state):
     state["log"] = state["log"][-LOG_KEEP:]
+    trimmed = 0
     while state["log"] and len(json.dumps(state)) > STATE_BUDGET:
         state["log"].pop(0)
+        trimmed += 1
+    if trimmed:
+        print(f"loop-tasks-sync: state over {STATE_BUDGET} bytes; dropped the {trimmed} oldest log entries", file=sys.stderr)
     if len(json.dumps(state)) > STATE_BUDGET:
         print(f"loop-tasks-sync: state is over {STATE_BUDGET} bytes with an empty log", file=sys.stderr)
     content = ("---\ntype: note\ntitle: Loop tasks sync state\n---\n\n# Loop tasks sync state\n\n"

@@ -334,11 +334,15 @@ def prune(state, now, in_trash):
         state["pending"] = dict(list(state["pending"].items())[-MAX_PENDING:])
     state["log"] = [e for e in state["log"]
                     if day(e.get("logged_at") or e.get("deleted_at")) >= days_ago(now, LOG_DAYS)][-MAX_LOG:]
+    trimmed = 0
     while len(json.dumps(state)) > STATE_BUDGET and (state["log"] or state["pending"]):
+        trimmed += 1
         if state["log"]:
             state["log"].pop(0)
         else:
             del state["pending"][next(iter(state["pending"]))]
+    if trimmed:
+        print(f"deletion-review: state over {STATE_BUDGET} bytes; dropped the {trimmed} oldest log and pending entries", file=sys.stderr)
     if len(json.dumps(state)) > STATE_BUDGET:
         print(f"deletion-review: state is over {STATE_BUDGET} bytes with only seen ids left", file=sys.stderr)
     return json.dumps(state, sort_keys=True) != before
