@@ -84,3 +84,8 @@ spec:
                     configMapKeyRef:
                       name: llm-models
                       key: LIVE_REASONING_MODEL
+              - op: add
+                path: /spec/template/spec/containers/0/env/-
+                value:
+                  name: HINDSIGHT_API_WORKER_ID
+                  value: hindsight
