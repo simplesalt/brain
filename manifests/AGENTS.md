@@ -48,8 +48,7 @@ Save them there. gbrain holds project knowledge.
 - People and companies live in gbrain. Whenever you learn what a person or
   company does (from the web, LinkedIn, a note or a chat), add it to their
   gbrain page in an `## About` section, with a `Source:` line: change the
-  existing page with `mcp__gbrain__edit_page` (or `mcp__gbrain__append_page`
-  to add the section at the end). Create the page with
+  existing page with `mcp__gbrain__edit_page`. Create the page with
   `mcp__gbrain__put_page` if there is none.
   This is how Dylan finds people later by what they do; Hindsight alone does
   not make them findable.
@@ -82,13 +81,15 @@ Save them there. gbrain holds project knowledge.
   the `revision` from the `get_page` you just read; without it gbrain refuses
   with `revision_required`. On `revision_conflict`, read the page again,
   merge, and retry with a new `request_id`.
-- Change an existing page in place: `mcp__gbrain__edit_page` to change part
-  of it, `mcp__gbrain__append_page` to add text at the end. Use `put_page`
+- Change an existing page in place with `mcp__gbrain__edit_page`: to add
+  text, replace a short passage next to where it goes with that passage plus
+  the new text (`mcp__gbrain__append_page`, when it is in your tool list, adds
+  text at the end). Use `put_page`
   only to create a page, or when you hold its complete content and mean to
   replace all of it.
 - Never rewrite a page from an outline or a window. When `get_page` returns
   an outline or only part of the body (large pages), do not `put_page` what
-  you got back; use `edit_page` or `append_page`.
+  you got back; use `edit_page`.
 - Never pass `allow_shrink`. If gbrain answers `page_shrink_refused`, stop:
   nothing was written; do not retry the write in another form. Tell the user
   the change was refused and why.
