@@ -120,6 +120,7 @@ def check_cap(slug, content):
 
 
 def put_state_page(args):
+    check_cap(args["slug"], args["content"])
     try:
         return call("put_page", args)
     except RuntimeError as e:
@@ -149,7 +150,6 @@ def save_state(done, pending, revision, keep):
                "Fireflies calls the meeting-ingest job has handed to Hermes: done, or pending until Hermes reports "
                "them done. Kept by cron-meeting-ingest.py.\n\n"
                "```json\n" + json.dumps(state, indent=1) + "\n```\n")
-    check_cap(STATE, content)
     args = {"slug": STATE, "content": content}
     if revision is not None:
         args["expected_revision"] = revision

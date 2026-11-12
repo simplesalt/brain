@@ -58,7 +58,6 @@ BATCH = int(os.environ.get("LOOP_TASKS_BATCH", "5"))
 LIMIT = 500
 LOG_KEEP = 200
 OUTPUTS_KEEP = 1000
-STATE_BUDGET = 128 * 1024
 RETRY_AFTER_H = 3
 MAX_TRIES = 3
 OUTPUT_DIR = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "cron", "output")
@@ -440,7 +439,17 @@ def state_body(page, slug):
     return page.get("compiled_truth") or ""
 
 
+STATE_CAP = 128 * 1024
+
+
+def check_cap(slug, content):
+    n = len(content.encode())
+    if n > STATE_CAP:
+        raise StateError(f"state would be {n} bytes, over the 128 KB cap; nothing written ({slug})")
+
+
 def put_state_page(args):
+    check_cap(args["slug"], args["content"])
     try:
         return call("put_page", args)
     except RuntimeError as e:
@@ -460,20 +469,22 @@ def load_state():
             "log": state.get("log") or []}
 
 
+def render(state):
+    return ("---\ntype: note\ntitle: Loop tasks sync state\n---\n\n# Loop tasks sync state\n\n"
+            "What the loop-tasks-sync job did each run, and what Hermes answered for Done rows whose loop "
+            "was still open. Kept by cron-loop-tasks-sync.py.\n\n"
+            "```json\n" + json.dumps(state, indent=1, sort_keys=True) + "\n```\n")
+
+
 def save_state(state):
     state["log"] = state["log"][-LOG_KEEP:]
     trimmed = 0
-    while state["log"] and len(json.dumps(state)) > STATE_BUDGET:
+    while state["log"] and len(render(state).encode()) > STATE_CAP:
         state["log"].pop(0)
         trimmed += 1
     if trimmed:
-        print(f"loop-tasks-sync: state over {STATE_BUDGET} bytes; dropped the {trimmed} oldest log entries", file=sys.stderr)
-    if len(json.dumps(state)) > STATE_BUDGET:
-        print(f"loop-tasks-sync: state is over {STATE_BUDGET} bytes with an empty log", file=sys.stderr)
-    content = ("---\ntype: note\ntitle: Loop tasks sync state\n---\n\n# Loop tasks sync state\n\n"
-               "What the loop-tasks-sync job did each run, and what Hermes answered for Done rows whose loop "
-               "was still open. Kept by cron-loop-tasks-sync.py.\n\n"
-               "```json\n" + json.dumps(state, indent=1, sort_keys=True) + "\n```\n")
+        print(f"loop-tasks-sync: state over {STATE_CAP} bytes; dropped the {trimmed} oldest log entries", file=sys.stderr)
+    content = render(state)
     args = {"slug": STATE, "content": content}
     try:
         page = call("get_page", {"slug": STATE})

@@ -366,7 +366,6 @@ def save_state(state):
     content = ("---\ntype: note\ntitle: Person dedupe state\n---\n\n# Person dedupe state\n\n"
                "Duplicate person pages: the merge plan, pending review and merge history. Kept by "
                "cron-person-dedupe.py.\n\n```json\n" + json.dumps(state, indent=1, sort_keys=True) + "\n```\n")
-    scan.check_cap(STATE, content)
     args = {"slug": STATE, "content": content}
     try:
         cur = call("get_page", {"slug": STATE, "include_content": True})

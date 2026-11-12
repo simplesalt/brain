@@ -40,7 +40,6 @@ MAX_PENDING = 200
 SEEN_DAYS = 35
 PENDING_DAYS = 14
 LOG_DAYS = 180
-STATE_BUDGET = 128 * 1024
 OUTPUT_DIR = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "cron", "output")
 MARKER = "DELETION-REVIEW-RESULT"
 DRY_RUN = os.environ.get("DELETION_REVIEW_DRY_RUN") == "1"
@@ -300,7 +299,17 @@ def state_body(page, slug):
     return page.get("compiled_truth") or ""
 
 
+STATE_CAP = 128 * 1024
+
+
+def check_cap(slug, content):
+    n = len(content.encode())
+    if n > STATE_CAP:
+        raise StateError(f"state would be {n} bytes, over the 128 KB cap; nothing written ({slug})")
+
+
 def put_state_page(args):
+    check_cap(args["slug"], args["content"])
     try:
         return call("put_page", args)
     except RuntimeError as e:
@@ -345,7 +354,7 @@ def mark_seen(state, ids, now):
 
 
 def prune(state, now, in_trash):
-    """Drop entries past their age limit, then the oldest log and pending entries until the state fits STATE_BUDGET. True if anything was dropped."""
+    """Drop entries past their age limit, then the oldest log and pending entries until the page fits STATE_CAP. True if anything was dropped."""
     before = json.dumps(state, sort_keys=True)
     state["seen"] = {i: d for i, d in state["seen"].items() if d >= days_ago(now, SEEN_DAYS) or i in in_trash}
     state["applied"] = [k for k in state["applied"] if not output_day(k) or output_day(k) >= days_ago(now, SEEN_DAYS)]
@@ -358,26 +367,28 @@ def prune(state, now, in_trash):
     state["log"] = [e for e in state["log"]
                     if day(e.get("logged_at") or e.get("deleted_at")) >= days_ago(now, LOG_DAYS)][-MAX_LOG:]
     trimmed = 0
-    while len(json.dumps(state)) > STATE_BUDGET and (state["log"] or state["pending"]):
+    while len(render(state).encode()) > STATE_CAP and (state["log"] or state["pending"]):
         trimmed += 1
         if state["log"]:
             state["log"].pop(0)
         else:
             del state["pending"][next(iter(state["pending"]))]
     if trimmed:
-        print(f"deletion-review: state over {STATE_BUDGET} bytes; dropped the {trimmed} oldest log and pending entries", file=sys.stderr)
-    if len(json.dumps(state)) > STATE_BUDGET:
-        print(f"deletion-review: state is over {STATE_BUDGET} bytes with only seen ids left", file=sys.stderr)
+        print(f"deletion-review: state over {STATE_CAP} bytes; dropped the {trimmed} oldest log and pending entries", file=sys.stderr)
     return json.dumps(state, sort_keys=True) != before
+
+
+def render(state):
+    body = {k: v for k, v in state.items() if k != "_revision"}
+    return ("---\ntype: note\ntitle: Deletion review state\n---\n\n# Deletion review state\n\n"
+            "Notion items moved to trash that the deletion-review job has seen, and its risk log (log only, nothing is "
+            "restored or changed in Notion). Kept by cron-deletion-review.py.\n\n"
+            "```json\n" + json.dumps(body) + "\n```\n")
 
 
 def save_state(state):
     revision = state.pop("_revision", None)
-    content = ("---\ntype: note\ntitle: Deletion review state\n---\n\n# Deletion review state\n\n"
-               "Notion items moved to trash that the deletion-review job has seen, and its risk log (log only, nothing is "
-               "restored or changed in Notion). Kept by cron-deletion-review.py.\n\n"
-               "```json\n" + json.dumps(state) + "\n```\n")
-    args = {"slug": STATE, "content": content}
+    args = {"slug": STATE, "content": render(state)}
     if revision is not None:
         args["expected_revision"] = revision
     put_state_page(args)

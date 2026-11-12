@@ -102,6 +102,7 @@ def check_cap(slug, content):
 
 
 def put_state_page(args):
+    check_cap(args["slug"], args["content"])
     try:
         return call("put_page", args)
     except RuntimeError as e:
@@ -109,7 +110,6 @@ def put_state_page(args):
 
 
 def put_state(slug, content):
-    check_cap(slug, content)
     args = {"slug": slug, "content": content}
     try:
         page = call("get_page", {"slug": slug})
