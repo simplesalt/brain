@@ -26,6 +26,7 @@ TOKEN = os.environ.get("GBRAIN_REMOTE_TOKEN", "gbrain-mcp")
 STATE = "ops/people-scan"
 BATCH = int(os.environ.get("PEOPLE_SCAN_BATCH", "3"))
 DAYS = 90
+KEEP_DAYS = DAYS + 7
 MAX_ATTENDEES = 10
 MAX_EXAMINED = 60
 BACKLOG_EVERY_MIN = 5
@@ -185,11 +186,22 @@ def load_state():
     return set(json.loads(m.group(1))) if m else set()
 
 
+def keep_from():
+    return (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=KEEP_DAYS)).date().isoformat()
+
+
+def entry_date(key):
+    m = re.search(r"\d{4}-\d{2}-\d{2}", key)
+    return m.group(0) if m else ""
+
+
 def applied_marks(done):
     return {s[len("output:"):] for s in done if s.startswith("output:")}
 
 
 def save_state(done):
+    keep = keep_from()
+    done = {s for s in done if not entry_date(s) or entry_date(s) >= keep}
     content = ("---\ntype: note\ntitle: People scan state\n---\n\n# People scan state\n\n"
                "Meetings and email threads the people-scan job has handled. Kept by cron-people-scan.py.\n\n"
                "```json\n" + json.dumps(sorted(done)) + "\n```\n")
@@ -278,14 +290,17 @@ def add_email(slug, email):
         m = re.match(r"---\n(.*?)\n---(?=\n|$)", content or "", re.S)
         if not m:
             raise RuntimeError(f"{slug}: no frontmatter to add {email} to")
+        if page.get("revision") is None:
+            raise RuntimeError(f"{slug}: get_page returned no revision")
         lines = m.group(1).split("\n")
         add_to_list(lines, "aliases", email, True)
         add_to_list(lines, "emails", email, False)
-        args = {"slug": slug, "content": "---\n" + "\n".join(lines) + "\n---" + content[m.end():]}
-        if page.get("revision") is not None:
-            args["expected_revision"] = page["revision"]
+        new = "---\n" + "\n".join(lines) + "\n---"
+        if new == m.group(0):
+            return
         try:
-            call("put_page", args)
+            call("edit_page", {"slug": slug, "expected_revision": page["revision"],
+                               "edits": [{"old_text": m.group(0), "new_text": new}]})
             return
         except RuntimeError as e:
             if "revision_conflict" not in str(e):
@@ -364,6 +379,8 @@ def apply_results(state_files):
             key = f"{job}/{f}"
             if key in state_files or not f.endswith(".md"):
                 continue
+            if entry_date(f) and entry_date(f) < keep_from():
+                continue
             text = open(os.path.join(d, f), encoding="utf-8", errors="replace").read()
             if MARKER not in text:
                 continue
@@ -389,7 +406,8 @@ def main():
     pages = [p for p in all_pages(type="meeting", source_id="google") + all_pages(type="email", source_id="google")
              if p["slug"] not in done]
     today = now.date().isoformat()
-    pages = [p for p in pages if slug_date(p) <= today]
+    keep = keep_from()
+    pages = [p for p in pages if slug_date(p) <= today and (not slug_date(p) or slug_date(p) >= keep)]
     pages.sort(key=slug_date, reverse=True)
     fresh = (now - datetime.timedelta(days=2)).date().isoformat()
     if not any(slug_date(p) >= fresh for p in pages) and now.minute % BACKLOG_EVERY_MIN:

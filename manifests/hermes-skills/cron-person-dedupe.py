@@ -39,6 +39,7 @@ STATE = "ops/person-dedupe"
 LIVE = os.environ.get("PERSON_DEDUPE_LIVE") == "1"
 MAX_GROUP = int(os.environ.get("PERSON_DEDUPE_MAX_GROUP", "5"))
 MAX_MERGES = int(os.environ.get("PERSON_DEDUPE_MAX_MERGES", "10"))
+MERGED_KEEP_DAYS = 180
 LIST_KEYS = ("emails", "phones", "aliases")
 SECTION_SKIP = {"contact", "timeline"}
 EMAIL_RE = re.compile(r"^[^\s:@]+@[^\s@]+\.[^\s@]+$")
@@ -238,20 +239,42 @@ def merged_frontmatter(sv, dp):
     return fm, changes
 
 
-def render_content(sv_page, fm, extra_sections):
+def unique_tail(text, end, start):
+    """The shortest run of whole lines ending at `end` (not before `start`) that occurs once in text."""
+    a = end
+    while a > start:
+        nl = text.rfind("\n", start, a - 1)
+        a = nl + 1 if nl >= 0 else start
+        if text.count(text[a:end]) == 1:
+            return a
+    return None
+
+
+def merge_edits(sv_page, fm, extra_sections):
     content = sv_page.get("content") or ""
     m = re.match(r"---\n.*?\n---\n", content, re.S)
-    body = content[m.end():] if m else content
+    if not m:
+        raise RuntimeError(f"{sv_page.get('slug')}: no frontmatter to merge into")
+    edits = []
+    view = content
+    if fm != (sv_page.get("frontmatter") or {}):
+        head = "---\n" + "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in fm.items()) + "\n---\n"
+        edits.append({"old_text": m.group(0), "new_text": head})
+        view = head + content[m.end():]
     if extra_sections:
+        start = len(view) - len(content) + m.end()
+        body = view[start:]
         truth = (sv_page.get("compiled_truth") or "").rstrip()
         at = body.find(truth) + len(truth) if truth and truth in body else -1
-        add = "\n\n" + "\n\n".join(extra_sections) + "\n"
         if at < 0:
             i = body.find("\n## Timeline")
             at = i if i >= 0 else len(body.rstrip())
-        body = body[:at].rstrip("\n") + add + body[at:]
-    head = "---\n" + "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in fm.items()) + "\n---\n"
-    return head + body
+        end = start + len(body[:at].rstrip("\n"))
+        a = unique_tail(view, end, start) if end > start else None
+        if a is None:
+            raise RuntimeError(f"{sv_page.get('slug')}: no unique line to add sections after")
+        edits.append({"old_text": view[a:end], "new_text": view[a:end] + "\n\n" + "\n\n".join(extra_sections)})
+    return edits
 
 
 def plan_merge(sv, dp):
@@ -314,11 +337,11 @@ def execute_merge(sv_slug, dp_slug):
     fm, _ = merged_frontmatter(sv.get("frontmatter") or {}, dp["fm"])
     sv_heads = {h.lower() for h, _ in split_sections(sv.get("compiled_truth"))}
     extra = [t for t in plan["sections"] if split_sections(t)[0][0].lower() not in sv_heads]
-    content = render_content(sv, fm, extra)
-    if fm != (sv.get("frontmatter") or {}) or extra:
-        call("put_page", {"slug": sv_slug, "content": content, "expected_revision": sv["revision"],
-                          "request_id": rid("put", sv_slug, sv["revision"],
-                                            hashlib.sha1(content.encode()).hexdigest())})
+    edits = merge_edits(sv, fm, extra)
+    if edits:
+        call("edit_page", {"slug": sv_slug, "expected_revision": sv["revision"], "edits": edits,
+                           "request_id": rid("edit", sv_slug, sv["revision"],
+                                             hashlib.sha1(json.dumps(edits).encode()).hexdigest())})
     dp = get_full(dp_slug)
     if dp:
         call("delete_page", {"slug": dp_slug, "expected_revision": dp["revision"],
@@ -416,6 +439,8 @@ def run(live=None):
             state["merged"].append({"duplicate": dp["slug"], "survivor": sv["slug"], "at": now()})
             state["redirects"][dp["slug"]] = sv["slug"]
             log.append(f"merged {dp['slug']} into {sv['slug']}")
+    keep = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=MERGED_KEEP_DAYS)).strftime("%Y-%m-%d")
+    state["merged"] = [e for e in state["merged"] if (e.get("at") or "")[:10] >= keep]
     state["pending_review"] = pending
     state["plan"] = plans
     state["mode"] = "live" if live else "dry-run"
