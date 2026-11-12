@@ -4,6 +4,13 @@ Meeting ingest: turn one recorded Fireflies call into a worked-up meeting page i
 
 The script output above names one meeting page in gbrain (a slug under `meetings/`). Load gbrain's `meeting-ingestion` skill and follow it for that meeting. The meeting page was drafted by the Fireflies import with `facts_backstop: false`; the raw transcript is on a linked sidecar page of type `source` (its slug is in the meeting page's `transcript` frontmatter field and its first line). Skip the skill's steps to normalize the input, split recordings, check for duplicates across recorders, and file a transcript page: the sidecar already exists.
 
+Page-writing rules. These override anything the meeting-ingestion skill says about writing pages:
+- Never call `put_page` on a page that already exists. Create a page with `put_page` only when gbrain has no page at that slug.
+- Change an existing page only with `mcp__gbrain__edit_page`: read it with `include_content: true`, pass its `revision` as `expected_revision`, and replace exact text. To add text, replace a short passage next to where it goes with that passage plus the new text.
+- Never pass `allow_shrink`, `force`, `allow_empty` or `drop_timeline`. Never remove more than a few lines of an existing page.
+- If gbrain refuses a write (for example `page_shrink_refused`, `revision_required` or a guard refusal), stop changing that page: nothing was written, so do not retry it another way. Name the refusal in your answer.
+- Slugs you build use one hyphen between words and none at the end or before a `/`.
+
 1. Read the meeting page with `mcp__gbrain__get_page` (`{"slug": "<meeting slug>"}`). Note its `revision`. Read the sidecar the same way (with `include_content: true`) and use it as the transcript. Never edit the sidecar and never remove its `facts_backstop: false`. If the sidecar is missing or has no transcript text, stop and answer `SKIPPED: no transcript`.
 2. Add the sections below after the Attendees section in one `mcp__gbrain__edit_page` call: read the page with `include_content: true`, pass its `revision` as `expected_revision`, and send one edit whose `old_text` is the whole Attendees section exactly as read (heading and every line) and whose `new_text` is that same text followed by the new sections. Never rewrite the meeting page with `put_page`: the frontmatter (including `facts_backstop: false` for now, and the `transcript` link), the link to the transcript sidecar and the Attendees section stay exactly as they are. Do not copy the transcript into the meeting page. Write these sections from the transcript only:
    - Summary: the key outcomes.
