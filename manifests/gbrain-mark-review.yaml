@@ -41,7 +41,7 @@ spec:
               command: ["bun", "/scripts/gbrain-mark-review.mjs"]
               env:
                 - name: APPLY
-                  value: "false"
+                  value: "true"
                 - name: DELETE_AFTER_HOURS
                   value: "4320"
                 - name: REPLACE_AFTER_HOURS

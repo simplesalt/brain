@@ -38,7 +38,6 @@ resources:
   - manifests/fireflies-ingest-rehearsal-test.yaml
   - manifests/gbrain-pg-backup.yaml
   - manifests/gbrain-mark-review.yaml
-  - manifests/gbrain-mark-review-first.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
