@@ -4,7 +4,7 @@ Meeting ingest: turn one recorded Fireflies call into a worked-up meeting page i
 
 The script output above names one meeting page in gbrain (a slug under `meetings/`). Load gbrain's `meeting-ingestion` skill and follow it for that meeting. The meeting page was drafted by the Fireflies import with `facts_backstop: false`; the raw transcript is on a linked sidecar page of type `source` (its slug is in the meeting page's `transcript` frontmatter field and its first line). Skip the skill's steps to normalize the input, split recordings, check for duplicates across recorders, and file a transcript page: the sidecar already exists.
 
-Page-writing rules. These override anything the meeting-ingestion skill says about writing pages:
+Page-writing rules. These override anything the meeting-ingestion skill says about writing pages, even if gbrain's hint says otherwise:
 - Never call `put_page` on a page that already exists. Create a page with `put_page` only when gbrain has no page at that slug.
 - Change an existing page only with `mcp__gbrain__edit_page`: read it with `include_content: true`, pass its `revision` as `expected_revision`, and replace exact text. To add text, replace a short passage next to where it goes with that passage plus the new text.
 - Never pass `allow_shrink`, `force`, `allow_empty` or `drop_timeline`. Never remove more than a few lines of an existing page.
