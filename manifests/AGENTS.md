@@ -59,9 +59,9 @@ Save them there. gbrain holds project knowledge.
 - After a `put_page` on a person or company, add what the page body cannot
   carry: `mcp__gbrain__add_link` for relationships (works_at, founded, knows)
   and `mcp__gbrain__add_timeline_entry` for each dated interaction. `put_page`
-  over MCP does not create links or timeline entries from the text. Keep the
-  page's existing Timeline section when you rewrite it; gbrain refuses a
-  rewrite that would drop timeline entries.
+  over MCP does not create links or timeline entries from the text. Never
+  remove the page's existing Timeline section; gbrain refuses a change that
+  would drop timeline entries.
 - Saving a person who works at a company takes all four steps, every time,
   even when the company is only named in passing:
   1. Find the company page: `mcp__gbrain__search` with the company name and
@@ -90,6 +90,14 @@ Save them there. gbrain holds project knowledge.
 - Never rewrite a page from an outline or a window. When `get_page` returns
   an outline or only part of the body (large pages), do not `put_page` what
   you got back; use `edit_page`.
+- To delete a page, call `mcp__gbrain__mark_page_for_deletion` with the slug
+  and a reason: the page is hidden from reads at once and deleted after 6
+  months unless you or Dylan call `mcp__gbrain__withdraw_page_mark`. A page
+  that must be replaced wholesale goes through
+  `mcp__gbrain__propose_page_replacement` (applied after 7 days). Searching
+  hard for something you can't find: pass `include_deleted: true` to see
+  pages marked for deletion. To see or restore an earlier version of a page:
+  `mcp__gbrain__get_versions`, then `mcp__gbrain__revert_version`.
 - Never pass `allow_shrink`. If gbrain answers `page_shrink_refused`, stop:
   nothing was written; do not retry the write in another form. Tell the user
   the change was refused and why.
