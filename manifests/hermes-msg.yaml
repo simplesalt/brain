@@ -740,7 +740,7 @@ data:
     }
 
     async function calendarTime(value, field) {
-      const v = String(value ?? '').trim();
+      const v = String(value ?? '').trim().replace(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?!:)/, '$1:00');
       if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return { date: v };
       if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v) || Number.isNaN(Date.parse(v))) {
         throw new Error(`${field} must be an ISO 8601 date-time or a YYYY-MM-DD date`);
@@ -1090,7 +1090,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "12"
+        simplesalt.company/restart-epoch: "13"
     spec:
       serviceAccountName: hermes-msg
       initContainers:
