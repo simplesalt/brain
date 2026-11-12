@@ -1,0 +1,26 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: agentdatabases.agentdb.simplesalt.company
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+spec:
+  group: agentdb.simplesalt.company
+  names:
+    kind: AgentDatabase
+    listKind: AgentDatabaseList
+    plural: agentdatabases
+    singular: agentdatabase
+    shortNames:
+      - agentdb
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
