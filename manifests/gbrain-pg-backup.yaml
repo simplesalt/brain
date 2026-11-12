@@ -1,0 +1,404 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gbrain-pg-backup-a
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gbrain-pg-backup-b
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gbrain-pg-backup-scripts
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  dump.sh: |
+    #!/bin/sh
+    set -u
+    export PGOPTIONS='-c default_transaction_read_only=on'
+    export PGAPPNAME="gbrain-pg-backup-$COPY"
+    DIR=/dumps
+    KEEP=7
+    partial=""
+    fail() { echo "FATAL: $*"; [ -n "$partial" ] && rm -f "$partial"; echo "RESULT: FAIL"; exit 1; }
+    q() { PGOPTIONS="$PGOPTIONS -c statement_timeout=60000 -c lock_timeout=5000" psql -X -q -A -t -v ON_ERROR_STOP=1 -c "$1" "$DATABASE_URL"; }
+    case "$DATABASE_URL" in *@gbrain-pg-rw[.:/]*) ;; *) fail "DATABASE_URL does not target gbrain-pg-rw" ;; esac
+    [ -d "$DIR" ] && [ -w "$DIR" ] || fail "$DIR is not writable"
+    i=0
+    until pg_isready -h gbrain-pg-rw -p 5432; do
+      i=$((i + 1)); [ "$i" -ge 90 ] && fail "gbrain-pg-rw not ready after 180s"; sleep 2
+    done
+    [ "$(q "SHOW default_transaction_read_only")" = "on" ] || fail "session is not read-only"
+    counts() {
+      echo "pages_live=$(q "SELECT count(*) FROM pages WHERE deleted_at IS NULL")"
+      echo "content_chunks=$(q "SELECT count(*) FROM content_chunks")"
+      echo "timeline_entries=$(q "SELECT count(*) FROM timeline_entries")"
+      echo "config_version=$(q "SELECT value FROM config WHERE key = 'version'")"
+    }
+    echo "gbrain-pg-backup copy $COPY on node ${NODE_NAME:-unknown}, started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    BEFORE=$(counts) || fail "could not read counts"
+    TS=$(date -u +%Y%m%dT%H%M%SZ)
+    base="gbrain-nightly-${TS}.dump"
+    partial="$DIR/$base.partial"
+    pg_dump --format=custom --compress=gzip:6 --lock-wait-timeout=60s --file="$partial" --dbname="$DATABASE_URL" || fail "pg_dump failed"
+    AFTER=$(counts) || AFTER="after=unavailable"
+    [ -s "$partial" ] || fail "dump is empty"
+    toc=$(pg_restore --list "$partial") || fail "pg_restore --list failed"
+    for t in pages content_chunks timeline_entries config access_tokens; do
+      printf '%s\n' "$toc" | grep -q " TABLE DATA public $t " || fail "public.$t data missing from the dump"
+    done
+    pg_restore --file=/dev/null "$partial" || fail "full read of the dump failed"
+    mv "$partial" "$DIR/$base" || fail "rename failed"
+    partial=""
+    { echo "dump_file=$base"; echo "copy=$COPY"; echo "node=${NODE_NAME:-unknown}"; echo "created_utc=$TS"
+      printf '%s\n' "$BEFORE" | while IFS= read -r l; do echo "before_$l"; done
+      printf '%s\n' "$AFTER" | while IFS= read -r l; do echo "after_$l"; done; } > "$DIR/$base.info" || fail "info write failed"
+    (cd "$DIR" && sha256sum "$base" > "$base.sha256.tmp" && mv "$base.sha256.tmp" "$base.sha256" && sha256sum -c "$base.sha256") || fail "checksum failed"
+    sync
+    n=0
+    for f in $(ls -1t "$DIR"/gbrain-nightly-*.dump 2>/dev/null); do
+      n=$((n + 1))
+      if [ "$n" -gt "$KEEP" ]; then echo "pruning $(basename "$f")"; rm -f "$f" "$f.info" "$f.sha256"; fi
+    done
+    rm -f "$DIR"/*.partial 2>/dev/null
+    echo "kept:"; ls -l "$DIR"
+    echo "size: $(wc -c < "$DIR/$base") bytes, sha256 $(cut -d ' ' -f 1 "$DIR/$base.sha256")"
+    cat "$DIR/$base.info"
+    echo "RESULT: PASS"
+  verify.sh: |
+    #!/bin/sh
+    set -u
+    DIR=/dumps
+    DB=gbrain_backup_verify
+    status=PASS
+    fail() { echo "FATAL: $*"; adm "DROP DATABASE IF EXISTS $DB WITH (FORCE)" >/dev/null 2>&1; echo "RESULT: FAIL"; exit 1; }
+    adm() { psql -X -q -A -t -v ON_ERROR_STOP=1 -h "$PGHOST" -d postgres -c "$1"; }
+    rq() { psql -X -q -A -t -v ON_ERROR_STOP=1 -h "$PGHOST" -d "$DB" -c "$1"; }
+    [ "$PGHOST" = gbrain-pg-rehearsal-rw ] || fail "PGHOST must be gbrain-pg-rehearsal-rw"
+    [ -z "${DATABASE_URL:-}" ] || fail "DATABASE_URL must be unset"
+    i=0
+    until pg_isready -h "$PGHOST" -p 5432; do
+      i=$((i + 1)); [ "$i" -ge 90 ] && fail "$PGHOST not ready after 180s"; sleep 2
+    done
+    file=$(ls -1t "$DIR"/gbrain-nightly-*.dump 2>/dev/null | head -n 1)
+    [ -n "$file" ] || fail "no nightly dump in $DIR"
+    base=$(basename "$file")
+    info="$file.info"
+    echo "verify-restore of $base into database $DB on $PGHOST (the rehearsal copy's database gbrain is not touched)"
+    age=$(( $(date +%s) - $(stat -c %Y "$file") ))
+    echo "dump age: ${age}s"
+    [ "$age" -le 93600 ] || { echo "WARN: newest dump is older than 26 hours"; status=FAIL; }
+    (cd "$DIR" && sha256sum -c "$base.sha256") || fail "checksum mismatch"
+    adm "DROP DATABASE IF EXISTS $DB WITH (FORCE)" || fail "could not drop $DB"
+    adm "CREATE DATABASE $DB OWNER gbrain TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'" || fail "could not create $DB"
+    pg_restore --host="$PGHOST" --dbname="$DB" --exit-on-error --single-transaction --no-password "$file" || fail "pg_restore failed"
+    val() { grep "^$1=" "$info" | cut -d= -f2-; }
+    check() {
+      r=$(rq "$2"); b=$(val "before_$1"); a=$(val "after_$1")
+      lo=$b; hi=$a; [ "$lo" -gt "$hi" ] 2>/dev/null && { lo=$a; hi=$b; }
+      if [ "$r" -ge "$lo" ] 2>/dev/null && [ "$r" -le "$hi" ] 2>/dev/null; then v=ok; else v=MISMATCH; status=FAIL; fi
+      echo "  $1: prod-before=$b prod-after=$a restored=$r $v"
+    }
+    check pages_live "SELECT count(*) FROM pages WHERE deleted_at IS NULL"
+    check content_chunks "SELECT count(*) FROM content_chunks"
+    check timeline_entries "SELECT count(*) FROM timeline_entries"
+    rv=$(rq "SELECT value FROM config WHERE key = 'version'")
+    [ "$rv" = "$(val before_config_version)" ] && echo "  config_version: $rv ok" || { echo "  config_version: restored=$rv MISMATCH"; status=FAIL; }
+    echo "  sample pages: $(rq "SELECT string_agg(slug || ' ' || octet_length(compiled_truth), ', ') FROM (SELECT slug, compiled_truth FROM pages WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 3) s")"
+    adm "DROP DATABASE IF EXISTS $DB WITH (FORCE)" || { echo "WARN: could not drop $DB"; status=FAIL; }
+    echo "RESULT: $status"
+    [ "$status" = PASS ]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gbrain-pg-backup-a
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  schedule: "30 3 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: gbrain-pg-backup
+            copy: a
+            entity: ssint
+            env: main
+            capability: ai
+            scheduling.simplesalt.company/class: work
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 26
+            runAsGroup: 26
+            fsGroup: 26
+            seccompProfile:
+              type: RuntimeDefault
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app: gbrain-pg-backup
+                      copy: b
+          containers:
+            - name: dump
+              image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/dump.sh"]
+              env:
+                - name: COPY
+                  value: a
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: gbrain-pg-app
+                      key: uri
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 64Mi
+                limits:
+                  memory: 512Mi
+              volumeMounts:
+                - name: dumps
+                  mountPath: /dumps
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: dumps
+              persistentVolumeClaim:
+                claimName: gbrain-pg-backup-a
+            - name: scripts
+              configMap:
+                name: gbrain-pg-backup-scripts
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gbrain-pg-backup-b
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  schedule: "30 3 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: gbrain-pg-backup
+            copy: b
+            entity: ssint
+            env: main
+            capability: ai
+            scheduling.simplesalt.company/class: work
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 26
+            runAsGroup: 26
+            fsGroup: 26
+            seccompProfile:
+              type: RuntimeDefault
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app: gbrain-pg-backup
+                      copy: a
+          containers:
+            - name: dump
+              image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/dump.sh"]
+              env:
+                - name: COPY
+                  value: b
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: gbrain-pg-app
+                      key: uri
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 64Mi
+                limits:
+                  memory: 512Mi
+              volumeMounts:
+                - name: dumps
+                  mountPath: /dumps
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: dumps
+              persistentVolumeClaim:
+                claimName: gbrain-pg-backup-b
+            - name: scripts
+              configMap:
+                name: gbrain-pg-backup-scripts
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gbrain-pg-backup-verify
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  schedule: "30 5 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: gbrain-pg-backup-verify
+            entity: ssint
+            env: main
+            capability: ai
+            scheduling.simplesalt.company/class: work
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 26
+            runAsGroup: 26
+            fsGroup: 26
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: verify
+              image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/verify.sh"]
+              env:
+                - name: PGHOST
+                  value: gbrain-pg-rehearsal-rw
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: gbrain-pg-rehearsal-app
+                      key: username
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: gbrain-pg-rehearsal-app
+                      key: password
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 64Mi
+                limits:
+                  memory: 512Mi
+              volumeMounts:
+                - name: dumps
+                  mountPath: /dumps
+                  readOnly: true
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: dumps
+              persistentVolumeClaim:
+                claimName: gbrain-pg-backup-a
+                readOnly: true
+            - name: scripts
+              configMap:
+                name: gbrain-pg-backup-scripts

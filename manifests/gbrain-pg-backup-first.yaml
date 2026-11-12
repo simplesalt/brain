@@ -1,0 +1,165 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-pg-backup-a-first
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 3600
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: gbrain-pg-backup
+        copy: a
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: gbrain-pg-backup
+                  copy: b
+      containers:
+        - name: dump
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/dump.sh"]
+          env:
+            - name: COPY
+              value: a
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: dumps
+              mountPath: /dumps
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: dumps
+          persistentVolumeClaim:
+            claimName: gbrain-pg-backup-a
+        - name: scripts
+          configMap:
+            name: gbrain-pg-backup-scripts
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-pg-backup-b-first
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 3600
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: gbrain-pg-backup
+        copy: b
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: gbrain-pg-backup
+                  copy: a
+      containers:
+        - name: dump
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/dump.sh"]
+          env:
+            - name: COPY
+              value: b
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: dumps
+              mountPath: /dumps
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: dumps
+          persistentVolumeClaim:
+            claimName: gbrain-pg-backup-b
+        - name: scripts
+          configMap:
+            name: gbrain-pg-backup-scripts
