@@ -27,6 +27,7 @@ STATE = "ops/timeline-sweep"
 MAIN_SOURCE = "default"
 MAX_PAGES = int(os.environ.get("TIMELINE_SWEEP_MAX_PAGES", "30"))
 DRY_RUN = os.environ.get("TIMELINE_SWEEP_DRY_RUN") == "1"
+KEEP_DAYS = 90
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SKIP_LABELS = scan.SKIP_LABELS
 
@@ -69,7 +70,8 @@ def load_state():
     return data if isinstance(data, dict) else {}
 
 
-def save_state(done):
+def save_state(done, keep):
+    done = {s: u for s, u in done.items() if not u or u[:10] >= keep}
     content = ("---\ntype: note\ntitle: Timeline sweep state\n---\n\n# Timeline sweep state\n\n"
                "Emails and meetings the timeline-sweep job has added to people's timelines, with the page's "
                "updated time when it did. Kept by cron-timeline-sweep.py.\n\n"
@@ -111,6 +113,7 @@ def has_entry(slug, source, cache):
 def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     done = load_state()
+    keep = (now - datetime.timedelta(days=KEEP_DAYS)).date().isoformat()
     pages = []
     for sid in google_sources():
         for kind in ("email", "meeting"):
@@ -118,7 +121,8 @@ def main():
     seen = {}
     for p in pages:
         seen[p["slug"]] = seen.get(p["slug"], 0) + 1
-    todo = [p for p in pages if done.get(p["slug"]) != str(p.get("updated_at") or "")]
+    todo = [p for p in pages if done.get(p["slug"]) != str(p.get("updated_at") or "")
+            and (not p.get("updated_at") or str(p["updated_at"])[:10] >= keep)]
     todo.sort(key=lambda p: str(p.get("updated_at") or ""), reverse=True)
     todo = todo[:MAX_PAGES]
     if not todo:
@@ -154,7 +158,7 @@ def main():
         except Exception as e:
             lines.append(f"timeline-sweep: could not process {slug}: {e}")
     if changed and not DRY_RUN:
-        save_state(done)
+        save_state(done, keep)
     if lines:
         print("\n".join(lines))
 

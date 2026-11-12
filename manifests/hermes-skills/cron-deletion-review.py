@@ -35,8 +35,12 @@ BACKLOG_HOURS = 48
 MAX_TEXT = 4000
 MAX_EXCERPT = 600
 MAX_REPLACEMENTS = 5
-MAX_LOG = 500
+MAX_LOG = 150
 MAX_PENDING = 200
+SEEN_DAYS = 35
+PENDING_DAYS = 14
+LOG_DAYS = 180
+STATE_BUDGET = 128 * 1024
 OUTPUT_DIR = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "cron", "output")
 MARKER = "DELETION-REVIEW-RESULT"
 DRY_RUN = os.environ.get("DELETION_REVIEW_DRY_RUN") == "1"
@@ -291,15 +295,57 @@ def load_state():
     state = json.loads(m.group(1)) if m else {}
     # gbrain refuses a put_page on an existing page without the revision just read.
     revision = page.get("revision") if isinstance(page, dict) else None
-    return {"seen": state.get("seen", []), "applied": state.get("applied", []),
+    seen = state.get("seen", {})
+    if isinstance(seen, list):
+        today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        seen = {i: today for i in seen}
+    return {"seen": seen, "applied": state.get("applied", []),
             "pending": state.get("pending", {}), "log": state.get("log", []), "_revision": revision}
+
+
+def day(ts):
+    return (ts or "")[:10]
+
+
+def output_day(key):
+    m = re.search(r"(\d{4}-\d{2}-\d{2})_\d{2}-\d{2}-\d{2}", key)
+    return m.group(1) if m else ""
+
+
+def days_ago(now, days):
+    return (now - datetime.timedelta(days=days)).date().isoformat()
+
+
+def mark_seen(state, ids, now):
+    for i in ids:
+        state["seen"].setdefault(i, now.date().isoformat())
+
+
+def prune(state, now, in_trash):
+    """Drop entries past their age limit, then the oldest log and pending entries until the state fits STATE_BUDGET. True if anything was dropped."""
+    before = json.dumps(state, sort_keys=True)
+    state["seen"] = {i: d for i, d in state["seen"].items() if d >= days_ago(now, SEEN_DAYS) or i in in_trash}
+    state["applied"] = [k for k in state["applied"] if not output_day(k) or output_day(k) >= days_ago(now, SEEN_DAYS)]
+    for i, p in list(state["pending"].items()):
+        if day(p.get("at") or p.get("deleted_at")) < days_ago(now, PENDING_DAYS):
+            print(f"deletion-review: dropped {i} after {PENDING_DAYS} days with no answer", file=sys.stderr)
+            del state["pending"][i]
+    if len(state["pending"]) > MAX_PENDING:
+        state["pending"] = dict(list(state["pending"].items())[-MAX_PENDING:])
+    state["log"] = [e for e in state["log"]
+                    if day(e.get("logged_at") or e.get("deleted_at")) >= days_ago(now, LOG_DAYS)][-MAX_LOG:]
+    while len(json.dumps(state)) > STATE_BUDGET and (state["log"] or state["pending"]):
+        if state["log"]:
+            state["log"].pop(0)
+        else:
+            del state["pending"][next(iter(state["pending"]))]
+    if len(json.dumps(state)) > STATE_BUDGET:
+        print(f"deletion-review: state is over {STATE_BUDGET} bytes with only seen ids left", file=sys.stderr)
+    return json.dumps(state, sort_keys=True) != before
 
 
 def save_state(state):
     revision = state.pop("_revision", None)
-    state["log"] = state["log"][-MAX_LOG:]
-    if len(state["pending"]) > MAX_PENDING:
-        state["pending"] = dict(list(state["pending"].items())[-MAX_PENDING:])
     content = ("---\ntype: note\ntitle: Deletion review state\n---\n\n# Deletion review state\n\n"
                "Notion items moved to trash that the deletion-review job has seen, and its risk log (log only, nothing is "
                "restored or changed in Notion). Kept by cron-deletion-review.py.\n\n"
@@ -310,7 +356,7 @@ def save_state(state):
     call("put_page", args)
 
 
-def apply_results(state):
+def apply_results(state, now):
     """Log a risk entry for every item in a saved deletion-review answer not applied yet; returns the files applied."""
     applied = []
     try:
@@ -322,6 +368,8 @@ def apply_results(state):
         for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
             key = f"{job}/{f}"
             if key in state["applied"] or not f.endswith(".md"):
+                continue
+            if output_day(key) and output_day(key) < days_ago(now, SEEN_DAYS):
                 continue
             text = open(os.path.join(d, f), encoding="utf-8", errors="replace").read()
             if MARKER not in text:
@@ -338,7 +386,7 @@ def apply_results(state):
                 l, r, e = unit(a.get("L")), unit(a.get("R")), unit(a.get("E"))
                 score = risk(item["S"], l, r, e)
                 state["log"].append(dict(item, L=l, R=r, E=e, risk=score, would_flag=score > THRESHOLD,
-                                         reason=str(a.get("reason") or "")[:300]))
+                                         reason=str(a.get("reason") or "")[:300], logged_at=now.isoformat()))
             applied.append(key)
     return applied
 
@@ -351,8 +399,8 @@ def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     state = load_state()
     first_run = state is None
-    state = state or {"seen": [], "applied": [], "pending": {}, "log": []}
-    applied = apply_results(state)
+    state = state or {"seen": {}, "applied": [], "pending": {}, "log": []}
+    applied = apply_results(state, now)
     state["applied"] += applied
     trashed = [o for o in search({"filter": {"in_trash": True}}) if o.get("in_trash")]
     seen = set(state["seen"])
@@ -361,7 +409,7 @@ def main():
         # Backlog: what was trashed more than 48h ago is not reviewed, only marked seen.
         cutoff = (now - datetime.timedelta(hours=BACKLOG_HOURS)).isoformat()
         old = [e for e in roots if (e["obj"].get("last_edited_time") or "") < cutoff]
-        state["seen"] += [i for e in old for i in [e["obj"]["id"]] + [k["id"] for k in e["children"]]]
+        mark_seen(state, [i for e in old for i in [e["obj"]["id"]] + [k["id"] for k in e["children"]]], now)
         roots = [e for e in roots if e not in old]
     roots.sort(key=lambda e: e["obj"].get("last_edited_time") or "")
     users = load_users() if roots else {}
@@ -371,16 +419,18 @@ def main():
     own = [e for e in roots if me and (e["obj"].get("last_edited_by") or {}).get("id") == me]
     for e in own:
         print(f"deletion-review: {e['obj']['id']} was last trashed by this job; skipped", file=sys.stderr)
-    state["seen"] += [i for e in own for i in [e["obj"]["id"]] + [k["id"] for k in e["children"]]]
+    mark_seen(state, [i for e in own for i in [e["obj"]["id"]] + [k["id"] for k in e["children"]]], now)
     roots = [e for e in roots if e not in own]
     batch = []
     for entry in roots[:BATCH]:
         item = review_item(entry, users)
         ids = item.pop("_all_ids")
-        state["seen"] += ids
-        state["pending"][item["id"]] = {k: item[k] for k in ("id", "title", "url", "deleter", "deleted_at", "S")}
+        mark_seen(state, ids, now)
+        state["pending"][item["id"]] = dict({k: item[k] for k in ("id", "title", "url", "deleter", "deleted_at", "S")},
+                                            at=now.isoformat())
         batch.append(item)
-    if (batch or applied or first_run) and not DRY_RUN:
+    pruned = prune(state, now, {o["id"] for o in trashed})
+    if (batch or applied or first_run or pruned) and not DRY_RUN:
         save_state(state)
     if not batch:
         print(json.dumps({"wakeAgent": False}))

@@ -58,6 +58,7 @@ BATCH = int(os.environ.get("LOOP_TASKS_BATCH", "5"))
 LIMIT = 500
 LOG_KEEP = 200
 OUTPUTS_KEEP = 1000
+STATE_BUDGET = 128 * 1024
 RETRY_AFTER_H = 3
 MAX_TRIES = 3
 OUTPUT_DIR = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "cron", "output")
@@ -438,6 +439,10 @@ def load_state():
 
 def save_state(state):
     state["log"] = state["log"][-LOG_KEEP:]
+    while state["log"] and len(json.dumps(state)) > STATE_BUDGET:
+        state["log"].pop(0)
+    if len(json.dumps(state)) > STATE_BUDGET:
+        print(f"loop-tasks-sync: state is over {STATE_BUDGET} bytes with an empty log", file=sys.stderr)
     content = ("---\ntype: note\ntitle: Loop tasks sync state\n---\n\n# Loop tasks sync state\n\n"
                "What the loop-tasks-sync job did each run, and what Hermes answered for Done rows whose loop "
                "was still open. Kept by cron-loop-tasks-sync.py.\n\n"

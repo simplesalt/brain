@@ -26,6 +26,7 @@ TOKEN = os.environ.get("GBRAIN_REMOTE_TOKEN", "gbrain-mcp")
 STATE = "ops/meeting-ingest"
 PREFIX = "meetings/"
 DAYS = 30
+KEEP_DAYS = DAYS + 7
 OUTPUT_DIR = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "cron", "output")
 DONE_MARKER = "MEETING-INGEST-DONE"
 RETRY_AFTER = datetime.timedelta(hours=1)
@@ -109,7 +110,8 @@ def load_state():
     return set(data.get("done", [])), dict(data.get("pending", {})), page.get("revision"), True
 
 
-def save_state(done, pending, revision):
+def save_state(done, pending, revision, keep):
+    done = {s for s in done if not slug_date({"slug": s}) or slug_date({"slug": s}) >= keep}
     state = {"done": sorted(done), "pending": dict(sorted(pending.items()))}
     content = ("---\ntype: note\ntitle: Meeting ingest state\n---\n\n# Meeting ingest state\n\n"
                "Fireflies calls the meeting-ingest job has handed to Hermes: done, or pending until Hermes reports "
@@ -265,6 +267,7 @@ def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     since = (now - datetime.timedelta(days=DAYS)).date().isoformat()
     today = now.date().isoformat()
+    keep = (now - datetime.timedelta(days=KEEP_DAYS)).date().isoformat()
     done, pending, revision, exists = load_state()
     before = (set(done), json.dumps(pending, sort_keys=True))
     finished = finished_slugs()
@@ -295,7 +298,8 @@ def main():
     for slug in done:
         pending.pop(slug, None)
     pages = [p for p in all_pages(type="meeting", source_id="default")
-             if p["slug"].startswith(PREFIX) and p["slug"] not in done and p["slug"] not in pending]
+             if p["slug"].startswith(PREFIX) and p["slug"] not in done and p["slug"] not in pending
+             and (not slug_date(p) or slug_date(p) >= keep)]
     fresh = [p for p in pages if since <= slug_date(p) <= today]
     # Calls older than the window (or with no date in the slug) are never handed out; mark them so they
     # are not listed again.
@@ -320,7 +324,7 @@ def main():
         tries = pending.get(pick["slug"], {}).get("tries", 0) + 1
         pending[pick["slug"]] = {"at": now.isoformat(), "tries": tries}
     if not DRY_RUN and ((set(done), json.dumps(pending, sort_keys=True)) != before or not exists):
-        save_state(done, pending, revision)
+        save_state(done, pending, revision, keep)
     if not pick:
         print(json.dumps({"wakeAgent": False}))
         return
