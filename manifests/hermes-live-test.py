@@ -67,7 +67,7 @@ def show(label, slug):
 
 
 def cleanup():
-    slugs = {MEETING, SIDECAR, NOTE}
+    slugs = {MEETING, SIDECAR, NOTE, f'people/pat-{TAG}', f'companies/livetest-{TAG}'}
     ok, res = gbrain('search', {'query': PERSON})
     for r in res if ok and isinstance(res, list) else []:
         if TAG in (r.get('slug') or ''):
