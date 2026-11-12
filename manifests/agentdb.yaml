@@ -24,7 +24,7 @@ spec:
   interval: 12h
   url: oci://ghcr.io/simplesalt/charts/agentdb
   ref:
-    tag: "0.2.0-20"
+    tag: "0.2.0-21"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
