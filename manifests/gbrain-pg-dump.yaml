@@ -20,7 +20,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-pg-dump-20261027-hop
+  name: gbrain-pg-dump-20261112
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -35,7 +35,7 @@ spec:
   template:
     metadata:
       labels:
-        app: gbrain-pg-dump-20261027-hop
+        app: gbrain-pg-dump-20261112
         entity: ssint
         env: main
         capability: ai
@@ -241,7 +241,7 @@ spec:
               echo "a non-zero delta means a writer changed the live database during the dump; the dump holds one consistent snapshot taken between the two counts. Stop all gbrain writers before the dump for an exact rollback point."
               echo
               echo "NEXT (for the parent; this job has done none of it):"
-              echo "  1. Job gbrain-pg-restore-20261027 in this manifest waits for this dump (label $DUMP_LABEL), then replaces database gbrain on the rehearsal cluster with it and ends with RESULT: PASS or RESULT: FAIL."
+              echo "  1. Job gbrain-pg-restore-20261112 in this manifest waits for this dump (label $DUMP_LABEL), then replaces database gbrain on the rehearsal cluster with it and ends with RESULT: PASS or RESULT: FAIL."
               echo "  2. Start the upgrade only after that job prints RESULT: PASS."
               echo "  3. This dump is the rollback artifact. Keep PVC gbrain-pg-dumps: it is annotated prune: disabled, but its StorageClass reclaim policy is Delete, so deleting the PVC deletes the dump. The volume is node-local; it does not survive losing its node."
               echo "  4. Rollback outline (a separate reviewed step): stop every gbrain writer; as role gbrain on gbrain-pg-rw run DROP DATABASE gbrain WITH (FORCE) then CREATE DATABASE gbrain TEMPLATE template0 with the encoding, collate and ctype recorded in $base.info; then pg_restore --exit-on-error --single-transaction --dbname=gbrain $DUMP_DIR/$base from a Job that mounts gbrain-pg-dumps."
@@ -250,7 +250,7 @@ spec:
               exit 0
           env:
             - name: DUMP_LABEL
-              value: "pre-hop-20261027"
+              value: "pre-908-20261112"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -278,7 +278,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-pg-restore-20261027
+  name: gbrain-pg-restore-20261112
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -293,7 +293,7 @@ spec:
   template:
     metadata:
       labels:
-        app: gbrain-pg-restore-20261027
+        app: gbrain-pg-restore-20261112
         entity: ssint
         env: main
         capability: ai
@@ -314,7 +314,7 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              export PGAPPNAME=gbrain-pg-restore-20261027
+              export PGAPPNAME=gbrain-pg-restore-20261112
 
               DUMP_DIR=/dumps
               TARGET_HOST=gbrain-pg-rehearsal-rw
@@ -373,7 +373,7 @@ spec:
                 ""|*[!A-Za-z0-9._-]*) fail "DUMP_LABEL must be non-empty and use only letters, digits, dot, underscore and hyphen (got: $DUMP_LABEL)" ;;
               esac
 
-              echo "gbrain-pg-restore-20261027: started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "gbrain-pg-restore-20261112: started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
               echo "target: database $TARGET_DB on $PGHOST (rehearsal cluster only) will be DROPPED and recreated from the dump labelled $DUMP_LABEL"
               echo "prod (gbrain-pg-rw) is not contacted by this job"
 
@@ -466,7 +466,7 @@ spec:
               section "6. result"
               echo "dump $base restored into $TARGET_DB on $PGHOST; the rehearsal gbrain Deployment must stay at 0 replicas until it is pointed at the new version"
               echo "RESULT: $status"
-              echo "gbrain-pg-restore-20261027: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "gbrain-pg-restore-20261112: complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
               if [ "$status" = "PASS" ]; then exit 0; fi
               exit 1
           env:
@@ -485,7 +485,7 @@ spec:
                   name: gbrain-pg-rehearsal-app
                   key: password
             - name: DUMP_LABEL
-              value: "pre-upgrade-20261027"
+              value: "pre-908-20261112"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

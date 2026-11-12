@@ -8,7 +8,7 @@ metadata:
     env: main
     capability: ai
 data:
-  GBRAIN_REHEARSAL_SHA: "23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc"
+  GBRAIN_REHEARSAL_SHA: "53b482504cfc37d5011f7e2259eb99357f650564"
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -72,7 +72,7 @@ metadata:
     env: main
     capability: ai
 spec:
-  replicas: 1
+  replicas: 0
   strategy:
     type: Recreate
   selector:
@@ -81,7 +81,7 @@ spec:
   template:
     metadata:
       annotations:
-        simplesalt.company/restart-epoch: "5"
+        simplesalt.company/restart-epoch: "6"
       labels:
         app: gbrain-rehearsal
         entity: ssint
@@ -118,30 +118,9 @@ spec:
               memory: 32Mi
             limits:
               memory: 128Mi
-        - name: install-gbrain
-          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
-          imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              GBRAIN_SHA="${GBRAIN_REHEARSAL_SHA:?GBRAIN_REHEARSAL_SHA is unset}"
-              echo "installing gbrain at ${GBRAIN_SHA}"
-              if [ ! -x /install/bin/gbrain ]; then
-                BUN_INSTALL=/install bun install -g "github:garrytan/gbrain#${GBRAIN_SHA}" \
-                  || { echo "FATAL: gbrain install failed"; exit 1; }
-              fi
-          env:
-            - name: GBRAIN_REHEARSAL_SHA
-              valueFrom:
-                configMapKeyRef:
-                  name: gbrain-rehearsal-version
-                  key: GBRAIN_REHEARSAL_SHA
-          volumeMounts:
-            - name: gbrain-install
-              mountPath: /install
       containers:
         - name: gbrain
-          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          image: ghcr.io/simplesalt/oci/gbrain:claude-project-thread-jsh22s@sha256:790372d524ace0ab427db222c3d0cf94eb09031e8c468be42105d7d5e83b24cd
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -305,11 +284,8 @@ spec:
               memory: 128Mi
             limits:
               memory: 2Gi
-          volumeMounts:
-            - name: gbrain-install
-              mountPath: /install
         - name: autopilot
-          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          image: ghcr.io/simplesalt/oci/gbrain:claude-project-thread-jsh22s@sha256:790372d524ace0ab427db222c3d0cf94eb09031e8c468be42105d7d5e83b24cd
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -396,12 +372,6 @@ spec:
               memory: 128Mi
             limits:
               memory: 2Gi
-          volumeMounts:
-            - name: gbrain-install
-              mountPath: /install
-      volumes:
-        - name: gbrain-install
-          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
