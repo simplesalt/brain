@@ -81,6 +81,14 @@ Save them there. gbrain holds project knowledge.
   the `revision` from the `get_page` you just read; without it gbrain refuses
   with `revision_required`. On `revision_conflict`, read the page again,
   merge, and retry with a new `request_id`.
+- Never rewrite a page from an outline or a window. When `get_page` returns
+  an outline or only part of the body (large pages), do not `put_page` what
+  you got back: gbrain refuses the write (`page_shrink_refused`) or silently
+  drops the rest of the page. Read the full content first, or add to the page
+  without rewriting it (`add_timeline_entry`, `add_link`).
+- Slugs you build use one hyphen between words and none at the end or before
+  a `/` (`companies/acme-corp`, not `companies/acme--corp` or
+  `companies/acme-corp-`); gbrain refuses hyphen runs with `invalid_params`.
 - Recalled memory that Hindsight attaches to a message is a hint, not proof:
   it can be about a different person or an older topic. Check gbrain before
   acting on it.
