@@ -177,31 +177,27 @@ def parse_section_lines(section_name, text):
             records.append({"kind": "blank"})
             continue
         if line.startswith("- "):
-            if checkbox:
-                m = CANONICAL_CHECKBOX_RE.match(line)
-                if m and m.group(2) == prefix:
-                    mark = m.group(1)
-                    num = m.group(3)
-                    rest = m.group(4)
-                    item_text, trailing = split_trailing(rest)
-                    records.append({
-                        "kind": "item", "id": int(num), "state": MARK_STATE[mark],
-                        "text": item_text, "trailing": trailing, "legacy": False,
-                        "bullet": True, "mark": mark,
-                    })
-                    continue
+            mark = num = rest = None
+            m = CANONICAL_CHECKBOX_RE.match(line)
+            if m and m.group(2) == prefix:
+                mark, num, rest = m.group(1), m.group(3), m.group(4)
             else:
                 m = CANONICAL_PLAIN_RE.match(line)
                 if m and m.group(1) == prefix:
-                    num = m.group(2)
-                    rest = m.group(3)
-                    item_text, trailing = split_trailing(rest)
-                    records.append({
-                        "kind": "item", "id": int(num), "state": "open",
-                        "text": item_text, "trailing": trailing, "legacy": False,
-                        "bullet": True, "mark": None,
-                    })
-                    continue
+                    num, rest = m.group(2), m.group(3)
+            if num is not None:
+                if checkbox:
+                    mark = mark if mark is not None else " "
+                    state = MARK_STATE[mark]
+                else:
+                    mark, state = None, "open"
+                item_text, trailing = split_trailing(rest)
+                records.append({
+                    "kind": "item", "id": int(num), "state": state,
+                    "text": item_text, "trailing": trailing, "legacy": False,
+                    "bullet": True, "mark": mark,
+                })
+                continue
             records.append({
                 "kind": "item", "id": None, "state": "open",
                 "text": line[2:], "trailing": "", "legacy": True,

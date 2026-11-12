@@ -174,6 +174,45 @@ class IdAllocation(unittest.TestCase):
         self.assertEqual(es.next_id(records), 1)
 
 
+class ItemsWithOrWithoutACheckbox(unittest.TestCase):
+    def test_unchecked_id_in_checkbox_section_is_open_and_addressable(self):
+        records = es.parse_section_lines("Unknowns", "- [U1] how many pages")
+        self.assertEqual(records[0]["id"], 1)
+        self.assertEqual(records[0]["state"], "open")
+        self.assertFalse(records[0]["legacy"])
+
+    def test_close_without_checkbox_then_gate_passes(self):
+        body = TASK_BODY.replace("### Unknowns\n\nnone", "### Unknowns\n\n- [U1] how many pages")
+        sections = es.parse(body)["sections"]
+        self.assertEqual(es.open_item_count(sections, "Unknowns"), 1)
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "b.md")
+            with open(p, "w") as f:
+                f.write(body)
+            rc, out, err = run_cli(["item-close", "--body-file", p, "--section", "Unknowns",
+                                    "--id", "1", "--state", "~", "--note", "superseded"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("- [~] [U1] how many pages", out)
+        after = es.parse(out)["sections"]
+        self.assertEqual(es.open_item_count(after, "Unknowns"), 0)
+        self.assertEqual(es.gate(after, "Planning", "Doing"), [])
+
+    def test_add_after_unchecked_item_takes_next_id(self):
+        records = es.parse_section_lines("Unknowns", "- [U1] how many pages")
+        self.assertEqual(es.next_id(records), 2)
+
+    def test_checkbox_on_plain_section_item_keeps_its_id(self):
+        records = es.parse_section_lines("Indicators", "- [ ] [I1] it works\n- [I2] it ships")
+        self.assertEqual([r["id"] for r in records], [1, 2])
+        self.assertEqual(es.next_id(records), 3)
+
+    def test_all_sections_accept_both_forms(self):
+        for section, p in es.ID_PREFIX.items():
+            for line in (f"- [{p}1] text", f"- [ ] [{p}1] text"):
+                r = es.parse_section_lines(section, line)[0]
+                self.assertEqual(r["id"], 1, (section, line))
+
+
 def sections_with(overrides):
     base = {name: "" for name in SECTION_ORDER}
     base.update(overrides)
