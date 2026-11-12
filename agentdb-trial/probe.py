@@ -1,8 +1,3 @@
-"""agentdb trial probe. Modes: setup (admin identity), check (reader identity).
-
-Talks MCP Streamable HTTP to AGENTDB_ENDPOINT with the projected service-account
-token. Prints one JSON line per tool call; the job logs are the evidence.
-"""
 import json
 import os
 import sys
@@ -12,14 +7,14 @@ import urllib.request
 ENDPOINT = os.environ.get("AGENTDB_ENDPOINT", "")
 TOKEN_PATH = "/var/run/secrets/agentdb/token"
 TIMEOUT = 30
-NS = "ssint-main-agentdb"
-READER = "agentdb-probe-reader"
 
 
 class Client:
     def __init__(self):
-        with open(TOKEN_PATH) as f:
-            self.token = f.read().strip()
+        self.token = None
+        if os.path.exists(TOKEN_PATH):
+            with open(TOKEN_PATH) as f:
+                self.token = f.read().strip()
         self.session = None
         self.next_id = 1
 
@@ -27,8 +22,9 @@ class Client:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
-            "Authorization": "Bearer " + self.token,
         }
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
         if self.session:
             headers["Mcp-Session-Id"] = self.session
         req = urllib.request.Request(
@@ -85,7 +81,6 @@ class Client:
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     def call(self, name, arguments=None, summary=None):
-        """Returns (isError, text). Logs one JSON line. JSON-RPC errors become isError."""
         try:
             result = self.request("tools/call", {"name": name, "arguments": arguments or {}})
             is_error = bool(result.get("isError"))
@@ -102,7 +97,6 @@ class Client:
 
 
 def structural(c, name, args):
-    """Review with confirm false, then apply with confirm true; 'already exists' is success."""
     for confirm in (False, True):
         a = dict(args, confirm=confirm)
         err, text = c.call(name, a, summary={"confirm": confirm, **{k: v for k, v in args.items() if k not in ("purpose", "future_use", "other_identities")}})
@@ -118,14 +112,12 @@ def setup(c):
         raise RuntimeError("whoami failed")
     common = {
         "purpose": "Trial probe database to verify agentdb works end to end.",
-        "future_use": "Read by the probe check job to confirm grants work.",
-        "other_identities": "Only the probe reader service account is granted access.",
+        "future_use": "Read by the probe check job to confirm a second caller sees it.",
+        "other_identities": "None; access control is off on this trial, so every caller can read it.",
     }
     structural(c, "create_database", dict(common, database="probe"))
     structural(c, "create_table", dict(common, database="probe", table="notes",
                                        columns=[{"name": "body", "type": "text", "nullable": True}]))
-    structural(c, "grant", dict(common, database="probe", operations=["read", "search"],
-                                subject={"kind": "ServiceAccount", "name": READER, "namespace": NS}))
 
 
 def check(c):
@@ -150,7 +142,7 @@ def main():
         c = Client()
         c.initialize()
         (setup if sys.argv[1] == "setup" else check)(c)
-    except Exception as e:  # any unexpected failure fails the job
+    except Exception as e:
         print(json.dumps({"fatal": str(e)}), flush=True)
         return 1
     return 0

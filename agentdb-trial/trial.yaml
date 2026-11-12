@@ -20,24 +20,6 @@ metadata:
     capability: agentdb
 automountServiceAccountToken: false
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: agentdb-probe-admin
-  namespace: ssint-main-agentdb
-  labels:
-    entity: ssint
-    env: main
-    capability: agentdb
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: agentdb-admin
-subjects:
-  - kind: ServiceAccount
-    name: agentdb-probe-admin
-    namespace: ssint-main-agentdb
----
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -93,20 +75,10 @@ spec:
               volumeMounts:
                 - name: probe
                   mountPath: /probe
-                - name: agentdb-token
-                  mountPath: /var/run/secrets/agentdb
-                  readOnly: true
           volumes:
             - name: probe
               configMap:
                 name: agentdb-probe
-            - name: agentdb-token
-              projected:
-                sources:
-                  - serviceAccountToken:
-                      audience: agentdb
-                      expirationSeconds: 3600
-                      path: token
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -163,17 +135,7 @@ spec:
               volumeMounts:
                 - name: probe
                   mountPath: /probe
-                - name: agentdb-token
-                  mountPath: /var/run/secrets/agentdb
-                  readOnly: true
           volumes:
             - name: probe
               configMap:
                 name: agentdb-probe
-            - name: agentdb-token
-              projected:
-                sources:
-                  - serviceAccountToken:
-                      audience: agentdb
-                      expirationSeconds: 3600
-                      path: token
