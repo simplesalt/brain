@@ -85,6 +85,7 @@ terminal:
   backend: local
   env_passthrough:
     - GBRAIN_REMOTE_TOKEN
+    - GBRAIN_URL
 memory:
   provider: hindsight
   memory_enabled: false
@@ -132,7 +133,7 @@ mcp_servers:
         - apply_kubernetes_manifest
   gbrain:
     enabled: true
-    url: http://gbrain:3131/mcp
+    url: http://gbrain:3141/mcp
     headers:
       Authorization: "Bearer ${GBRAIN_REMOTE_TOKEN}"
     timeout: 60
@@ -159,9 +160,14 @@ mcp_servers:
         - find_experts
         - resolve_slugs
         - capture
+        - mark_page_for_deletion
+        - propose_page_replacement
+        - withdraw_page_mark
+        - get_versions
+        - revert_version
   gbrain-mail:
     enabled: true
-    url: http://gbrain:3131/mcp
+    url: http://gbrain:3141/mcp
     headers:
       Authorization: "Bearer ${GBRAIN_MAIL_TOKEN}"
     timeout: 60

@@ -200,7 +200,7 @@ spec:
         # add-on pin in simplesalt/oci gbrain/pins.env); nothing is installed at start. This only copies
         # the image's admin dashboard assets out for admin-gate, which runs on a plain python image.
         - name: seed-admin-assets
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:45ca18a0a78f787356718cd99b743f9ecc834cdcf07d978d2cd0dc1c6e057415
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:ef0dad13c558dfc4bec6c79a93e91281d4d3c4b1affbc3280edf689092e4371d
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -213,7 +213,7 @@ spec:
               mountPath: /out
       containers:
         - name: gbrain
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:45ca18a0a78f787356718cd99b743f9ecc834cdcf07d978d2cd0dc1c6e057415
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:ef0dad13c558dfc4bec6c79a93e91281d4d3c4b1affbc3280edf689092e4371d
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -503,7 +503,7 @@ spec:
               mountPath: /google
               readOnly: true
         - name: autopilot
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:45ca18a0a78f787356718cd99b743f9ecc834cdcf07d978d2cd0dc1c6e057415
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:ef0dad13c558dfc4bec6c79a93e91281d4d3c4b1affbc3280edf689092e4371d
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -639,7 +639,7 @@ spec:
         # simplesalt/brain gbrain-addon: channel-neutral loop jobs (addon-loop-open, addon-loop-recheck)
         # on Minion queue "addon" (simplesalt/projects#838).
         - name: addon-worker
-          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:45ca18a0a78f787356718cd99b743f9ecc834cdcf07d978d2cd0dc1c6e057415
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:ef0dad13c558dfc4bec6c79a93e91281d4d3c4b1affbc3280edf689092e4371d
           imagePullPolicy: IfNotPresent
           command: ["gbrain-addon-worker"]
           # No readinessProbe on purpose: a failing add-on must not take gbrain's MCP off the Service.
@@ -695,6 +695,8 @@ spec:
               value: "3141"
             - name: GUARD_DEFAULT_SOURCE
               value: default
+            - name: GUARD_OVERWRITE_PREFIXES
+              value: ops/
           resources:
             requests:
               memory: 64Mi
@@ -952,6 +954,7 @@ spec:
         entity: ssint
         env: main
         capability: ai
+        gbrain-access: guard-only
       annotations:
         simplesalt.company/restart-epoch: "15"
     spec:
@@ -972,7 +975,7 @@ spec:
               const net = require("net");
               const until = Date.now() + 300000;
               (function attempt() {
-                const s = net.connect(3131, "gbrain", () => { console.log("gbrain is listening"); process.exit(0); });
+                const s = net.connect(3141, "gbrain", () => { console.log("gbrain is listening"); process.exit(0); });
                 s.on("error", () => {
                   s.destroy();
                   if (Date.now() > until) { console.log("WARN: gbrain not listening after 5 minutes; starting without waiting"); process.exit(0); }
@@ -1564,6 +1567,8 @@ spec:
                   name: mcp-proxy-secrets
                   key: NOTION_TOKEN
                   optional: true
+            - name: GBRAIN_URL
+              value: http://gbrain:3141/mcp
           ports:
             - name: api
               containerPort: 8642

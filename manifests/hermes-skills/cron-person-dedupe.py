@@ -344,8 +344,7 @@ def execute_merge(sv_slug, dp_slug):
                                              hashlib.sha1(json.dumps(edits).encode()).hexdigest())})
     dp = get_full(dp_slug)
     if dp:
-        call("delete_page", {"slug": dp_slug, "expected_revision": dp["revision"],
-                             "request_id": rid("delete", dp_slug, dp["revision"])})
+        call("mark_page_for_deletion", {"slug": dp_slug, "reason": "person-dedupe merged it into " + sv_slug})
     return "merged"
 
 

@@ -1,0 +1,31 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gbrain-guard-only
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  podSelector:
+    matchLabels:
+      app: gbrain
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchExpressions:
+              - key: gbrain-access
+                operator: NotIn
+                values: ["guard-only"]
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              gbrain-access: guard-only
+      ports:
+        - port: 3140
+        - port: 3141
