@@ -36,7 +36,7 @@ const refuse = (code: string, message: string): Decision => ({ action: 'refuse',
 const str = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : null);
 export const flagKey = (sourceId: string, slug: string) => `${sourceId}\u0000${slug}`;
 
-export async function decide(name: string, args: Record<string, unknown>, store: GuardStore, defaultSource: string, principal: string): Promise<Decision> {
+export async function decide(name: string, args: Record<string, unknown>, store: GuardStore, defaultSource: string, principal: string, overwritePrefixes: readonly string[] = []): Promise<Decision> {
   const slug = str(args.slug);
   const sourceId = str(args.source_id) ?? defaultSource;
 
@@ -63,7 +63,7 @@ export async function decide(name: string, args: Record<string, unknown>, store:
     }
     if (!slug) return { action: 'forward' };
     const page = await store.page(slug, sourceId);
-    if (page) {
+    if (page && !overwritePrefixes.some(p => slug.startsWith(p))) {
       return refuse('guard_overwrite_refused',
         `${slug} already exists (${page.bytes} bytes), and put_page would replace all of it. Nothing was written. Change it with edit_page, or, if it really must be replaced completely, call propose_page_replacement with the new content and a reason.`);
     }
@@ -228,6 +228,7 @@ export function engineStore(engine: Pick<BrainEngine, 'executeRaw'>, flagTtlMs =
 export interface GuardOpts {
   upstream: string;
   defaultSource: string;
+  overwritePrefixes?: readonly string[];
   fetchImpl?: typeof fetch;
   log?: (entry: Record<string, unknown>) => void;
 }
@@ -328,7 +329,7 @@ export function makeGuardHandler(store: GuardStore, opts: GuardOpts) {
     const sourceId = (typeof args.source_id === 'string' && args.source_id) || opts.defaultSource;
     let d: Decision;
     try {
-      d = await decide(name, args, store, opts.defaultSource, principal);
+      d = await decide(name, args, store, opts.defaultSource, principal, opts.overwritePrefixes ?? []);
     } catch (e) {
       log({ tool: name, slug: args.slug ?? null, decision: 'error', error: e instanceof Error ? e.message : String(e) });
       return toolError(msg.id, 'guard_unavailable', 'The write guard could not check this call. Nothing was written. Try again later.', extra);

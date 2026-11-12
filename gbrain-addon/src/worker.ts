@@ -45,7 +45,8 @@ async function main() {
   if (guardUpstream) {
     await ensureMarkTable(engine);
     const guardPort = Number(process.env.GUARD_PORT ?? 3141);
-    const guard = makeGuardHandler(engineStore(engine), { upstream: guardUpstream, defaultSource: process.env.GUARD_DEFAULT_SOURCE || 'default' });
+    const guard = makeGuardHandler(engineStore(engine), { upstream: guardUpstream, defaultSource: process.env.GUARD_DEFAULT_SOURCE || 'default',
+      overwritePrefixes: (process.env.GUARD_OVERWRITE_PREFIXES ?? '').split(',').map(x => x.trim()).filter(Boolean) });
     Bun.serve({ port: guardPort, fetch: guard, maxRequestBodySize: MAX_GUARD_BODY_BYTES });
     console.log(`gbrain-addon write guard listening on :${guardPort}, upstream ${guardUpstream}`);
   }

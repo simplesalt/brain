@@ -73,6 +73,13 @@ describe('guard decisions: allowed', () => {
     expect(await d('edit_page', { slug: 'people/jane', expected_revision: 'r1', edits: [{ old_text: 'a'.repeat(900), new_text: '' }] })).toEqual({ action: 'forward' });
     expect(await d('edit_page', { slug: 'notes/tiny', expected_revision: 'r2', edits: [{ old_text: 'a'.repeat(99), new_text: '' }] })).toEqual({ action: 'forward' });
   });
+  test('put_page may overwrite an existing page only under an allowed prefix, and options stay refused there', async () => {
+    const s2 = memStore({ ...pages(), 'default:ops/people-scan': { bytes: 900, revision: 'r9' } }).store;
+    expect(await decide('put_page', { slug: 'ops/people-scan', content: '{}', expected_revision: 'r9' }, s2, 'default', 'p', ['ops/'])).toEqual({ action: 'forward' });
+    expect(await decide('put_page', { slug: 'people/jane', content: 'x', expected_revision: 'r1' }, s2, 'default', 'p', ['ops/'])).toMatchObject({ action: 'refuse', code: 'guard_overwrite_refused' });
+    expect(await decide('put_page', { slug: 'ops/people-scan', content: '{}', allow_shrink: true }, s2, 'default', 'p', ['ops/'])).toMatchObject({ action: 'refuse', code: 'guard_option_refused' });
+    expect(await decide('put_page', { slug: 'ops/people-scan', content: '{}', expected_revision: 'r9' }, s2, 'default', 'p')).toMatchObject({ action: 'refuse', code: 'guard_overwrite_refused' });
+  });
   test('get_versions and revert_version pass through', async () => {
     expect(await d('get_versions', { slug: 'people/jane' })).toEqual({ action: 'forward' });
     expect(await d('revert_version', { slug: 'people/jane', version_id: 3 })).toEqual({ action: 'forward' });

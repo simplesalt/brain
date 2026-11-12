@@ -1,0 +1,78 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-guard-rehearsal-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-guard-rehearsal
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: test
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              mkdir -p /addon/src
+              cp /addon-src/src--guard.ts /addon/src/guard.ts
+              cd /addon && bun /test/gbrain-guard-rehearsal-test.mjs
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: addon-src
+              mountPath: /addon-src
+              readOnly: true
+            - name: test
+              mountPath: /test
+              readOnly: true
+            - name: addon
+              mountPath: /addon
+      volumes:
+        - name: addon-src
+          configMap:
+            name: gbrain-addon-src
+        - name: test
+          configMap:
+            name: gbrain-guard-rehearsal-test
+        - name: addon
+          emptyDir:
+            sizeLimit: 16Mi
