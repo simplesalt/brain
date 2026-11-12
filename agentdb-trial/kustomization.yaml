@@ -3,6 +3,7 @@ kind: Kustomization
 namespace: ssint-main-agentdb
 resources:
   - trial.yaml
+  - leftover-rbac.yaml
 configMapGenerator:
   - name: agentdb-probe
     files:

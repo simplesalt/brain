@@ -1,0 +1,39 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agentdb-90d4bdbdf955
+  namespace: ssint-main-agentdb
+  labels:
+    agentdb.simplesalt.company/instance: trial
+    entity: ssint
+    env: main
+    capability: agentdb
+rules:
+  - apiGroups:
+      - agentdb.simplesalt.company
+    resourceNames:
+      - probe
+    resources:
+      - databases
+    verbs:
+      - read
+      - search
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agentdb-90d4bdbdf955
+  namespace: ssint-main-agentdb
+  labels:
+    agentdb.simplesalt.company/instance: trial
+    entity: ssint
+    env: main
+    capability: agentdb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agentdb-90d4bdbdf955
+subjects:
+  - kind: ServiceAccount
+    name: agentdb-probe-reader
+    namespace: ssint-main-agentdb
