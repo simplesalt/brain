@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-guard-rehearsal-1
+  name: gbrain-guard-rehearsal-2
   namespace: ssint-main-ai
   labels:
     entity: ssint

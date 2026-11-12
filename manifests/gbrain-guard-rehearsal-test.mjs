@@ -36,7 +36,7 @@ const list = await rpc('tools/list', {});
 const names = list.result.tools.map(t => t.name);
 check('tools/list hides delete_page and adds the mark tools', !names.includes('delete_page') && ['mark_page_for_deletion', 'withdraw_page_mark', 'propose_page_replacement'].every(n => names.includes(n)), { count: names.length });
 
-let r = await call('put_page', { slug: note, content: `---\ntype: note\ntitle: Guard rehearsal ${T}\n---\n\n# Guard rehearsal\n\n${'Line of original content for the guard rehearsal test.\n'.repeat(40)}` });
+let r = await call('put_page', { slug: note, content: `---\ntype: note\ntitle: Guard rehearsal ${T}\n---\n\n# Guard rehearsal\n\n${Array.from({ length: 40 }, (_, i) => `Line ${i} of original content for the guard rehearsal test.`).join('\n')}\n` });
 check('put_page creates a new page', !r.isError, r.body?.status ?? r.body);
 
 r = await call('put_page', { slug: note, content: 'overwrite', expected_revision: await rev(note) });
@@ -58,7 +58,7 @@ check('append_page adds to a page', !r.isError, r.body?.status ?? r.body);
 
 const before = (await call('get_page', { slug: note, include_content: true })).body;
 const body = String(before?.content ?? '');
-const cut = body.slice(body.indexOf('Line of original'), body.lastIndexOf('Line of original'));
+const cut = body.slice(body.indexOf('Line 0 of original'), body.indexOf('Line 39 of original'));
 r = await call('edit_page', { slug: note, expected_revision: before?.revision, edits: [{ old_text: cut, new_text: '' }] });
 check('edit_page removing most of a page goes through', !r.isError, r.body?.status ?? r.body);
 r = await call('get_versions', { slug: note });
@@ -75,6 +75,7 @@ check('mark_page_for_deletion records a mark', !r.isError && r.body?.status === 
 r = await call('get_page', { slug: note });
 check('a marked page is hidden from get_page', r.isError && code(r) === 'page_flagged_for_deletion', r.body);
 r = await call('list_pages', { limit: 500, sort: 'updated_desc' });
+console.log('list_pages raw shape:', typeof r.body, JSON.stringify(r.body).slice(0, 600));
 check('a marked page is left out of list_pages', !JSON.stringify(r.body).includes(note), { contains: JSON.stringify(r.body).includes(note) });
 r = await call('list_pages', { limit: 500, sort: 'updated_desc', include_deleted: true });
 check('list_pages with include_deleted shows it', JSON.stringify(r.body).includes(note), { contains: JSON.stringify(r.body).includes(note) });
