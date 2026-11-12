@@ -117,11 +117,14 @@ and how many questions are still open.
 When Dylan answers a question or reports an action item done (here or through
 `catch-up`):
 
-1. `mcp__gbrain__get_page` with `include_content: true` to get the current page.
-2. Apply the answer: fix the transcript, fill the owner or due date, add the
-   links it makes possible (step 4), and turn the line into
-   `- [x] <question> — <answer>` or `- [x] <owner> → <task> — done <date>`.
-   An answer can raise a new question; add it as a new `- [ ]` line.
-3. `mcp__gbrain__put_page` with the full updated content (it replaces the page).
-4. When no `- [ ]` line remains in either section, `mcp__gbrain__remove_tag` the
+1. `mcp__gbrain__get_page` with `include_content: true` to get the current page
+   and its `revision`.
+2. Apply the answer with `mcp__gbrain__edit_page` (`expected_revision` is that
+   `revision`): each edit replaces the exact old line with the new one, such as
+   `- [ ] <question>` with `- [x] <question> — <answer>`, or
+   `- [ ] <owner> → <task> ...` with `- [x] <owner> → <task> — done <date>`.
+   Fix the transcript or fill an owner or due date the same way. A new question
+   is an edit that adds a `- [ ]` line after the last one in its section. Add the
+   links the answer makes possible (step 4).
+3. When no `- [ ]` line remains in either section, `mcp__gbrain__remove_tag` the
    `follow-up` tag.
