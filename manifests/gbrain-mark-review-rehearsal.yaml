@@ -1,0 +1,98 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-mark-review-rehearsal-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 1800
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-mark-review
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: review
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -c]
+          env:
+            - name: GBRAIN_MCP_URL
+              value: http://gbrain-rehearsal:3131/mcp
+            - name: GBRAIN_REMOTE_TOKEN
+              value: gbrain-mcp
+            - name: DELETE_AFTER_HOURS
+              value: "1"
+            - name: REPLACE_AFTER_HOURS
+              value: "1"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: dumps
+              mountPath: /dumps
+              readOnly: true
+            - name: work
+              mountPath: /work
+            - name: work-in
+              mountPath: /work-in
+              readOnly: true
+          args:
+            - |
+              set -e
+              case "$DATABASE_URL" in *@gbrain-pg-rehearsal-rw[.:/]*) ;; *) echo "FATAL: not the rehearsal database"; exit 1 ;; esac
+              bun /work-in/setup.mjs
+              echo "== log-only run"
+              APPLY=false bun /scripts/gbrain-mark-review.mjs
+              echo "== apply run"
+              APPLY=true bun /scripts/gbrain-mark-review.mjs
+              echo "== result"
+              bun /work-in/check.mjs
+      volumes:
+        - name: scripts
+          configMap:
+            name: gbrain-mark-review-script
+        - name: dumps
+          persistentVolumeClaim:
+            claimName: gbrain-pg-backup-a
+            readOnly: true
+        - name: work
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: work-in
+          configMap:
+            name: gbrain-mark-review-test

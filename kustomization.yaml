@@ -37,6 +37,8 @@ resources:
   - manifests/agentdb.yaml
   - manifests/fireflies-ingest-rehearsal-test.yaml
   - manifests/gbrain-pg-backup.yaml
+  - manifests/gbrain-mark-review.yaml
+  - manifests/gbrain-mark-review-rehearsal.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
@@ -164,6 +166,25 @@ configMapGenerator:
       - sync-deferred-parent.sh=efforts/scripts/sync-deferred-parent.sh
       - find-stalled-efforts.sh=efforts/scripts/find-stalled-efforts.sh
       - explain-blocked-effort.sh=efforts/scripts/explain-blocked-effort.sh
+  - name: gbrain-mark-review-script
+    namespace: ssint-main-ai
+    files:
+      - gbrain-mark-review.mjs=manifests/gbrain-mark-review.mjs
+    options:
+      labels:
+        entity: ssint
+        env: main
+        capability: ai
+  - name: gbrain-mark-review-test
+    namespace: ssint-main-ai
+    files:
+      - setup.mjs=manifests/gbrain-mark-review-test-setup.mjs
+      - check.mjs=manifests/gbrain-mark-review-test-check.mjs
+    options:
+      labels:
+        entity: ssint
+        env: main
+        capability: ai
 generatorOptions:
   labels:
     entity: ssint
