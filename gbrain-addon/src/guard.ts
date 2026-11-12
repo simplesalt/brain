@@ -1,15 +1,23 @@
 import type { BrainEngine } from 'gbrain/engine';
 
-export const REMOVE_REFUSE_FRACTION = 0.8;
-export const NEAR_EMPTY_BYTES = 64;
+export const ARCHIVE_SHRINK_FRACTION = 0.3;
 export const MAX_GUARD_BODY_BYTES = 8 * 1024 * 1024;
 export const REFUSED_OPTIONS = ['allow_shrink', 'force', 'allow_empty', 'drop_timeline'] as const;
 export const REFUSED_TOOLS = ['delete_page', 'put_pages', 'begin_page_upload'] as const;
-export const MARK_TOOLS = ['mark_page_for_deletion', 'propose_page_replacement', 'withdraw_page_mark'] as const;
+export const FILTERED_READ_TOOLS = ['get_page', 'search', 'query', 'list_pages', 'resolve_slugs', 'get_backlinks', 'find_experts', 'chronicle_day'] as const;
 
 export interface StoredPage {
   bytes: number;
   revision: string | null;
+}
+
+export interface Snapshot {
+  title: string | null;
+  type: string | null;
+  frontmatter: unknown;
+  compiledTruth: string | null;
+  timeline: string | null;
+  bodyStorage: string | null;
 }
 
 export interface MarkInput {
@@ -22,19 +30,48 @@ export interface MarkInput {
   page: StoredPage;
 }
 
+export interface ArchiveInput {
+  slug: string;
+  sourceId: string;
+  tool: string;
+  principal: string;
+  storedBytes: number;
+  removedBytes: number;
+  revision: string | null;
+  snapshot: Snapshot;
+  content: string | null;
+}
+
+export interface ArchiveRow {
+  id: number;
+  slug: string;
+  source_id: string;
+  tool: string;
+  stored_bytes: number;
+  removed_bytes: number;
+  created_at: string;
+  content: string | null;
+  compiled_truth: string | null;
+}
+
 export interface GuardStore {
   page(slug: string, sourceId: string): Promise<StoredPage | null>;
+  snapshot(slug: string, sourceId: string): Promise<Snapshot | null>;
   mark(input: MarkInput): Promise<{ id: number; replaced: number }>;
   withdraw(slug: string, sourceId: string, principal: string): Promise<number>;
+  flagged(): Promise<Set<string>>;
+  archive(input: ArchiveInput): Promise<number>;
+  archives(slug: string, sourceId: string): Promise<ArchiveRow[]>;
 }
 
 export type Decision =
-  | { action: 'forward' }
+  | { action: 'forward'; args?: Record<string, unknown>; filter?: boolean; archive?: Omit<ArchiveInput, 'snapshot' | 'content'> }
   | { action: 'refuse'; code: string; message: string }
   | { action: 'answer'; text: string };
 
 const refuse = (code: string, message: string): Decision => ({ action: 'refuse', code, message });
 const str = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : null);
+export const flagKey = (sourceId: string, slug: string) => `${sourceId}\u0000${slug}`;
 
 export async function decide(name: string, args: Record<string, unknown>, store: GuardStore, defaultSource: string, principal: string): Promise<Decision> {
   const slug = str(args.slug);
@@ -42,20 +79,33 @@ export async function decide(name: string, args: Record<string, unknown>, store:
 
   if ((REFUSED_TOOLS as readonly string[]).includes(name)) {
     return refuse('guard_tool_refused',
-      `${name} is not available to Hermes. Nothing was written. To remove a page, call mark_page_for_deletion with the slug and a reason; a reviewed job deletes it after 7 days unless the mark is withdrawn. To change a page, use edit_page or append_page.`);
+      `${name} is not available to Hermes. Nothing was written. To remove a page, call mark_page_for_deletion with the slug and a reason: the page is hidden at once and deleted after 6 months unless the mark is withdrawn. To change a page, use edit_page.`);
+  }
+
+  if ((FILTERED_READ_TOOLS as readonly string[]).includes(name)) {
+    const { include_deleted, ...rest } = args;
+    if (include_deleted === true) return { action: 'forward', args: rest, filter: false };
+    if (name === 'get_page' && slug && (await store.flagged()).has(flagKey(sourceId, slug))) {
+      return refuse('page_flagged_for_deletion',
+        `${slug} is marked for deletion and hidden. Pass include_deleted: true to read it, or withdraw_page_mark to restore it.`);
+    }
+    return { action: 'forward', args: rest, filter: true };
   }
 
   if (name === 'put_page') {
     const used = REFUSED_OPTIONS.filter(o => args[o] !== undefined && args[o] !== false);
     if (used.length) {
       return refuse('guard_option_refused',
-        `put_page option ${used.join(', ')} is not available to Hermes. Nothing was written. Change an existing page with edit_page or append_page; to replace one completely, call propose_page_replacement.`);
+        `put_page option ${used.join(', ')} is not available to Hermes. Nothing was written. Change an existing page with edit_page; to replace one completely, call propose_page_replacement.`);
     }
     if (!slug) return { action: 'forward' };
     const page = await store.page(slug, sourceId);
     if (page) {
       return refuse('guard_overwrite_refused',
-        `${slug} already exists (${page.bytes} bytes), and put_page would replace all of it. Nothing was written. Change part of it with edit_page, add to it with append_page, or, if it really must be replaced completely, call propose_page_replacement with the new content and a reason; a reviewed job applies it after 7 days.`);
+        `${slug} already exists (${page.bytes} bytes), and put_page would replace all of it. Nothing was written. Change it with edit_page, or, if it really must be replaced completely, call propose_page_replacement with the new content and a reason.`);
+    }
+    if ((await store.flagged()).has(flagKey(sourceId, slug))) {
+      return refuse('page_flagged_for_deletion', `${slug} is marked for deletion. Withdraw the mark with withdraw_page_mark before writing it again. Nothing was written.`);
     }
     return { action: 'forward' };
   }
@@ -70,13 +120,8 @@ export async function decide(name: string, args: Record<string, unknown>, store:
       const newText = typeof e?.new_text === 'string' ? e.new_text : '';
       removed += Buffer.byteLength(oldText, 'utf8') - Buffer.byteLength(newText, 'utf8');
     }
-    if (removed <= 0) return { action: 'forward' };
-    const left = page.bytes - removed;
-    if (removed > page.bytes * REMOVE_REFUSE_FRACTION || (left < NEAR_EMPTY_BYTES && page.bytes >= NEAR_EMPTY_BYTES)) {
-      return refuse('guard_gutting_refused',
-        `This edit would remove ${removed} of ${slug}'s ${page.bytes} bytes, leaving about ${Math.max(left, 0)}. Edits may not remove more than ${Math.round(REMOVE_REFUSE_FRACTION * 100)}% of a page or leave it nearly empty. Nothing was written. Make a smaller edit, or call propose_page_replacement (or mark_page_for_deletion) with a reason; a reviewed job applies it after 7 days.`);
-    }
-    return { action: 'forward' };
+    if (removed <= page.bytes * ARCHIVE_SHRINK_FRACTION) return { action: 'forward' };
+    return { action: 'forward', archive: { slug, sourceId, tool: name, principal, storedBytes: page.bytes, removedBytes: removed, revision: page.revision } };
   }
 
   if (name === 'mark_page_for_deletion' || name === 'propose_page_replacement') {
@@ -92,7 +137,9 @@ export async function decide(name: string, args: Record<string, unknown>, store:
       action: 'answer',
       text: JSON.stringify({
         status: 'marked', mark_id: id, kind, slug, source_id: sourceId, page_bytes: page.bytes, replaced_earlier_marks: replaced,
-        note: `The page is unchanged. A reviewed job applies this ${kind === 'delete' ? 'deletion' : 'replacement'} no sooner than 7 days from now, and only if the page has not changed since; withdraw it with withdraw_page_mark.`,
+        note: kind === 'delete'
+          ? 'The page is now hidden from reads and searches (include_deleted: true still shows it). It is deleted after 6 months unless the mark is withdrawn with withdraw_page_mark.'
+          : 'The page is unchanged. A reviewed job applies the replacement later, only if the page has not changed since; withdraw it with withdraw_page_mark.',
       }),
     };
   }
@@ -103,13 +150,36 @@ export async function decide(name: string, args: Record<string, unknown>, store:
     return { action: 'answer', text: JSON.stringify({ status: 'withdrawn', slug, source_id: sourceId, withdrawn: n }) };
   }
 
+  if (name === 'get_page_archives') {
+    if (!slug) return refuse('guard_mark_invalid', 'get_page_archives needs slug.');
+    const rows = await store.archives(slug, sourceId);
+    return { action: 'answer', text: JSON.stringify({ slug, source_id: sourceId, archives: rows }) };
+  }
+
   return { action: 'forward' };
 }
 
-export const MARK_TOOL_DEFS = [
+export function filterFlagged(value: unknown, flagged: Set<string>, defaultSource: string): unknown {
+  if (Array.isArray(value)) {
+    return value
+      .filter(v => !(v && typeof v === 'object' && typeof (v as Record<string, unknown>).slug === 'string'
+        && flagged.has(flagKey(String((v as Record<string, unknown>).source_id ?? defaultSource), String((v as Record<string, unknown>).slug)))))
+      .map(v => filterFlagged(v, flagged, defaultSource));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = filterFlagged(v, flagged, defaultSource);
+    return out;
+  }
+  return value;
+}
+
+const INCLUDE_DELETED = { type: 'boolean', description: 'Also show pages marked for deletion.' };
+
+export const GUARD_TOOL_DEFS = [
   {
     name: 'mark_page_for_deletion',
-    description: 'Ask for an existing page to be deleted. The page is not changed now; a reviewed job deletes it no sooner than 7 days later, only if the page has not changed since the mark. Withdraw with withdraw_page_mark.',
+    description: 'Delete an existing page the safe way: it is hidden from reads and searches at once and deleted after 6 months unless the mark is withdrawn with withdraw_page_mark.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -122,7 +192,7 @@ export const MARK_TOOL_DEFS = [
   },
   {
     name: 'propose_page_replacement',
-    description: 'Ask for an existing page to be replaced by new complete content. The page is not changed now; a reviewed job applies it no sooner than 7 days later, only if the page has not changed since. Use edit_page or append_page for ordinary changes.',
+    description: 'Ask for an existing page to be replaced by new complete content. The page is not changed now; a reviewed job applies it later, only if the page has not changed since. Use edit_page for ordinary changes.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -136,7 +206,19 @@ export const MARK_TOOL_DEFS = [
   },
   {
     name: 'withdraw_page_mark',
-    description: 'Withdraw every open deletion mark or replacement proposal on a page.',
+    description: 'Withdraw every open deletion mark or replacement proposal on a page; a page hidden for deletion becomes visible again.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        slug: { type: 'string', description: 'Page slug.' },
+        source_id: { type: 'string', description: 'Source (default: default).' },
+      },
+      required: ['slug'],
+    },
+  },
+  {
+    name: 'get_page_archives',
+    description: 'Earlier versions of a page, saved automatically before an edit removed more than 30% of it. Newest first, kept 6 months.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -148,7 +230,7 @@ export const MARK_TOOL_DEFS = [
   },
 ];
 
-export async function ensureMarkTable(engine: Pick<BrainEngine, 'executeRaw'>): Promise<void> {
+export async function ensureGuardTables(engine: Pick<BrainEngine, 'executeRaw'>): Promise<void> {
   await engine.executeRaw(`CREATE TABLE IF NOT EXISTS addon_page_marks (
     id BIGSERIAL PRIMARY KEY,
     kind TEXT NOT NULL CHECK (kind IN ('delete', 'replace')),
@@ -165,9 +247,33 @@ export async function ensureMarkTable(engine: Pick<BrainEngine, 'executeRaw'>): 
     outcome TEXT
   )`);
   await engine.executeRaw(`CREATE INDEX IF NOT EXISTS addon_page_marks_open ON addon_page_marks (source_id, slug) WHERE withdrawn_at IS NULL AND applied_at IS NULL`);
+  await engine.executeRaw(`CREATE TABLE IF NOT EXISTS addon_page_archives (
+    id BIGSERIAL PRIMARY KEY,
+    slug TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    stored_bytes BIGINT NOT NULL,
+    removed_bytes BIGINT NOT NULL,
+    page_revision TEXT,
+    title TEXT,
+    type TEXT,
+    frontmatter JSONB,
+    compiled_truth TEXT,
+    timeline TEXT,
+    body_storage TEXT,
+    content TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expired_at TIMESTAMPTZ
+  )`);
+  await engine.executeRaw(`CREATE INDEX IF NOT EXISTS addon_page_archives_slug ON addon_page_archives (source_id, slug, created_at DESC)`);
 }
 
-export function engineStore(engine: Pick<BrainEngine, 'executeRaw'>): GuardStore {
+export const ensureMarkTable = ensureGuardTables;
+
+export function engineStore(engine: Pick<BrainEngine, 'executeRaw'>, flagTtlMs = 5000): GuardStore {
+  let cache: { at: number; set: Set<string> } | null = null;
+  const invalidate = () => { cache = null; };
   return {
     async page(slug, sourceId) {
       const rows = await engine.executeRaw<{ bytes: unknown; revision: unknown }>(
@@ -178,7 +284,20 @@ export function engineStore(engine: Pick<BrainEngine, 'executeRaw'>): GuardStore
       if (!rows.length) return null;
       return { bytes: Number(rows[0].bytes ?? 0), revision: rows[0].revision == null ? null : String(rows[0].revision) };
     },
+    async snapshot(slug, sourceId) {
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT p.title, p.type, p.frontmatter, p.compiled_truth, p.timeline, to_jsonb(p)->>'body_storage' AS body_storage
+           FROM pages p WHERE p.slug = $1 AND p.source_id = $2 AND p.deleted_at IS NULL`, [slug, sourceId]);
+      if (!rows.length) return null;
+      const r = rows[0];
+      return {
+        title: r.title == null ? null : String(r.title), type: r.type == null ? null : String(r.type), frontmatter: r.frontmatter ?? null,
+        compiledTruth: r.compiled_truth == null ? null : String(r.compiled_truth), timeline: r.timeline == null ? null : String(r.timeline),
+        bodyStorage: r.body_storage == null ? null : String(r.body_storage),
+      };
+    },
     async mark(m) {
+      invalidate();
       const done = await engine.executeRaw<{ n: number }>(
         `WITH w AS (UPDATE addon_page_marks SET withdrawn_at = now(), outcome = 'superseded'
            WHERE slug = $1 AND source_id = $2 AND withdrawn_at IS NULL AND applied_at IS NULL RETURNING 1)
@@ -190,11 +309,37 @@ export function engineStore(engine: Pick<BrainEngine, 'executeRaw'>): GuardStore
       return { id: Number(rows[0].id), replaced: Number(done[0]?.n ?? 0) };
     },
     async withdraw(slug, sourceId) {
+      invalidate();
       const rows = await engine.executeRaw<{ n: number }>(
         `WITH w AS (UPDATE addon_page_marks SET withdrawn_at = now(), outcome = 'withdrawn'
            WHERE slug = $1 AND source_id = $2 AND withdrawn_at IS NULL AND applied_at IS NULL RETURNING 1)
          SELECT count(*)::int AS n FROM w`, [slug, sourceId]);
       return Number(rows[0]?.n ?? 0);
+    },
+    async flagged() {
+      if (cache && Date.now() - cache.at < flagTtlMs) return cache.set;
+      const rows = await engine.executeRaw<{ slug: string; source_id: string }>(
+        `SELECT slug, source_id FROM addon_page_marks WHERE kind = 'delete' AND withdrawn_at IS NULL AND applied_at IS NULL`);
+      cache = { at: Date.now(), set: new Set(rows.map(r => flagKey(r.source_id, r.slug))) };
+      return cache.set;
+    },
+    async archive(a) {
+      const rows = await engine.executeRaw<{ id: unknown }>(
+        `INSERT INTO addon_page_archives (slug, source_id, tool, principal, stored_bytes, removed_bytes, page_revision, title, type, frontmatter, compiled_truth, timeline, body_storage, content)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14) RETURNING id`,
+        [a.slug, a.sourceId, a.tool, a.principal, a.storedBytes, a.removedBytes, a.revision, a.snapshot.title, a.snapshot.type,
+          a.snapshot.frontmatter == null ? null : JSON.stringify(a.snapshot.frontmatter), a.snapshot.compiledTruth, a.snapshot.timeline, a.snapshot.bodyStorage, a.content]);
+      return Number(rows[0].id);
+    },
+    async archives(slug, sourceId) {
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT id, slug, source_id, tool, stored_bytes, removed_bytes, created_at::text AS created_at, content, compiled_truth
+           FROM addon_page_archives WHERE slug = $1 AND source_id = $2 AND expired_at IS NULL ORDER BY created_at DESC LIMIT 20`, [slug, sourceId]);
+      return rows.map(r => ({
+        id: Number(r.id), slug: String(r.slug), source_id: String(r.source_id), tool: String(r.tool), stored_bytes: Number(r.stored_bytes),
+        removed_bytes: Number(r.removed_bytes), created_at: String(r.created_at), content: r.content == null ? null : String(r.content),
+        compiled_truth: r.compiled_truth == null ? null : String(r.compiled_truth),
+      }));
     },
   };
 }
@@ -227,6 +372,12 @@ export function parseRpcBody(text: string): any {
   return last;
 }
 
+function toolText(msg: any): string | null {
+  const content = msg?.result?.content;
+  if (!Array.isArray(content)) return null;
+  return content.map((c: any) => (typeof c?.text === 'string' ? c.text : '')).join('\n');
+}
+
 export function makeGuardHandler(store: GuardStore, opts: GuardOpts) {
   const doFetch = opts.fetchImpl ?? fetch;
   const log = opts.log ?? ((e) => console.log(JSON.stringify({ guard: true, ...e })));
@@ -244,6 +395,13 @@ export function makeGuardHandler(store: GuardStore, opts: GuardOpts) {
     res.headers.forEach((v, k) => { if (!['content-length', 'transfer-encoding', 'connection'].includes(k)) h.set(k, v); });
     return new Response(res.body, { status: res.status, headers: h });
   };
+  const call = async (req: Request, body: unknown) => {
+    const res = await doFetch(opts.upstream, { method: 'POST', headers: passHeaders(req), body: JSON.stringify(body) });
+    const raw = await res.text();
+    return { res, raw, parsed: res.ok ? parseRpcBody(raw) : null };
+  };
+  const toolError = (id: unknown, code: string, message: string, extra: Record<string, string>) =>
+    rpcJson({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: code, message }) }] } }, extra);
 
   return async (req: Request): Promise<Response> => {
     const path = new URL(req.url).pathname;
@@ -264,37 +422,78 @@ export function makeGuardHandler(store: GuardStore, opts: GuardOpts) {
     const extra: Record<string, string> = sessionHeader ? { 'mcp-session-id': sessionHeader } : {};
 
     if (msg?.method === 'tools/list') {
-      const res = await doFetch(opts.upstream, { method: 'POST', headers: passHeaders(req), body: text });
-      const raw = await res.text();
-      const parsed = res.ok ? parseRpcBody(raw) : null;
+      const { res, raw, parsed } = await call(req, msg);
       if (!parsed?.result || !Array.isArray(parsed.result.tools)) {
         return new Response(raw, { status: res.status, headers: { 'content-type': res.headers.get('content-type') ?? 'application/json', ...extra } });
       }
       const hidden = new Set<string>(REFUSED_TOOLS);
-      parsed.result.tools = [...parsed.result.tools.filter((t: any) => !hidden.has(t?.name)), ...MARK_TOOL_DEFS];
+      const filtered = new Set<string>(FILTERED_READ_TOOLS);
+      parsed.result.tools = [
+        ...parsed.result.tools.filter((t: any) => !hidden.has(t?.name)).map((t: any) => {
+          if (!filtered.has(t?.name) || !t.inputSchema || typeof t.inputSchema !== 'object') return t;
+          return { ...t, inputSchema: { ...t.inputSchema, properties: { ...(t.inputSchema.properties ?? {}), include_deleted: INCLUDE_DELETED } } };
+        }),
+        ...GUARD_TOOL_DEFS,
+      ];
       const sid = res.headers.get('mcp-session-id');
       return rpcJson(parsed, sid ? { 'mcp-session-id': sid } : extra);
     }
 
-    if (msg?.method === 'tools/call') {
-      const name = String(msg.params?.name ?? '');
-      const args = (msg.params?.arguments && typeof msg.params.arguments === 'object') ? msg.params.arguments : {};
-      const principal = principalOf(req.headers.get('authorization'));
-      let d: Decision;
+    if (msg?.method !== 'tools/call') return forward(req, text);
+
+    const name = String(msg.params?.name ?? '');
+    const args = (msg.params?.arguments && typeof msg.params.arguments === 'object') ? msg.params.arguments : {};
+    const principal = principalOf(req.headers.get('authorization'));
+    const sourceId = (typeof args.source_id === 'string' && args.source_id) || opts.defaultSource;
+    let d: Decision;
+    try {
+      d = await decide(name, args, store, opts.defaultSource, principal);
+    } catch (e) {
+      log({ tool: name, slug: args.slug ?? null, decision: 'error', error: e instanceof Error ? e.message : String(e) });
+      return toolError(msg.id, 'guard_unavailable', 'The write guard could not check this call. Nothing was written. Try again later.', extra);
+    }
+    if (d.action === 'refuse') {
+      log({ tool: name, slug: args.slug ?? null, source_id: sourceId, decision: 'refuse', code: d.code, principal });
+      return toolError(msg.id, d.code, d.message, extra);
+    }
+    if (d.action === 'answer') {
+      log({ tool: name, slug: args.slug ?? null, source_id: sourceId, decision: 'answer', principal });
+      return rpcJson({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: d.text }] } }, extra);
+    }
+
+    if (d.archive) {
       try {
-        d = await decide(name, args, store, opts.defaultSource, principal);
+        const snapshot = await store.snapshot(d.archive.slug, d.archive.sourceId);
+        if (!snapshot) throw new Error('page vanished before it could be archived');
+        let content: string | null = null;
+        if (snapshot.bodyStorage === 'segmented' || snapshot.compiledTruth == null) {
+          const got = await call(req, { jsonrpc: '2.0', id: 'guard-archive', method: 'tools/call', params: { name: 'get_page', arguments: { slug: d.archive.slug, source_id: d.archive.sourceId, include_content: true, body: 'full' } } });
+          const t = toolText(got.parsed);
+          if (!t || got.parsed?.result?.isError) throw new Error('could not read the full page to archive it');
+          try { content = String(JSON.parse(t).content ?? t); } catch { content = t; }
+        }
+        const id = await store.archive({ ...d.archive, snapshot, content });
+        log({ tool: name, slug: d.archive.slug, source_id: d.archive.sourceId, decision: 'archived', archive_id: id, stored_bytes: d.archive.storedBytes, removed_bytes: d.archive.removedBytes, principal });
       } catch (e) {
-        log({ tool: name, slug: args.slug ?? null, decision: 'error', error: e instanceof Error ? e.message : String(e) });
-        return rpcJson({ jsonrpc: '2.0', id: msg.id, result: { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'guard_unavailable', message: 'The write guard could not check this call. Nothing was written. Try again later.' }) }] } }, extra);
-      }
-      if (d.action !== 'forward') log({ tool: name, slug: args.slug ?? null, source_id: args.source_id ?? opts.defaultSource, decision: d.action, code: d.action === 'refuse' ? d.code : undefined, principal });
-      if (d.action === 'refuse') {
-        return rpcJson({ jsonrpc: '2.0', id: msg.id, result: { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: d.code, message: d.message }) }] } }, extra);
-      }
-      if (d.action === 'answer') {
-        return rpcJson({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: d.text }] } }, extra);
+        log({ tool: name, slug: args.slug ?? null, decision: 'archive_failed', error: e instanceof Error ? e.message : String(e) });
+        return toolError(msg.id, 'guard_unavailable', `This edit removes more than ${Math.round(ARCHIVE_SHRINK_FRACTION * 100)}% of the page, and the guard could not save the current version first, so nothing was written. Try again later or make a smaller edit.`, extra);
       }
     }
-    return forward(req, text);
+
+    const outBody = d.args ? JSON.stringify({ ...msg, params: { ...msg.params, arguments: d.args } }) : text;
+    if (!d.filter) return forward(req, outBody);
+
+    const flagged = await store.flagged();
+    const res = await doFetch(opts.upstream, { method: 'POST', headers: passHeaders(req), body: outBody });
+    const raw = await res.text();
+    const parsed = res.ok ? parseRpcBody(raw) : null;
+    const t = toolText(parsed);
+    if (!parsed || t === null || flagged.size === 0) {
+      return new Response(raw, { status: res.status, headers: { 'content-type': res.headers.get('content-type') ?? 'application/json', ...extra } });
+    }
+    let inner: unknown;
+    try { inner = JSON.parse(t); } catch { return rpcJson(parsed, extra); }
+    parsed.result.content = [{ type: 'text', text: JSON.stringify(filterFlagged(inner, flagged, opts.defaultSource)) }];
+    return rpcJson(parsed, extra);
   };
 }
