@@ -1,25 +1,3 @@
-# Trial agentdb instance and its end-to-end probes (applied by the agentdb-trial
-# Kustomization in manifests/agentdb.yaml). The probe admin is bound through GitOps
-# (admin grants are GitOps-managed by design); the probe reader gets its access only
-# from the MCP grant tool, which the setup probe calls.
-apiVersion: agentdb.simplesalt.company/v1alpha1
-kind: AgentDatabase
-metadata:
-  name: trial
-  namespace: ssint-main-agentdb
-  labels:
-    entity: ssint
-    env: main
-    capability: agentdb
-spec:
-  instances: 2
-  storage:
-    size: 5Gi
-  postgres:
-    imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
-  history:
-    retention: 30d
----
 apiVersion: v1
 kind: ServiceAccount
 metadata:
