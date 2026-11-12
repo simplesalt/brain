@@ -1,0 +1,328 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hermes-live-version-test-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 3000
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: hermes-live-version-test
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: restore
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              DB=gbrain_live_test
+              [ "$PGHOST" = gbrain-pg-rehearsal-rw ] || { echo "FATAL: wrong host"; exit 1; }
+              adm() { psql -X -q -A -t -v ON_ERROR_STOP=1 -h "$PGHOST" -d postgres -c "$1"; }
+              until pg_isready -h "$PGHOST" -p 5432; do sleep 2; done
+              file=$(ls -1t /dumps/gbrain-nightly-*.dump | head -n 1)
+              echo "restoring $(basename "$file") (prod gbrain, live version) into $DB on $PGHOST; prod is not contacted"
+              (cd /dumps && sha256sum -c "$(basename "$file").sha256") || exit 1
+              adm "DROP DATABASE IF EXISTS $DB WITH (FORCE)" && adm "CREATE DATABASE $DB OWNER gbrain TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'" || exit 1
+              pg_restore --host="$PGHOST" --dbname="$DB" --exit-on-error --single-transaction --no-password "$file" || exit 1
+              psql -X -q -A -t -h "$PGHOST" -d "$DB" -c "SELECT 'pages live: ' || count(*) FROM pages WHERE deleted_at IS NULL"
+              printf 'postgres://%s:%s@gbrain-pg-rehearsal-rw:5432/%s' "$PGUSER" "$PGPASSWORD" "$DB" > /work/dburl
+          env:
+            - name: PGHOST
+              value: gbrain-pg-rehearsal-rw
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: password
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 26
+            runAsGroup: 26
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: dumps
+              mountPath: /dumps
+              readOnly: true
+            - name: work
+              mountPath: /work
+        - name: gbrain
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:260fcc993a2f179254146f8bfb1e1b94795d91986bd7c3a3745a915a804257e4
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export DATABASE_URL="$(cat /work/dburl)"
+              case "$DATABASE_URL" in *@gbrain-pg-rehearsal-rw:5432/gbrain_live_test) ;; *) echo "FATAL: wrong database"; sleep 3600; exit 1 ;; esac
+              gbrain --version
+              gbrain init --migrate-only || echo "WARN: migrate-only failed"
+              bun -e '
+                import { SQL } from "bun";
+                const h = new Bun.CryptoHasher("sha256").update("gbrain-mcp").digest("hex");
+                const db = new SQL(process.env.DATABASE_URL);
+                await db`INSERT INTO access_tokens (name, token_hash) VALUES (${"hermes-mcp"}, ${h}) ON CONFLICT (token_hash) DO NOTHING`;
+                await db.end();
+              ' || echo "WARN: token seed failed"
+              exec gbrain serve --http --bind 127.0.0.1
+          env:
+            - name: GBRAIN_EMBEDDING_DIMENSIONS
+              value: "1536"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+              readOnly: true
+        - name: seed
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              /opt/hermes/.venv/bin/python -c '
+              from ruamel.yaml import YAML
+              yaml = YAML(typ="safe", pure=True); yaml.version = (1, 1)
+              out = YAML(typ="safe", pure=True); out.default_flow_style = False
+              c = yaml.load(open("/seed/config.yaml"))
+              g = c["mcp_servers"]["gbrain"]; g["url"] = "http://127.0.0.1:3131/mcp"
+              c["mcp_servers"] = {"gbrain": g}
+              c["platforms"] = {}
+              c["platform_toolsets"] = {"cli": ["gbrain", "skills"]}
+              if isinstance(c.get("memory"), dict): c["memory"].pop("provider", None)
+              out.dump(c, open("/opt/data/config.yaml", "w"))
+              print("include:", g["tools"]["include"])
+              '
+              cp /seed/AGENTS.md /seed/SOUL.md /opt/data/
+              cp /seed/cron-meeting-ingest.md /seed/skill-note-capture.md /work/
+              S=23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc
+              curl -fsSL -o /tmp/g.tgz "https://github.com/garrytan/gbrain/archive/$S.tar.gz" && mkdir -p /tmp/g && tar -xzf /tmp/g.tgz -C /tmp/g "gbrain-$S/skills" && mv "/tmp/g/gbrain-$S/skills" /opt/data/skills && rm -rf /tmp/g /tmp/g.tgz
+              ls /opt/data/skills | head -40
+              mkdir -p /work/cron-cwd
+              chown -R 10000:10000 /opt/data /work
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: home
+              mountPath: /opt/data
+            - name: work
+              mountPath: /work
+            - name: config-seed
+              mountPath: /seed
+              readOnly: true
+      containers:
+        - name: hermes
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
+          imagePullPolicy: IfNotPresent
+          workingDir: /opt/data
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              H=/opt/hermes/.venv/bin/hermes
+              PY=/opt/hermes/.venv/bin/python
+              trap 'touch /work/done' EXIT
+              cat > /work/mcp.py <<'EOF'
+              import json, sys, urllib.request
+              def call(name, args=None, method="tools/call"):
+                  body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": {} if method == "tools/list" else {"name": name, "arguments": args or {}}}
+                  req = urllib.request.Request("http://127.0.0.1:3131/mcp", data=json.dumps(body).encode(), method="POST",
+                      headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Authorization": "Bearer gbrain-mcp"})
+                  t = urllib.request.urlopen(req, timeout=120).read().decode()
+                  msg = None
+                  for block in t.split("\n\n"):
+                      d = "\n".join(l[5:].strip() for l in block.split("\n") if l.startswith("data:"))
+                      if d:
+                          o = json.loads(d)
+                          if "result" in o or "error" in o: msg = o
+                  if msg is None: msg = json.loads(t)
+                  if method == "tools/list": return sorted(x["name"] for x in msg["result"]["tools"])
+                  text = "\n".join(c.get("text", "") for c in msg.get("result", {}).get("content", []))
+                  try: return json.loads(text)
+                  except Exception: return {"raw": text, "isError": msg.get("result", {}).get("isError")}
+              EOF
+              cat > /work/setup.py <<'EOF'
+              import json, sys
+              sys.path.insert(0, "/work")
+              from mcp import call
+              names = call(None, method="tools/list")
+              print("live gbrain tools/list:", len(names), "tools")
+              for n in ["put_page", "edit_page", "append_page", "get_page"]: print(f"  {n}: {'present' if n in names else 'ABSENT'}")
+              M = "meetings/2026-11-12-live-version-test-zzyzx-call"
+              T = "sources/meetings/2026-11-12-live-version-test-zzyzx-call-transcript"
+              N = "notes/2026-11-12-live-version-test"
+              tr = "\n".join(f"**{s}** [{i}:00]: {x}" for i, (s, x) in enumerate([
+                  ("Pat Zzyzx", "Thanks for joining. We want a pentest of the customer portal before the end of the quarter."),
+                  ("Dylan", "We can do that. I will send you the scoping questionnaire by Friday, the 2026-11-20."),
+                  ("Pat Zzyzx", "Great. We decided to exclude the legacy admin panel from scope."),
+                  ("Dylan", "Agreed, the legacy admin panel is out of scope."),
+                  ("Pat Zzyzx", "I will share the staging credentials after the questionnaire.")]))
+              print(call("put_page", {"slug": T, "content": f"---\ntype: source\ntitle: 'Transcript: Live version test call'\nfacts_backstop: false\nmeeting: {M}\n---\n\n# Transcript: Live version test call\n\n{tr}\n"}))
+              print(call("put_page", {"slug": M, "content": f"---\ntype: meeting\ntitle: Live version test call\ndate: '2026-11-12'\ntranscript: {T}\nfacts_backstop: false\n---\n\n# Live version test call\n\nTranscript: [[{T}]]\n\n## Attendees\n\n- Pat Zzyzx (pat@zzyzx-test.invalid), Test contact\n- Dylan\n"}))
+              print(call("put_page", {"slug": N, "content": "---\ntype: note\ntitle: Live version test note\ndate: '2026-11-12'\nsource: handwritten\ntags: [handwritten]\n---\n\n# Live version test note\n\nScoping call prep.\n\nCall Pat about the portal pentest.\n\n## Action items\n\n- [ ] Dylan → send the scoping questionnaire (due 2026-11-20)\n\n## Open questions\n\n- [ ] Is the legacy admin panel in scope?\n"}))
+              for s in [M, T, N]:
+                  p = call("get_page", {"slug": s})
+                  print("before", s, len((p.get("compiled_truth") or "").encode()), "bytes, revision", p.get("revision"))
+              EOF
+              cat > /work/after.py <<'EOF'
+              import json, sys
+              sys.path.insert(0, "/work")
+              from mcp import call
+              for s in ["meetings/2026-11-12-live-version-test-zzyzx-call", "sources/meetings/2026-11-12-live-version-test-zzyzx-call-transcript", "notes/2026-11-12-live-version-test"]:
+                  p = call("get_page", {"slug": s})
+                  print("== after", s, len((p.get("compiled_truth") or "").encode()), "bytes, frontmatter", json.dumps(p.get("frontmatter")))
+                  print(p.get("compiled_truth"))
+              EOF
+              echo "== waiting for live-version gbrain"
+              i=0; until $PY -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3131/health', timeout=3)" 2>/dev/null; do i=$((i+1)); [ $i -ge 180 ] && { echo FATAL; exit 1; }; sleep 5; done
+              $PY /work/setup.py
+              echo
+              echo "== meeting-ingest prompt, run from a directory without AGENTS.md (as cron does)"
+              { echo "## Script output"; echo; echo "meetings/2026-11-12-live-version-test-zzyzx-call"; echo; cat /work/cron-meeting-ingest.md; } > /work/meeting-prompt.txt
+              (cd /work/cron-cwd && HERMES_ORIG_CWD=/work/cron-cwd timeout 1200 $H chat -Q --query-file /work/meeting-prompt.txt 2>&1 | tail -n 40; echo "[exit $?]")
+              echo
+              echo "== note-capture answer, run as chat (AGENTS.md loaded)"
+              { echo "Use these skill instructions:"; echo; cat /work/skill-note-capture.md; echo; echo "Dylan says: on notes/2026-11-12-live-version-test, the legacy admin panel is out of scope, and I sent the scoping questionnaire today."; } > /work/note-prompt.txt
+              timeout 900 $H chat -Q --query-file /work/note-prompt.txt 2>&1 | tail -n 30; echo "[exit $?]"
+              echo
+              $PY /work/after.py
+          env:
+            - name: HERMES_HOME
+              value: /opt/data
+            - name: HOME
+              value: /opt/data
+            - name: HERMES_ORIG_CWD
+              value: /opt/data
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: GENERAL_API_LLM_API_KEY
+            - name: LIVE_REASONING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: LIVE_REASONING_MODEL
+            - name: LIVE_DUMB_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: LIVE_DUMB_MODEL
+            - name: VISION_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: VISION_MODEL
+            - name: GBRAIN_REMOTE_TOKEN
+              value: "gbrain-mcp"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10000
+            runAsGroup: 10000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: home
+              mountPath: /opt/data
+            - name: work
+              mountPath: /work
+        - name: cleanup
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              i=0; until [ -f /work/done ]; do i=$((i+1)); [ $i -ge 1400 ] && break; sleep 2; done
+              sleep 5
+              psql -X -q -h gbrain-pg-rehearsal-rw -d postgres -c "DROP DATABASE IF EXISTS gbrain_live_test WITH (FORCE)" && echo "dropped gbrain_live_test"
+          env:
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-rehearsal-app
+                  key: password
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 26
+            runAsGroup: 26
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+      volumes:
+        - name: dumps
+          persistentVolumeClaim:
+            claimName: gbrain-pg-backup-b
+            readOnly: true
+        - name: work
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: home
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: config-seed
+          configMap:
+            name: hermes-config
