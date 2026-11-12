@@ -42,7 +42,6 @@ metadata:
     entity: ssint
     env: main
     capability: ai
-    stateful: "true"
 spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
   bootstrap:
@@ -53,9 +52,6 @@ spec:
         - CREATE EXTENSION IF NOT EXISTS vector;
   storage:
     size: 5Gi
-  inheritedMetadata:
-    labels:
-      stateful: "true"
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -66,7 +62,6 @@ metadata:
     entity: ssint
     env: main
     capability: ai
-    stateful: "true"
 spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
   bootstrap:
@@ -86,9 +81,6 @@ spec:
           name: gbrain-pg-app
   storage:
     size: 5Gi
-  inheritedMetadata:
-    labels:
-      stateful: "true"
 ---
 apiVersion: v1
 kind: ConfigMap

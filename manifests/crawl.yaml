@@ -68,7 +68,6 @@ metadata:
     entity: ssint
     env: main
     capability: crawl
-    stateful: "true"
 spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
   bootstrap:
@@ -96,9 +95,6 @@ spec:
           name: crawl-read-login
   storage:
     size: 5Gi
-  inheritedMetadata:
-    labels:
-      stateful: "true"
 ---
 apiVersion: v1
 kind: Secret

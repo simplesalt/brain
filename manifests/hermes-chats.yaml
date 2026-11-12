@@ -7,7 +7,6 @@ metadata:
     entity: ssint
     env: main
     capability: ai
-    stateful: "true"
 spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
   bootstrap:
@@ -16,9 +15,6 @@ spec:
       owner: hermes_chats
   storage:
     size: 5Gi
-  inheritedMetadata:
-    labels:
-      stateful: "true"
 ---
 apiVersion: v1
 kind: ConfigMap
