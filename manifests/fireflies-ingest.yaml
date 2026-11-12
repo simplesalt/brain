@@ -498,8 +498,8 @@ data:
       try { return JSON.parse(text); } catch { return null; }
     }
 
-    // The transcript sidecar under sources/meetings/ belongs wholly to this ingest, so its write deliberately
-    // overwrites (force). The meeting page is only created when absent (see ingestMeeting): Hermes rewrites it
+    // The transcript sidecar under sources/meetings/ belongs wholly to this ingest; a rewrite carries the
+    // revision get_page returned, never force. The meeting page is only created when absent (see ingestMeeting): Hermes rewrites it
     // after the first ingest, and a re-ingest must not undo that.
     // The request_id is a UUID derived from slug+content: a replay of the same write reuses gbrain's
     // original receipt instead of spending a new write, and changed content gets a fresh id.
@@ -539,9 +539,9 @@ data:
       return parsed;
     }
 
-    async function gbrainPutPage(slug, content, { force = true } = {}) {
-      const args = { slug, content, request_id: putRequestId(slug, content) };
-      if (force) args.force = true;
+    async function gbrainPutPage(slug, content, { expectedRevision = null } = {}) {
+      const args = { slug, content, request_id: putRequestId(slug, expectedRevision ? `${expectedRevision}:${content}` : content) };
+      if (expectedRevision) args.expected_revision = expectedRevision;
       const receipt = await gbrainCall('put_page', args);
       if (receipt?.state && receipt.state !== 'committed') {
         throw new Error(`write not committed: state=${receipt.state} request_id=${receipt.request_id}`);
@@ -760,8 +760,61 @@ data:
 
     // ---------------------------------------------------------------------------
     // Meeting ingest: fetch the transcript, write the transcript sidecar and (if absent) the meetings/ page, link attendees.
-    // Idempotent: sidecar overwritten with the same request_id for same content, meeting page never overwritten, upserted links.
+    // Idempotent: sidecar rewritten against the revision just read, meeting page never overwritten, upserted links.
     // ---------------------------------------------------------------------------
+
+    const WRITE_REFUSALS = ['revision_required', 'revision_conflict', 'revision_changed', 'page_shrink_refused', 'request_too_large'];
+    const refusalCode = (e) => WRITE_REFUSALS.find((c) => e.message.includes(c)) ?? null;
+
+    async function readPageState(slug) {
+      try {
+        const p = await gbrainCall('get_page', { slug });
+        return { exists: true, revision: p?.revision ?? null };
+      } catch (e) {
+        if (/page_not_found/.test(e.message)) return { exists: false, revision: null };
+        throw e;
+      }
+    }
+
+    async function writeTranscript(tSlug, t, dayIso) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const page = await readPageState(tSlug);
+        if (page.exists && !page.revision) {
+          console.error(`WARN: ${tSlug} exists but get_page returned no revision; rewrite skipped, stored page kept`);
+          return 'skipped';
+        }
+        const write = (maxChars) => gbrainPutPage(tSlug, transcriptToMarkdown(t, dayIso, maxChars), { expectedRevision: page.revision });
+        try {
+          await write(0);
+          return 'written';
+        } catch (e) {
+          const code = refusalCode(e);
+          if (code === 'revision_conflict' || code === 'revision_changed') {
+            console.error(`WARN: ${tSlug} changed during the rewrite (${code}); reading it again`);
+            continue;
+          }
+          if (code === 'request_too_large' || (!code && /size|large|too long|limit|413/i.test(e.message))) {
+            console.error(`WARN: ${tSlug} rejected at full size (${e.message}); retrying with a truncated transcript`);
+            try {
+              await write(FALLBACK_MAX_CHARS);
+              return 'truncated';
+            } catch (e2) {
+              const code2 = refusalCode(e2);
+              if (!code2) throw e2;
+              console.error(`WARN: ${tSlug} truncated write refused (${code2}); stored page kept: ${e2.message}`);
+              return 'refused';
+            }
+          }
+          if (code) {
+            console.error(`WARN: ${tSlug} write refused (${code}); stored page kept: ${e.message}`);
+            return 'refused';
+          }
+          throw e;
+        }
+      }
+      console.error(`WARN: ${tSlug} kept changing during the rewrite; stored page kept`);
+      return 'refused';
+    }
 
     async function ingestMeeting(meetingId, { hintDate = null, budget = null } = {}) {
       const d = await firefliesQuery(DETAIL_QUERY, { id: meetingId }, budget);
@@ -774,14 +827,7 @@ data:
       const slug = meetingSlug(t, dayIso);
       const tSlug = transcriptSlug(t, dayIso);
 
-      // Sidecar first so the meeting page's transcript link never dangles. Always rewritten (force).
-      try {
-        await gbrainPutPage(tSlug, transcriptToMarkdown(t, dayIso, 0));
-      } catch (e) {
-        if (!/size|large|too long|limit|413/i.test(e.message)) throw e;
-        console.error(`WARN: ${tSlug} rejected at full size (${e.message}); retrying with a truncated transcript`);
-        await gbrainPutPage(tSlug, transcriptToMarkdown(t, dayIso, FALLBACK_MAX_CHARS));
-      }
+      await writeTranscript(tSlug, t, dayIso);
       // Meeting page: create only when absent. Hermes rewrites it after the first ingest.
       let exists = true;
       try { await gbrainCall('get_page', { slug }); }
@@ -789,7 +835,7 @@ data:
         if (!/page_not_found/.test(e.message)) throw e;
         exists = false;
       }
-      if (!exists) await gbrainPutPage(slug, meetingToMarkdown(t, dayIso, attendees), { force: false });
+      if (!exists) await gbrainPutPage(slug, meetingToMarkdown(t, dayIso, attendees));
       else console.log(`meeting page ${slug} exists; left untouched`);
       let linked = 0;
       try { linked = await linkAttendees(slug, t, attendees, dayIso); }
@@ -1090,7 +1136,7 @@ spec:
         env: main
         capability: msg
       annotations:
-        simplesalt.company/restart-epoch: "1"
+        simplesalt.company/restart-epoch: "2"
     spec:
       serviceAccountName: fireflies-ingest
       containers:
