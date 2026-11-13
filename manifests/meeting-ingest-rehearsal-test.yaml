@@ -1,0 +1,101 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: meeting-ingest-rehearsal-test-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: meeting-ingest-rehearsal-test
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: test
+          image: python:3.12-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              export GBRAIN_URL=http://gbrain-rehearsal:3131/mcp GBRAIN_REMOTE_TOKEN=gbrain-mcp ADDON_URL=http://127.0.0.1:9 HERMES_HOME=/work/h
+              mkdir -p /work/h/cron/output/job1
+              python3 -I - <<'EOF'
+              import datetime, json, os, sys, urllib.request
+              URL = os.environ["GBRAIN_URL"]
+              def call(tool, args):
+                  body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": args}}).encode()
+                  req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Authorization": "Bearer gbrain-mcp"})
+                  t = urllib.request.urlopen(req, timeout=60).read().decode()
+                  for line in t.splitlines():
+                      if line.startswith("data: "):
+                          m = json.loads(line[6:])
+                          return m["result"]["content"][0]["text"], m["result"].get("isError")
+              A, B = "meetings/2026-11-13-t13-finished-then-deleted", "meetings/2026-11-13-t13-unfinished-then-deleted"
+              for s in (A, B):
+                  print("put", s, call("put_page", {"slug": s, "content": f"---\ntype: meeting\ntitle: T13 test\ndate: '2026-11-13'\nfireflies_id: t13{s[-7:]}\n---\n\n# T13 test\n\n## Attendees\n\n- Test person, Test contact\n"})[1])
+                  rev = json.loads(call("get_page", {"slug": s})[0])["revision"]
+                  print("delete", s, call("delete_page", {"slug": s, "expected_revision": rev})[1])
+                  print("get_page after delete ->", call("get_page", {"slug": s}))
+              st = json.loads(call("get_page", {"slug": "ops/meeting-ingest"})[0])
+              at = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=3)).isoformat()
+              state = {"done": [], "pending": {A: {"at": at, "tries": 1}, B: {"at": at, "tries": 1}}}
+              content = "---\ntype: note\ntitle: Meeting ingest state\n---\n\n# Meeting ingest state\n\nT13 rehearsal test state.\n\n```json\n" + json.dumps(state, indent=1) + "\n```\n"
+              print("seed state", call("put_page", {"slug": "ops/meeting-ingest", "content": content, "expected_revision": st["revision"]})[1])
+              open("/work/h/cron/output/job1/2026-11-13_00-00-00.md", "w").write(f"MEETING-INGEST-DONE {A}: 0 action items\n")
+              EOF
+              echo "== run the cron script (fixed version from the hermes-config ConfigMap)"
+              python3 -I /seed/cron-meeting-ingest.py; echo "[exit $?]"
+              python3 -I - <<'EOF'
+              import json, os, re, urllib.request
+              body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_page", "arguments": {"slug": "ops/meeting-ingest"}}}).encode()
+              req = urllib.request.Request(os.environ["GBRAIN_URL"], data=body, headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Authorization": "Bearer gbrain-mcp"})
+              t = urllib.request.urlopen(req, timeout=60).read().decode()
+              page = json.loads([json.loads(l[6:]) for l in t.splitlines() if l.startswith("data: ")][0]["result"]["content"][0]["text"])
+              state = json.loads(re.search(r"```json\n(.*?)\n```", page["compiled_truth"], re.S).group(1))
+              A, B = "meetings/2026-11-13-t13-finished-then-deleted", "meetings/2026-11-13-t13-unfinished-then-deleted"
+              print("state after:", json.dumps(state))
+              print("CHECK finished-then-deleted meeting is done and not pending:", "PASS" if A in state["done"] and A not in state["pending"] else "FAIL")
+              print("CHECK unfinished deleted meeting is not handed out again:", "PASS" if B in state["done"] and B not in state["pending"] else "FAIL")
+              EOF
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: seed
+              mountPath: /seed
+              readOnly: true
+            - name: work
+              mountPath: /work
+      volumes:
+        - name: seed
+          configMap:
+            name: hermes-config
+        - name: work
+          emptyDir:
+            sizeLimit: 16Mi

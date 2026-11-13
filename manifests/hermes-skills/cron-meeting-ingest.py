@@ -203,6 +203,16 @@ def action_items(body):
     return items
 
 
+def page_exists(slug):
+    try:
+        call("get_page", {"slug": slug})
+        return True
+    except RuntimeError as e:
+        if page_gone(e):
+            return False
+        raise
+
+
 def is_dylan(name):
     n = (name or "").strip().lower()
     return n in DYLAN_NAMES or n in DYLAN_EMAILS or n.startswith("dylan ")
@@ -230,10 +240,19 @@ def is_test_contact(slug):
     return isinstance(page, dict) and "test contact" in json.dumps(page).lower()
 
 
+def page_gone(err):
+    return bool(re.search(r"(?i)not[_ ]found|page_flagged_for_deletion|deleted", str(err)))
+
+
 def open_loops(slug):
     """Turn the Action Items of a saved meeting page into open loops. Returns the summary string, or None
     when the addon was unreachable (the caller retries on a later run). Idempotent on the addon side."""
-    page = call("get_page", {"slug": slug, "include_content": True})
+    try:
+        page = call("get_page", {"slug": slug, "include_content": True})
+    except RuntimeError as e:
+        if page_gone(e):
+            return "loops: page gone"
+        raise
     if not isinstance(page, dict):
         return "loops: no page"
     body = page.get("compiled_truth") or page.get("content") or ""
@@ -322,6 +341,9 @@ def main():
             done.add(slug)
         elif now - datetime.datetime.fromisoformat(p["at"]) < RETRY_AFTER:
             continue
+        elif not page_exists(slug):
+            print(f"meeting-ingest: {slug} no longer exists; not handing it out again", file=sys.stderr)
+            done.add(slug)
         elif p["tries"] >= MAX_TRIES:
             print(f"meeting-ingest: giving up on {slug} after {p['tries']} passes with no {DONE_MARKER}",
                   file=sys.stderr)
