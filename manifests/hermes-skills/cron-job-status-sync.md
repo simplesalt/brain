@@ -37,3 +37,5 @@ Answer with a line reading exactly `JOB-STATUS-RESULT`, then a JSON list with on
   }
 ]
 ```
+
+Do not call skill_manage; report a skill gap in your answer instead.

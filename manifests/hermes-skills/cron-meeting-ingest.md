@@ -26,3 +26,5 @@ When the skill's verification checklist passes, remove the `facts_backstop: fals
 Call one tool at a time. Do not search the web, do not use any outside source, and do not send any message to anyone.
 
 Answer with one line: `MEETING-INGEST-DONE <meeting slug>: <n> action items, <n> people and companies updated, facts_backstop <receipt of the final save>` (for example `queued` or `skipped: opted_out`), followed by one line for each conflict or claim you held back, if any.
+
+Do not call skill_manage; report a skill gap in your answer instead.

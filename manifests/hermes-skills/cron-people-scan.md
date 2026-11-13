@@ -28,3 +28,5 @@ Answer with a line reading exactly `PEOPLE-SCAN-RESULT`, then a JSON list with o
   }
 ]
 ```
+
+Do not call skill_manage; report a skill gap in your answer instead.

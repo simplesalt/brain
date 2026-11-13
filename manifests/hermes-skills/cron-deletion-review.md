@@ -18,3 +18,5 @@ Answer with a line reading exactly `DELETION-REVIEW-RESULT`, then a JSON list wi
   {"id": "<item id>", "L": 0.0, "R": 0.0, "E": 0.0, "reason": "<one sentence>"}
 ]
 ```
+
+Do not call skill_manage; report a skill gap in your answer instead.

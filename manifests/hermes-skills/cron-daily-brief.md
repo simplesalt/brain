@@ -11,3 +11,5 @@ Daily brief: email Dylan one short morning brief of today's meetings and who is 
 4. Send it with the `outbound-email` skill: from `dylan@simple-salt.com`, to `dylan.evans@simplesalt.company`, subject `Today: <weekday, month day>`.
 
 Rules: read only, except sending this one email. Do not reply to anyone, close loops, or change pages. If there are no meetings and nothing waiting, send nothing and say so.
+
+Do not call skill_manage; report a skill gap in your answer instead.
