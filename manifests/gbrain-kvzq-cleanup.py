@@ -43,6 +43,9 @@ def call(name, args):
             parts.append(json.loads(c.get('text', '')))
         except Exception:
             parts.append(c.get('text', ''))
+    data = [p for p in parts if not isinstance(p, str)]
+    if data:
+        parts = data
     if len(parts) == 1:
         out = parts[0]
     elif parts and all(isinstance(p, list) for p in parts):
