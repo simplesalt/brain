@@ -113,6 +113,9 @@ if rm:
 before = recent()
 print(f'== list_pages parsed {len(before)} recent pages')
 if not before:
+    print('== raw list_pages:', json.dumps(call('list_pages', {'limit': 3, 'sort': 'updated_desc'}))[:1500])
+    print('== raw list_pages (no sort):', json.dumps(call('list_pages', {'limit': 3}))[:1500])
+    print('== raw get_page:', json.dumps(call('get_page', {'slug': KNOWN[3]}))[:600])
     print('RESULT FAIL: list_pages returned nothing parseable')
     raise SystemExit(1)
 targets = sorted(find_tag_slugs())
