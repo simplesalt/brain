@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-kvzq-cleanup-1
+  name: gbrain-kvzq-cleanup-2
   namespace: ssint-main-ai
   labels:
     entity: ssint

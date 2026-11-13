@@ -37,11 +37,20 @@ def call(name, args):
     ok, res = gbrain('tools/call', {'name': name, 'arguments': args})
     if not ok:
         return False, res
-    out = '\n'.join(c.get('text', '') for c in res.get('content', []))
-    try:
-        out = json.loads(out)
-    except Exception:
-        pass
+    parts = []
+    for c in res.get('content', []):
+        try:
+            parts.append(json.loads(c.get('text', '')))
+        except Exception:
+            parts.append(c.get('text', ''))
+    if len(parts) == 1:
+        out = parts[0]
+    elif parts and all(isinstance(p, list) for p in parts):
+        out = [x for p in parts for x in p]
+    elif parts and all(isinstance(p, dict) for p in parts):
+        out = [x for p in parts for x in (rows(p) or [p])]
+    else:
+        out = parts
     return not res.get('isError'), out
 
 
@@ -60,8 +69,22 @@ def recent():
     return {r.get('slug'): r for r in rows(res) if isinstance(r, dict) and r.get('slug')}
 
 
+KNOWN = [
+    'meetings/2026-11-12-livetest-kvzq-pentest-scoping',
+    'sources/meetings/2026-11-12-livetest-kvzq-pentest-scoping-transcript',
+    'notes/2026-11-12-livetest-kvzq-scoping-prep',
+    'people/pat-kvzq',
+    'companies/livetest-kvzq',
+]
+
+
+def live(slug):
+    ok, p = call('get_page', {'slug': slug})
+    return p if ok and isinstance(p, dict) and p.get('slug') == slug and not p.get('deleted_at') else None
+
+
 def find_tag_slugs():
-    slugs = set(s for s in recent() if TAG in s)
+    slugs = set(s for s in recent() if TAG in s) | set(s for s in KNOWN if live(s))
     for q in (TAG, 'Pat Kvzq', 'Livetest Kvzq'):
         ok, res = call('search', {'query': q, 'limit': 50})
         for r in rows(res):
@@ -88,6 +111,10 @@ if rm:
     print('== remove_link schema:', json.dumps(rm.get('inputSchema'))[:800])
 
 before = recent()
+print(f'== list_pages parsed {len(before)} recent pages')
+if not before:
+    print('RESULT FAIL: list_pages returned nothing parseable')
+    raise SystemExit(1)
 targets = sorted(find_tag_slugs())
 print(f'== kvzq slugs found ({len(targets)}):')
 for s in targets:
