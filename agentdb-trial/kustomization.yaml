@@ -19,6 +19,7 @@ configMapGenerator:
       - mcp_test.py
       - mcp_test3.py
       - reviewer_test.py
+      - cleanup_t2.py
     options:
       disableNameSuffixHash: true
       labels:
