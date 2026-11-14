@@ -37,7 +37,7 @@ spec:
   interval: 12h
   url: oci://ghcr.io/simplesalt/charts/agentdb
   ref:
-    tag: "0.2.0-26"
+    tag: "0.2.0-28"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -60,7 +60,7 @@ spec:
   values:
     instanceName: trial
     image:
-      digest: sha256:2c11eed7051a0184ae86308397165f9006519d7e2fea07260ffab0f98d6e6c04
+      digest: sha256:d9f47d8fae6911d58e900d75feb98ad0c3f82ac4c39ed1fe604a9a3a32dbb181
     postgres:
       instances: 2
       imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
