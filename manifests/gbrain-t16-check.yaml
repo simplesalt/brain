@@ -1,0 +1,111 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-t16-check-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-t16-check
+        gbrain-access: guard-only
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: mark
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              sleep 20
+              python3 -I /check/t16.py mark
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: check
+              mountPath: /check
+              readOnly: true
+      containers:
+        - name: scripts
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              cd /scripts
+              fails=0
+              for s in cron-people-scan.py cron-job-status-sync.py cron-timeline-sweep.py; do
+                python3 -B "$s" > /tmp/out.txt 2> /tmp/err.txt
+                rc=$?
+                [ "$rc" = 0 ] || fails=$((fails + 1))
+                echo "$s with an open mark (dry run, via $GBRAIN_URL): exit=$rc stdout_lines=$(wc -l < /tmp/out.txt) stderr_lines=$(wc -l < /tmp/err.txt)"
+                head -c 600 /tmp/out.txt | cut -c1-160
+                head -c 1500 /tmp/err.txt
+              done
+              python3 -I /check/t16.py withdraw
+              echo "RESULT: $([ "$fails" = 0 ] && echo PASS || echo FAIL)"
+          env:
+            - name: GBRAIN_URL
+              value: http://gbrain:3141/mcp
+            - name: PEOPLE_SCAN_DRY_RUN
+              value: "1"
+            - name: TIMELINE_SWEEP_DRY_RUN
+              value: "1"
+            - name: JOB_STATUS_DRY_RUN
+              value: "1"
+            - name: HERMES_HOME
+              value: /tmp/hermes
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: check
+              mountPath: /check
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: hermes-config
+        - name: check
+          configMap:
+            name: gbrain-t16-check-script

@@ -39,6 +39,7 @@ resources:
   - manifests/gbrain-pg-backup.yaml
   - manifests/gbrain-mark-review.yaml
   - manifests/gbrain-networkpolicy.yaml
+  - manifests/gbrain-t16-check.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
@@ -179,6 +180,10 @@ configMapGenerator:
     namespace: ssint-main-ai
     files:
       - gbrain-guard-rehearsal-test.mjs=manifests/gbrain-guard-rehearsal-test.mjs
+  - name: gbrain-t16-check-script
+    namespace: ssint-main-ai
+    files:
+      - t16.py=manifests/gbrain-t16-check.py
 generatorOptions:
   labels:
     entity: ssint
