@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from 'gbrain/pglite-engine';
 import {
-  decide, engineStore, ensureGuardTables, filterFlagged, flagKey, makeGuardHandler,
+  decide, engineStore, ensureGuardTables, filterFlagged, flagKey, makeGuardHandler, parseRpcBody,
   type GuardStore, type MarkInput, type StoredPage,
 } from '../src/guard.ts';
 
@@ -141,7 +141,9 @@ describe('guard http', () => {
   beforeEach(() => { calls.length = 0; });
 
   test('tools/list hides refused tools, adds guard tools and include_deleted', async () => {
-    const r = await (await rpc('tools/list', {})).json();
+    const res = await rpc('tools/list', {});
+    expect(res.headers.get('content-type')).toBe('text/event-stream');
+    const r = parseRpcBody(await res.text());
     const names = r.result.tools.map((t: { name: string }) => t.name);
     expect(names).toEqual(['get_page', 'put_page', 'mark_page_for_deletion', 'propose_page_replacement', 'withdraw_page_mark']);
     expect(r.result.tools[0].inputSchema.properties.include_deleted.type).toBe('boolean');
@@ -178,6 +180,33 @@ describe('guard http', () => {
     const all = await (await tool('search', { query: 'notes', include_deleted: true })).json();
     expect(JSON.parse(all.result.content[0].text).results).toHaveLength(2);
     expect(calls.every(c => c.body.params.arguments.include_deleted === undefined)).toBe(true);
+    await tool('withdraw_page_mark', { slug: 'notes/old' });
+  });
+  test('a filtered read answers in SSE when gbrain answered in SSE, and in JSON when gbrain did', async () => {
+    const sse = (async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body ?? ''));
+      const payload = { jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: JSON.stringify({ results: [{ slug: 'notes/old' }, { slug: 'notes/new' }] }) }] } };
+      return new Response(`event: message\ndata: ${JSON.stringify(payload)}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+    }) as unknown as typeof fetch;
+    const m = memStore(pages());
+    const h = makeGuardHandler(m.store, { upstream: 'http://gbrain:3131/mcp', defaultSource: 'default', fetchImpl: sse, log: () => {} });
+    const call = (name: string, args: Record<string, unknown>) => h(new Request('http://g/mcp', {
+      method: 'POST', headers: { authorization: 'Bearer t', 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name, arguments: args } }),
+    }));
+    await call('mark_page_for_deletion', { slug: 'notes/old', reason: 'dup' });
+    const res = await call('search', { query: 'notes' });
+    expect(res.headers.get('content-type')).toBe('text/event-stream');
+    const text = await res.text();
+    const line = text.split('\n').find(l => l.startsWith('data: '));
+    expect(line).toBeDefined();
+    const msg = JSON.parse(line!.slice(6));
+    expect(msg.id).toBe(9);
+    expect(JSON.parse(msg.result.content[0].text).results).toEqual([{ slug: 'notes/new' }]);
+    await tool('mark_page_for_deletion', { slug: 'notes/old', reason: 'dup' });
+    const j = await tool('search', { query: 'notes' });
+    expect(j.headers.get('content-type')).toBe('application/json');
+    expect(JSON.parse((await j.json()).result.content[0].text).results).toEqual([{ slug: 'notes/new' }]);
     await tool('withdraw_page_mark', { slug: 'notes/old' });
   });
   test('batched tool calls are refused', async () => {

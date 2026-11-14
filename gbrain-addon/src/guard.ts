@@ -236,6 +236,11 @@ export interface GuardOpts {
 const rpcJson = (body: unknown, extra: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json', ...extra } });
 
+export const rpcLike = (body: unknown, upstreamType: string | null, extra: Record<string, string> = {}) =>
+  (upstreamType ?? '').toLowerCase().includes('text/event-stream')
+    ? new Response(`event: message\ndata: ${JSON.stringify(body)}\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream', ...extra } })
+    : rpcJson(body, extra);
+
 function principalOf(auth: string | null): string {
   if (!auth) return 'anonymous';
   const t = auth.replace(/^Bearer\s+/i, '');
@@ -318,7 +323,7 @@ export function makeGuardHandler(store: GuardStore, opts: GuardOpts) {
         ...GUARD_TOOL_DEFS,
       ];
       const sid = res.headers.get('mcp-session-id');
-      return rpcJson(parsed, sid ? { 'mcp-session-id': sid } : extra);
+      return rpcLike(parsed, res.headers.get('content-type'), sid ? { 'mcp-session-id': sid } : extra);
     }
 
     if (msg?.method !== 'tools/call') return forward(req, text);
@@ -361,6 +366,6 @@ export function makeGuardHandler(store: GuardStore, opts: GuardOpts) {
       return { ...c, text: JSON.stringify(filterFlagged(inner, flagged, opts.defaultSource)) };
     });
     if (parsed.result.structuredContent !== undefined) parsed.result.structuredContent = filterFlagged(parsed.result.structuredContent, flagged, opts.defaultSource);
-    return rpcJson(parsed, extra);
+    return rpcLike(parsed, res.headers.get('content-type'), extra);
   };
 }
