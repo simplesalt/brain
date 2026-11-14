@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: agentdb-mcp-test-t2c
+  name: agentdb-mcp-test-t2d
   namespace: ssint-main-agentdb
   labels:
     entity: ssint
@@ -53,9 +53,11 @@ spec:
               mountPath: /test
             - name: probe
               mountPath: /probe
+            - name: tmp
+              mountPath: /tmp
           args:
             - |
-              python3 /test/cleanup_t2.py t2_fidelity_1794676684 t2_927_928_1794676679 t2_fidelity_1794676328; echo "=== mcp_test3.py"; python3 /test/mcp_test3.py; echo "=== mcp_test3.py exit=$?"; python3 /test/cleanup_t2.py
+              for i in 1 2 3; do echo "=== mcp_test3.py try $i"; python3 /test/mcp_test3.py > /tmp/o.txt 2>&1; cat /tmp/o.txt | grep -E "\"kind\": \"(check|summary)\""; grep -q "create_table: confirm=true applies" /tmp/o.txt && break; done; python3 /test/cleanup_t2.py
       volumes:
         - name: test
           configMap:
@@ -63,3 +65,6 @@ spec:
         - name: probe
           configMap:
             name: agentdb-probe
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
