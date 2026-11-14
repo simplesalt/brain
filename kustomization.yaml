@@ -39,7 +39,6 @@ resources:
   - manifests/gbrain-pg-backup.yaml
   - manifests/gbrain-mark-review.yaml
   - manifests/gbrain-networkpolicy.yaml
-  - manifests/gbrain-t15-check.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
