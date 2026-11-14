@@ -1,0 +1,382 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-t15-backup-a
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 3600
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: gbrain-pg-backup
+        copy: a
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: gbrain-pg-backup
+                  copy: b
+      containers:
+        - name: dump
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/dump.sh"]
+          env:
+            - name: COPY
+              value: a
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: dumps
+              mountPath: /dumps
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: dumps
+          persistentVolumeClaim:
+            claimName: gbrain-pg-backup-a
+        - name: scripts
+          configMap:
+            name: gbrain-pg-backup-scripts
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-t15-backup-b
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 3600
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: gbrain-pg-backup
+        copy: b
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: gbrain-pg-backup
+                  copy: a
+      containers:
+        - name: dump
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/dump.sh"]
+          env:
+            - name: COPY
+              value: b
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: dumps
+              mountPath: /dumps
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: dumps
+          persistentVolumeClaim:
+            claimName: gbrain-pg-backup-b
+        - name: scripts
+          configMap:
+            name: gbrain-pg-backup-scripts
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-t15-guard
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-t15-guard
+        gbrain-access: guard-only
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "-e"]
+          args:
+            - |
+              await Bun.sleep(20000);
+              const rpc = async (method, params) => {
+                for (let i = 0; ; i++) {
+                  try {
+                    const r = await fetch("http://gbrain:3141/mcp", { method: "POST", signal: AbortSignal.timeout(20000),
+                      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: "Bearer gbrain-mcp" },
+                      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+                    const t = await r.text();
+                    let msg = null;
+                    for (const b of t.split("\n\n")) { const d = b.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).join("\n"); if (!d) continue; try { const o = JSON.parse(d); if (o.result || o.error) msg = o; } catch {} }
+                    return msg ?? JSON.parse(t);
+                  } catch (e) { if (i >= 5) throw e; await Bun.sleep(5000); }
+                }
+              };
+              const call = async (name, args) => {
+                const m = await rpc("tools/call", { name, arguments: args });
+                const text = (m.result?.content ?? []).map(c => c.text ?? "").join("\n");
+                let body; try { body = JSON.parse(text); } catch { body = text; }
+                return { isError: !!m.result?.isError || !!m.error, body: m.error ?? body, text };
+              };
+              const show = (v) => JSON.stringify(v).slice(0, 300);
+              let fails = 0;
+              const check = (label, ok, detail) => { if (!ok) fails++; console.log(`${ok ? "PASS" : "FAIL"} ${label} :: ${show(detail)}`); };
+              try { await fetch("http://gbrain:3131/health", { signal: AbortSignal.timeout(8000) }); check("direct gbrain:3131 is blocked", false, "reachable"); }
+              catch (e) { check("direct gbrain:3131 is blocked", true, `${e.name}: ${e.message}`); }
+              const TARGET = "people/dylan-evans";
+              const b = (await call("get_page", { slug: TARGET, body: "none" })).body;
+              const put = await call("put_page", { slug: TARGET, content: "guard refusal probe", expected_revision: b.revision });
+              const a = (await call("get_page", { slug: TARGET, body: "none" })).body;
+              check(`I1 put_page on existing ${TARGET} refused, revision unchanged (${b.revision} -> ${a.revision})`, put.isError && a.revision === b.revision, put.body);
+              const note = `notes/zz-guard-check-926-${Date.now()}`;
+              let r = await call("put_page", { slug: note, content: "---\ntype: note\ntitle: Guard check 926 T15\n---\n\n# Guard check\n\nLine one of a test page for projects#926.\nLine two of a test page for projects#926.\n" });
+              check(`I2 put_page creates ${note}`, !r.isError, r.body?.status ?? r.body);
+              const r1 = (await call("get_page", { slug: note, body: "none" })).body?.revision;
+              r = await call("edit_page", { slug: note, expected_revision: r1, edits: [{ old_text: "Line two of a test page", new_text: "Line two (edited) of a test page" }] });
+              const pg = (await call("get_page", { slug: note })).body;
+              check(`I2 edit_page changes part of ${note} (revision ${r1} -> ${pg?.revision})`, !r.isError && JSON.stringify(pg).includes("Line two (edited)"), r.body?.status ?? r.body);
+              r = await call("mark_page_for_deletion", { slug: note, reason: "projects#926 T15 guard check" });
+              check("I7 mark_page_for_deletion records a mark", !r.isError && r.body?.status === "marked", r.body);
+              r = await call("get_page", { slug: note });
+              check("I7 default get_page hides the flagged page", r.isError && r.text.includes("page_flagged_for_deletion"), r.body);
+              r = await call("list_pages", { limit: 200, sort: "updated_desc" });
+              check("I7 default list_pages leaves it out", !JSON.stringify(r.body).includes(note), { contains: JSON.stringify(r.body).includes(note) });
+              r = await call("get_page", { slug: note, include_deleted: true });
+              check("I7 get_page with include_deleted reads it", !r.isError && r.body?.slug === note, { slug: r.body?.slug, flagged: r.body?.flagged_for_deletion ?? r.body?.deleted ?? null });
+              r = await call("list_pages", { limit: 200, sort: "updated_desc", include_deleted: true });
+              check("I7 list_pages with include_deleted shows it", JSON.stringify(r.body).includes(note), { contains: JSON.stringify(r.body).includes(note) });
+              r = await call("withdraw_page_mark", { slug: note });
+              check("I7 withdraw_page_mark unflags it", !r.isError && r.body?.withdrawn === 1, r.body);
+              r = await call("get_page", { slug: note, body: "none" });
+              check("I7 default get_page reads it again after withdraw", !r.isError && r.body?.slug === note, { slug: r.body?.slug });
+              r = await call("mark_page_for_deletion", { slug: note, reason: "projects#926 T15 test page, done" });
+              check("test page marked for deletion again so it stays hidden", !r.isError && r.body?.status === "marked", r.body);
+              console.log(`RESULT: ${fails === 0 ? "PASS" : "FAIL"} (${fails} failed)`);
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gbrain-t15-jobs
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+  annotations:
+    kustomize.toolkit.fluxcd.io/force: enabled
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gbrain-t15-jobs
+        gbrain-access: guard-only
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: scripts
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              sleep 20
+              cd /scripts
+              for s in cron-timeline-sweep.py cron-job-status-sync.py; do
+                echo "=== $s (dry run, GBRAIN_URL=$GBRAIN_URL)"
+                python3 -B "$s" > /tmp/out.txt 2> /tmp/err.txt
+                rc=$?
+                echo "exit=$rc stdout_lines=$(wc -l < /tmp/out.txt) stderr_lines=$(wc -l < /tmp/err.txt)"
+                head -c 1500 /tmp/out.txt | cut -c1-200
+                echo "--- stderr"
+                head -c 2000 /tmp/err.txt
+              done
+              echo "RESULT: done"
+          env:
+            - name: GBRAIN_URL
+              value: http://gbrain:3141/mcp
+            - name: TIMELINE_SWEEP_DRY_RUN
+              value: "1"
+            - name: JOB_STATUS_DRY_RUN
+              value: "1"
+            - name: HERMES_HOME
+              value: /tmp/hermes
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+        - name: writes
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=60000'
+              case "$DATABASE_URL" in *@gbrain-pg-rw[.:/]*) ;; *) echo "FATAL"; exit 1 ;; esac
+              q() { echo "+ $1"; psql -X -c "$1" "$DATABASE_URL"; }
+              q "SELECT slug, updated_at::timestamp(0) FROM pages WHERE slug IN ('ops/timeline-sweep', 'ops/job-status-sync', 'ops/people-scan', 'ops/meeting-ingest', 'ops/loop-tasks-sync', 'ops/deletion-review', 'ops/person-dedupe') ORDER BY slug"
+              q "SELECT operation, state, coalesce(error_code, '-') AS error_code, count(*), min(created_at)::timestamp(0) AS first, max(created_at)::timestamp(0) AS last FROM persistence_requests WHERE created_at >= '2026-11-13 12:00:00+00' AND principal_kind = 'legacy_token' GROUP BY 1,2,3 ORDER BY 1,2"
+              q "SELECT created_at::timestamp(0) AS at, operation, state, slug, coalesce(error_code, '-') AS error_code FROM persistence_requests WHERE created_at >= '2026-11-13 12:00:00+00' AND principal_kind = 'legacy_token' AND (slug LIKE 'ops/%' OR state <> 'committed') ORDER BY created_at DESC LIMIT 40"
+              q "SELECT operation, status, count(*), max(created_at)::timestamp(0) AS last FROM mcp_request_log WHERE created_at >= '2026-11-13 12:00:00+00' AND token_name = 'hermes-mcp' GROUP BY 1,2 ORDER BY 3 DESC LIMIT 40"
+              q "SELECT id, kind, slug, reason, created_at::timestamp(0), withdrawn_at::timestamp(0), applied_at::timestamp(0), outcome FROM addon_page_marks ORDER BY id"
+              echo "RESULT: done"
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gbrain-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: hermes-config
