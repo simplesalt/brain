@@ -46,6 +46,8 @@ def short(v):
 
 
 def log(kind, **kw):
+    if kind in ("rpc", "tool") and os.environ.get("QUIET") == "1":
+        return
     print(json.dumps(dict(kind=kind, **kw), ensure_ascii=False, default=str), flush=True)
 
 

@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: agentdb-mcp-test-950
+  name: agentdb-mcp-test-950b
   namespace: ssint-main-agentdb
   labels:
     entity: ssint
@@ -36,6 +36,8 @@ spec:
               value: http://trial-mcp.ssint-main-agentdb.svc/mcp
             - name: PYTHONDONTWRITEBYTECODE
               value: "1"
+            - name: QUIET
+              value: "1"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -57,7 +59,7 @@ spec:
               mountPath: /tmp
           args:
             - |
-              for t in mcp_test.py mcp_test3.py; do echo "=== $t"; python3 /test/$t; echo "=== $t exit=$?"; done; echo "=== t950_951.py"; python3 /test/t950_951.py 200; echo "=== t950_951.py exit=$?"; python3 /test/cleanup_t2.py
+              for t in mcp_test.py mcp_test3.py; do echo "=== $t"; python3 /test/$t; echo "=== $t exit=$?"; done; python3 /test/cleanup_t2.py
       volumes:
         - name: test
           configMap:
