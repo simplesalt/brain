@@ -1,0 +1,70 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: agentdb-mcp-test-950
+  namespace: ssint-main-agentdb
+  labels:
+    entity: ssint
+    env: main
+    capability: agentdb
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        entity: ssint
+        env: main
+        capability: agentdb
+    spec:
+      serviceAccountName: agentdb-probe-admin
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: test
+          image: python:3.12-alpine
+          command:
+            - /bin/sh
+            - -c
+          env:
+            - name: AGENTDB_ENDPOINT
+              value: http://trial-mcp.ssint-main-agentdb.svc/mcp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: test
+              mountPath: /test
+            - name: probe
+              mountPath: /probe
+            - name: tmp
+              mountPath: /tmp
+          args:
+            - |
+              for t in mcp_test.py mcp_test3.py; do echo "=== $t"; python3 /test/$t; echo "=== $t exit=$?"; done; echo "=== t950_951.py"; python3 /test/t950_951.py 200; echo "=== t950_951.py exit=$?"; python3 /test/cleanup_t2.py
+      volumes:
+        - name: test
+          configMap:
+            name: agentdb-mcp-test
+        - name: probe
+          configMap:
+            name: agentdb-probe
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
