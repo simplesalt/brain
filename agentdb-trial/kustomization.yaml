@@ -3,22 +3,10 @@ kind: Kustomization
 namespace: ssint-main-agentdb
 resources:
   - trial.yaml
-  - mcp-test.yaml
 configMapGenerator:
   - name: agentdb-probe
     files:
       - probe.py
-    options:
-      disableNameSuffixHash: true
-      labels:
-        entity: ssint
-        env: main
-        capability: agentdb
-  - name: agentdb-mcp-test
-    files:
-      - mcp_test.py
-      - t950_951.py
-      - cleanup_t2.py
     options:
       disableNameSuffixHash: true
       labels:
