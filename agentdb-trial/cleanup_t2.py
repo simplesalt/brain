@@ -7,8 +7,12 @@ import mcp_test as t
 
 def main():
     c = t.Client()
-    for _ in range(12):
-        init = c.initialize()
+    for _ in range(24):
+        try:
+            init = c.initialize()
+        except OSError as e:
+            t.log("waiting_for_mcp", error=repr(e))
+            init = None
         if "result" in (init or {}):
             break
         time.sleep(5)

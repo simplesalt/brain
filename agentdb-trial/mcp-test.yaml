@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: agentdb-mcp-test-t2b
+  name: agentdb-mcp-test-t2c
   namespace: ssint-main-agentdb
   labels:
     entity: ssint
@@ -55,7 +55,7 @@ spec:
               mountPath: /probe
           args:
             - |
-              python3 /test/cleanup_t2.py t2_fidelity_1794676328; for t in mcp_test3.py mcp_test.py; do echo "=== $t"; python3 /test/$t; echo "=== $t exit=$?"; done; python3 /test/cleanup_t2.py
+              python3 /test/cleanup_t2.py t2_fidelity_1794676684 t2_927_928_1794676679 t2_fidelity_1794676328; echo "=== mcp_test3.py"; python3 /test/mcp_test3.py; echo "=== mcp_test3.py exit=$?"; python3 /test/cleanup_t2.py
       volumes:
         - name: test
           configMap:
