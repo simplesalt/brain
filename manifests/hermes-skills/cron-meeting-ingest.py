@@ -45,7 +45,8 @@ def call(tool, args):
         "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
         "Authorization": "Bearer " + TOKEN})
     with urllib.request.urlopen(req, timeout=60) as r:
-        for line in r.read().decode().splitlines():
+        raw = r.read().decode()
+        for line in (["data: " + raw.strip()] if raw.lstrip().startswith("{") else raw.splitlines()):
             if line.startswith("data: "):
                 msg = json.loads(line[6:])
                 if "error" in msg:

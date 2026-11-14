@@ -102,7 +102,7 @@ def call(tool, args):
                 raise
             log(f"gbrain unreachable ({e.reason}); retrying in {15 * (attempt + 1)}s")
             time.sleep(15 * (attempt + 1))
-    for line in raw.splitlines():
+    for line in (["data: " + raw.strip()] if raw.lstrip().startswith("{") else raw.splitlines()):
         if line.startswith("data: "):
             msg = json.loads(line[6:])
             if "error" in msg:

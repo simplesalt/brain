@@ -61,7 +61,7 @@ def call(tool, args):
         raise
     except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
         raise Unreachable(f"gbrain unreachable on {tool}: {getattr(e, 'reason', e)}") from None
-    for line in raw.splitlines():
+    for line in (["data: " + raw.strip()] if raw.lstrip().startswith("{") else raw.splitlines()):
         if line.startswith("data: "):
             msg = json.loads(line[6:])
             if "error" in msg:
