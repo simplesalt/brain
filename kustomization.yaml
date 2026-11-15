@@ -39,7 +39,6 @@ resources:
   - manifests/gbrain-pg-backup.yaml
   - manifests/gbrain-mark-review.yaml
   - manifests/gbrain-networkpolicy.yaml
-  - manifests/gbrain-kvzq-timeline.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
@@ -180,10 +179,6 @@ configMapGenerator:
     namespace: ssint-main-ai
     files:
       - gbrain-guard-rehearsal-test.mjs=manifests/gbrain-guard-rehearsal-test.mjs
-  - name: gbrain-kvzq-timeline-script
-    namespace: ssint-main-ai
-    files:
-      - gbrain-kvzq-timeline.mjs=manifests/gbrain-kvzq-timeline.mjs
 generatorOptions:
   labels:
     entity: ssint
