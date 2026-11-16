@@ -31,7 +31,6 @@ resources:
   - manifests/coding.yaml
   - manifests/coding-rc.yaml
   - manifests/coding-fe.yaml
-  - manifests/coding-permtest.yaml
   - manifests/cloudflare-zero-trust-main.yaml
   - manifests/gcp-sso.yaml
   - manifests/efforts.yaml
