@@ -28,7 +28,8 @@ data:
         "/home/coder/repo/.claude/worktrees": {
           "hasTrustDialogAccepted": true
         }
-      }
+      },
+      "remoteControlMachineId": "126ad15e-90ea-46ac-a419-197a112317ac"
     }
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
@@ -83,4 +84,4 @@ spec:
       create: false
       existingConfigMap: claude-rc-skel-permtest
     podAnnotations:
-      simplesalt.company/restart-epoch: "2"
+      simplesalt.company/restart-epoch: "3"
