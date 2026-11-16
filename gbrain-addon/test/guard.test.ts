@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from 'gbrain/pglite-engine';
 import {
-  decide, engineStore, ensureGuardTables, filterFlagged, flagKey, makeGuardHandler, parseRpcBody,
+  decide, DESCRIPTION_OVERRIDES, engineStore, ensureGuardTables, filterFlagged, flagKey, makeGuardHandler, PAGE_NOT_FOUND_HINT,
+  parseRpcBody, REMOVED_ON_PURPOSE, REVISION_HINT,
   type GuardStore, type MarkInput, type StoredPage,
 } from '../src/guard.ts';
 
@@ -214,6 +215,89 @@ describe('guard http', () => {
       body: JSON.stringify([{ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'delete_page', arguments: {} } }]) }))).json();
     expect(calls).toHaveLength(0);
     expect(r[0].error.code).toBe(-32600);
+  });
+});
+
+describe('hints Hermes sees treat removed pages as removed on purpose', () => {
+  const notFound = (suggestion: string) => ({
+    error: 'page_not_found', code: 'page_not_found', message: 'Page not found: notes/gone', suggestion,
+    fix: { argv: ['gbrain', 'get', 'notes/gone', '--include-deleted'], mcp: { tool: 'get_page', arguments: { slug: 'notes/gone', include_deleted: true } } },
+    docs_cmd: ['gbrain', 'errors', 'page_not_found'],
+  });
+  const errors: Record<string, unknown> = {
+    get_page: notFound('Page may be soft-deleted; pass include_deleted: true to verify. Next: get_page {"slug":"notes/gone","include_deleted":true}'),
+    get_backlinks: notFound("Page exists in source 'google' — pass source_id: 'google'. Page may be soft-deleted; pass include_deleted: true to verify"),
+    edit_page: { error: 'invalid_params', code: 'invalid_params', message: 'expected_revision and force: true are mutually exclusive.', suggestion: 'Use the observed revision for a conditional edit or force: true for an intentional overwrite.' },
+    get_raw_data: 'Raw data follows soft-delete; restore_page brings the rows back.',
+  };
+  const upstream = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body ?? ''));
+    if (body.method === 'tools/list') {
+      const tools = [
+        { name: 'get_page', inputSchema: { type: 'object', properties: { slug: {}, include_deleted: { type: 'boolean', description: 'Include soft-deleted pages.' } } } },
+        { name: 'revert_version', description: 'Restore a page to an earlier version. Use when an edit must be undone.', inputSchema: { type: 'object', properties: { slug: {}, force: { type: 'boolean', description: 'Ignore the revision.' } } } },
+        { name: 'get_raw_data', description: 'Retrieve raw data; restore_page brings the rows back, and get_page include_deleted: true verifies the tombstone.', inputSchema: { type: 'object', properties: { slug: {} } } },
+        { name: 'add_tag', description: 'Add one tag.', inputSchema: { type: 'object', properties: { force: { type: 'boolean', description: 'Ignore the revision.' } } } },
+      ];
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { tools } }), { headers: { 'content-type': 'application/json' } });
+    }
+    const e = errors[body.params?.name];
+    const result = e === undefined
+      ? { content: [{ type: 'text', text: JSON.stringify({ ok: true, note: 'force is fine to mention in a success' }) }] }
+      : { content: [{ type: 'text', text: typeof e === 'string' ? e : JSON.stringify(e) }], isError: true };
+    return new Response(`event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: body.id, result })}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  }) as unknown as typeof fetch;
+  const h = makeGuardHandler(memStore(pages()).store, { upstream: 'http://gbrain:3131/mcp', defaultSource: 'default', fetchImpl: upstream, log: () => {} });
+  const rpc = async (method: string, params: unknown) => parseRpcBody(await (await h(new Request('http://g/mcp', {
+    method: 'POST', headers: { authorization: 'Bearer t', 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 3, method, params }),
+  }))).text());
+  const call = async (name: string, args: Record<string, unknown>) => (await rpc('tools/call', { name, arguments: args })).result;
+  const bypass = /include_deleted|include-deleted|restore_page|force: true|withdraw_page_mark/;
+
+  test('page_not_found says the page was removed on purpose and drops the include_deleted fix', async () => {
+    const r = await call('get_page', { slug: 'notes/gone' });
+    expect(r.isError).toBe(true);
+    const e = JSON.parse(r.content[0].text);
+    expect(e.code).toBe('page_not_found');
+    expect(e.suggestion).toBe(PAGE_NOT_FOUND_HINT);
+    expect(e.fix).toBeUndefined();
+    expect(e.docs_cmd).toEqual(['gbrain', 'errors', 'page_not_found']);
+    expect(r.content[0].text).not.toMatch(bypass);
+  });
+  test('a page found in another source keeps that pointer', async () => {
+    const e = JSON.parse((await call('get_backlinks', { slug: 'notes/gone' })).content[0].text);
+    expect(e.suggestion).toBe(`Page exists in source 'google' — pass source_id: 'google'. ${PAGE_NOT_FOUND_HINT}`);
+  });
+  test('a revision error points to expected_revision, not force', async () => {
+    const e = JSON.parse((await call('edit_page', { slug: 'people/jane', force: true, expected_revision: 'r1' })).content[0].text);
+    expect(e.message).toBe('expected_revision and force: true are mutually exclusive.');
+    expect(e.suggestion).toBe(REVISION_HINT);
+  });
+  test('a plain-text error hint is reworded too, and successes pass unchanged', async () => {
+    expect((await call('get_raw_data', { slug: 'notes/gone' })).content[0].text).toBe(REMOVED_ON_PURPOSE);
+    expect(JSON.parse((await call('append_page', { slug: 'people/jane', text: 'x' })).content[0].text).note).toBe('force is fine to mention in a success');
+  });
+  test('tools/list descriptions for restore paths and force match', async () => {
+    const tools = (await rpc('tools/list', {})).result.tools;
+    const by = Object.fromEntries(tools.map((t: { name: string }) => [t.name, t]));
+    expect(by.revert_version.description).toBe(DESCRIPTION_OVERRIDES.revert_version);
+    expect(by.get_raw_data.description).toBe(DESCRIPTION_OVERRIDES.get_raw_data);
+    expect(by.revert_version.inputSchema.properties.force.description).toMatch(/^Leave unset/);
+    expect(by.add_tag.inputSchema.properties.force.description).toMatch(/^Leave unset/);
+    expect(by.get_page.inputSchema.properties.include_deleted.description).toMatch(/Dylan asks about a page he names/);
+    expect(by.withdraw_page_mark.description).toMatch(/placed on purpose/);
+    expect(by.add_tag.description).toBe('Add one tag.');
+    for (const t of tools) expect(JSON.stringify(t.description ?? '')).not.toMatch(/restore_page|include_deleted: true/);
+  });
+  test('the guard\'s own refusals and notes name no restore path', async () => {
+    const m = memStore(pages());
+    await decide('mark_page_for_deletion', { slug: 'notes/old', reason: 'dup' }, m.store, 'default', 'p');
+    const g = await decide('get_page', { slug: 'notes/old' }, m.store, 'default', 'p');
+    const p = await decide('put_page', { slug: 'notes/old', content: 'x' }, m.store, 'default', 'p', ['notes/']);
+    const note = await decide('mark_page_for_deletion', { slug: 'people/jane', reason: 'dup' }, m.store, 'default', 'p');
+    for (const d of [g, p]) expect((d as { message: string }).message).toContain(REMOVED_ON_PURPOSE);
+    expect(JSON.stringify([g, p, note])).not.toMatch(bypass);
   });
 });
 
