@@ -84,7 +84,7 @@ spec:
       create: false
       existingConfigMap: claude-rc-skel-permtest
     podAnnotations:
-      simplesalt.company/restart-epoch: "5"
+      simplesalt.company/restart-epoch: "6"
   postRenderers:
     - kustomize:
         patches:
