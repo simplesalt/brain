@@ -413,9 +413,10 @@ def apply_results(state, now):
             text = open(os.path.join(d, f), encoding="utf-8", errors="replace").read()
             if MARKER not in text:
                 continue
-            m = re.search(r"\[.*\]", text.split(MARKER, 1)[1], re.S)
+            tail = text.split(MARKER, 1)[1]
+            start = tail.find("[")
             try:
-                answers = json.loads(m.group(0)) if m else []
+                answers = json.JSONDecoder().raw_decode(tail[start:])[0] if start >= 0 else []
             except json.JSONDecodeError:
                 answers = []
             for a in answers if isinstance(answers, list) else []:

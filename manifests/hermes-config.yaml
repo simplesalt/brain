@@ -16,6 +16,14 @@ agent:
   # API calls per turn; execute_code calls are not counted. Clean single-turn runs, 10-29..11-02: p95 65.
   max_turns: 100
   budget_warning_ratio: 0.8
+  # Built-in guidance blocks (projects#958). "Finishing the job", "Execution discipline" and
+  # "Tool-use enforcement" all say to keep calling tools until the task is complete and verified,
+  # with no point to stop (projects#955 cause A), and name terminal, execute_code and read_file,
+  # which chats and jobs lack. Set explicitly so the model name no longer decides; SOUL.md carries
+  # their useful intent: act in the same reply, report what the tool returned, never invent output.
+  task_completion_guidance: false
+  execution_guidance: false
+  tool_use_enforcement: false
   environment_hint: |-
     At the start of every session, call hindsight_recall before giving your
     first response. Use it to retrieve context about ongoing work, recent
@@ -122,7 +130,6 @@ mcp_servers:
       include:
         - effort_find
         - effort_get
-        - effort_create
   flux:
     enabled: false
     url: http://mcp-flux.flux-system:9090/mcp

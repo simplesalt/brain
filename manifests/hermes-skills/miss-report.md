@@ -12,6 +12,9 @@ get an accurate report into this chat. A daily review reads every chat and
 counts each report as a definite miss, so the report must be in your reply,
 in the exact format below.
 
+This is the same block you end a reply with when you hit a problem yourself
+("When something goes wrong"); there `Reported by` is `Hermes`.
+
 ## 1. Ask, unless they already said it
 
 If the user's message already says what they expected and what you did

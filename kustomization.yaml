@@ -49,7 +49,6 @@ configMapGenerator:
       - skill-outbound-email.md=manifests/hermes-skills/outbound-email.md
       - skill-hubspot-lookup.md=manifests/hermes-skills/hubspot-lookup.md
       - skill-notion-workspace.md=manifests/hermes-skills/notion-workspace.md
-      - skill-github-projects.md=manifests/hermes-skills/github-projects.md
       - skill-note-capture.md=manifests/hermes-skills/note-capture.md
       - skill-catch-up.md=manifests/hermes-skills/catch-up.md
       - skill-miss-report.md=manifests/hermes-skills/miss-report.md
