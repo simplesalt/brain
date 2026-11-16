@@ -33,6 +33,10 @@ export type Decision =
   | { action: 'answer'; text: string };
 
 const refuse = (code: string, message: string): Decision => ({ action: 'refuse', code, message });
+
+export const REMOVED_ON_PURPOSE = 'A page that was deleted or marked for deletion was removed on purpose: work without it and name it in your answer. Bringing a page back is Dylan\'s call, for a page he names.';
+export const PAGE_NOT_FOUND_HINT = `No page at this slug; check the slug with resolve_slugs or search. ${REMOVED_ON_PURPOSE} A page the task needs that never existed is created as your instructions describe.`;
+export const REVISION_HINT = 'Pass expected_revision set to the revision from the get_page you just read, and leave force unset. On revision_conflict, read the page again, merge, and retry.';
 const str = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : null);
 export const flagKey = (sourceId: string, slug: string) => `${sourceId}\u0000${slug}`;
 
@@ -50,7 +54,7 @@ export async function decide(name: string, args: Record<string, unknown>, store:
     if (include_deleted === true) return { action: 'forward', args: rest, filter: false };
     if (name === 'get_page' && slug && (await store.flagged()).has(flagKey(sourceId, slug))) {
       return refuse('page_flagged_for_deletion',
-        `${slug} is marked for deletion and hidden. Pass include_deleted: true to read it, or withdraw_page_mark to restore it.`);
+        `${slug} is marked for deletion, so it is hidden. ${REMOVED_ON_PURPOSE}`);
     }
     return { action: 'forward', args: rest, filter: true };
   }
@@ -68,7 +72,7 @@ export async function decide(name: string, args: Record<string, unknown>, store:
         `${slug} already exists (${page.bytes} bytes), and put_page would replace all of it. Nothing was written. Change it with edit_page, or, if it really must be replaced completely, call propose_page_replacement with the new content and a reason.`);
     }
     if ((await store.flagged()).has(flagKey(sourceId, slug))) {
-      return refuse('page_flagged_for_deletion', `${slug} is marked for deletion. Withdraw the mark with withdraw_page_mark before writing it again. Nothing was written.`);
+      return refuse('page_flagged_for_deletion', `${slug} is marked for deletion. Nothing was written. ${REMOVED_ON_PURPOSE}`);
     }
     return { action: 'forward' };
   }
@@ -87,8 +91,8 @@ export async function decide(name: string, args: Record<string, unknown>, store:
       text: JSON.stringify({
         status: 'marked', mark_id: id, kind, slug, source_id: sourceId, page_bytes: page.bytes, replaced_earlier_marks: replaced,
         note: kind === 'delete'
-          ? 'The page is now hidden from reads and searches (include_deleted: true still shows it). It is deleted after 6 months unless the mark is withdrawn with withdraw_page_mark.'
-          : 'The page is unchanged. A reviewed job applies the replacement later, only if the page has not changed since; withdraw it with withdraw_page_mark.',
+          ? 'The page is now hidden from reads and searches, and is deleted after 6 months unless the mark is withdrawn.'
+          : 'The page is unchanged. A reviewed job applies the replacement later, only if the page has not changed since.',
       }),
     };
   }
@@ -117,7 +121,48 @@ export function filterFlagged(value: unknown, flagged: Set<string>, defaultSourc
   return value;
 }
 
-const INCLUDE_DELETED = { type: 'boolean', description: 'Also show pages marked for deletion.' };
+const ELSEWHERE = /^Page exists in source '[^']*' — pass [^.]*\.\s*/;
+
+function rewordHint(text: string, code: unknown): string {
+  if (/include_deleted|include-deleted|restore_page|soft-deleted/i.test(text)) {
+    const elsewhere = code === 'page_not_found' ? (text.match(ELSEWHERE)?.[0] ?? '') : '';
+    return elsewhere + (code === 'page_not_found' ? PAGE_NOT_FOUND_HINT : REMOVED_ON_PURPOSE);
+  }
+  if (/\bforce\b/.test(text)) return REVISION_HINT;
+  return text;
+}
+
+export function rewordError(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const out: Record<string, unknown> = { ...(value as Record<string, unknown>) };
+  const code = out.code ?? out.error;
+  for (const k of ['suggestion', 'hint']) {
+    if (typeof out[k] === 'string') out[k] = rewordHint(out[k] as string, code);
+  }
+  if (out.fix !== undefined && /include_deleted|include-deleted|restore_page|"force"|--force/.test(JSON.stringify(out.fix))) delete out.fix;
+  return out;
+}
+
+const INCLUDE_DELETED = { type: 'boolean', description: 'Also show pages marked for deletion, for when Dylan asks about a page he names. They were marked on purpose.' };
+const FORCE = 'Leave unset: a write passes expected_revision from the page just read.';
+
+export const DESCRIPTION_OVERRIDES: Record<string, string> = {
+  revert_version: 'Restore a page to an earlier version from its history (a new revision; history is kept). For when Dylan asks to undo a change on a page he names: a change someone else made was made on purpose. On a revision conflict: re-read the page with get_page and resubmit with its revision.',
+  get_raw_data: 'Retrieve raw data for a page. A deleted page returns [] exactly like a missing page; it was deleted on purpose.',
+};
+
+export function rewordToolDef(t: any): any {
+  if (!t || typeof t !== 'object') return t;
+  let out = DESCRIPTION_OVERRIDES[t.name] ? { ...t, description: DESCRIPTION_OVERRIDES[t.name] } : t;
+  const props = out.inputSchema?.properties;
+  if (props && typeof props === 'object') {
+    const next: Record<string, unknown> = { ...props };
+    if (next.force && typeof next.force === 'object') next.force = { ...(next.force as object), description: FORCE };
+    if ((FILTERED_READ_TOOLS as readonly string[]).includes(out.name)) next.include_deleted = INCLUDE_DELETED;
+    out = { ...out, inputSchema: { ...out.inputSchema, properties: next } };
+  }
+  return out;
+}
 
 export const GUARD_TOOL_DEFS = [
   {
@@ -149,7 +194,7 @@ export const GUARD_TOOL_DEFS = [
   },
   {
     name: 'withdraw_page_mark',
-    description: 'Withdraw every open deletion mark or replacement proposal on a page; a page hidden for deletion becomes visible again.',
+    description: 'Withdraw every open deletion mark or replacement proposal on a page; a page hidden for deletion becomes visible again. For when Dylan asks to keep or bring back a page he names: a mark someone else placed was placed on purpose.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -317,8 +362,10 @@ export function makeGuardHandler(store: GuardStore, opts: GuardOpts) {
       const filtered = new Set<string>(FILTERED_READ_TOOLS);
       parsed.result.tools = [
         ...parsed.result.tools.filter((t: any) => !hidden.has(t?.name)).map((t: any) => {
-          if (!filtered.has(t?.name) || !t.inputSchema || typeof t.inputSchema !== 'object') return t;
-          return { ...t, inputSchema: { ...t.inputSchema, properties: { ...(t.inputSchema.properties ?? {}), include_deleted: INCLUDE_DELETED } } };
+          if (filtered.has(t?.name) && t.inputSchema && typeof t.inputSchema === 'object' && !t.inputSchema.properties) {
+            t = { ...t, inputSchema: { ...t.inputSchema, properties: {} } };
+          }
+          return rewordToolDef(t);
         }),
         ...GUARD_TOOL_DEFS,
       ];
@@ -349,23 +396,24 @@ export function makeGuardHandler(store: GuardStore, opts: GuardOpts) {
     }
 
     const outBody = d.args ? JSON.stringify({ ...msg, params: { ...msg.params, arguments: d.args } }) : text;
-    if (!d.filter) return forward(req, outBody);
 
-    const flagged = await store.flagged();
+    const flagged = d.filter ? await store.flagged() : new Set<string>();
     const res = await doFetch(opts.upstream, { method: 'POST', headers: passHeaders(req), body: outBody });
     const raw = await res.text();
     const parsed = res.ok ? parseRpcBody(raw) : null;
     const t = toolText(parsed);
-    if (!parsed || t === null || flagged.size === 0) {
+    const isError = parsed?.result?.isError === true;
+    if (!parsed || t === null || (!isError && flagged.size === 0)) {
       return new Response(raw, { status: res.status, headers: { 'content-type': res.headers.get('content-type') ?? 'application/json', ...extra } });
     }
+    const rewrite = (v: unknown) => (isError ? rewordError(v) : filterFlagged(v, flagged, opts.defaultSource));
     parsed.result.content = parsed.result.content.map((c: any) => {
       if (typeof c?.text !== 'string') return c;
       let inner: unknown;
-      try { inner = JSON.parse(c.text); } catch { return c; }
-      return { ...c, text: JSON.stringify(filterFlagged(inner, flagged, opts.defaultSource)) };
+      try { inner = JSON.parse(c.text); } catch { return isError ? { ...c, text: rewordHint(c.text, null) } : c; }
+      return { ...c, text: JSON.stringify(rewrite(inner)) };
     });
-    if (parsed.result.structuredContent !== undefined) parsed.result.structuredContent = filterFlagged(parsed.result.structuredContent, flagged, opts.defaultSource);
+    if (parsed.result.structuredContent !== undefined) parsed.result.structuredContent = rewrite(parsed.result.structuredContent);
     return rpcLike(parsed, res.headers.get('content-type'), extra);
   };
 }
