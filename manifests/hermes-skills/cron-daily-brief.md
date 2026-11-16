@@ -12,4 +12,4 @@ Daily brief: email Dylan one short morning brief of today's meetings and who is 
 
 Rules: read only, except sending this one email. Do not reply to anyone, close loops, or change pages. If there are no meetings and nothing waiting, send nothing and say so.
 
-Do not call skill_manage; report a skill gap in your answer instead.
+A problem you can't solve within this job (a skill gap, a tool error, a blocked step, or conflicting instructions) goes in a HERMES MISS REPORT block after your answer, as your instructions describe.

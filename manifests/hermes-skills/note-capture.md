@@ -106,8 +106,10 @@ Then link each settled person, company, project or meeting:
 naming what the note says about them. For each action item owned by or owed to a
 known person, also `mcp__gbrain__add_timeline_entry` on that person's page
 (`{"slug": <person>, "date": <note date>, "summary": "<owner> → <task> (due ...)",
-"source": <note slug>}`), so it shows up in their history. Never create a new person or
-company page from a note alone; an unmatched name stays an open question.
+"source": <note slug>}`), so it shows up in their history. A person or company the
+note identifies (a full name, or a name with their company) and gbrain has no page
+for is saved as AGENTS.md describes ("Saving a person who works at a company"). A
+name that could be several people, or only a first name, stays an open question.
 
 Close with one line: what was filed and where, how many action items it tracks,
 and how many questions are still open.

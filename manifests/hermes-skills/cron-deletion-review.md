@@ -19,4 +19,4 @@ Answer with a line reading exactly `DELETION-REVIEW-RESULT`, then a JSON list wi
 ]
 ```
 
-Do not call skill_manage; report a skill gap in your answer instead.
+A problem you can't solve within this job (a skill gap, a tool error, a blocked step, or conflicting instructions) goes in a HERMES MISS REPORT block after your answer, as your instructions describe.

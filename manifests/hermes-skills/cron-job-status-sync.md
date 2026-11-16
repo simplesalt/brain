@@ -21,7 +21,7 @@ For every item, in order:
 4. Matched: a stage only moves forward in the stage order, except Closed, which applies from any stage. If the new stage is later than the row's Stage, or is Closed, set it with `mcp_notion_API_patch_page` (`{"page_id": "<row id>", "properties": {"Stage": {"select": {"name": "<stage>"}}}}`); otherwise leave Stage as it is (outcome `unchanged`). Either way, add a note to the row's page: read it with `mcp_notion_API_retrieve_page_markdown`, then with `mcp_notion_API_update_page_markdown` add the line `- <email date> · <stage set, or "no change"> · <under 15 words on what the email said> · [email](<the email's Gmail link from the gbrain page's Source line>)` under a `## Email updates` heading (add the heading at the end of the page if it is missing, newest line first).
 5. Unmatched: add it to the Notion page titled "Unmatched job emails". Find it with `mcp_notion_API_post_search` (`page` filter). If it does not exist, create it with `mcp_notion_API_post_page` under the page that holds the Jobs database (the `parent` of `mcp_notion_API_retrieve_a_data_source`'s database; use `mcp_notion_API_retrieve_a_page` on that database ID's parent if needed), with the body line `Job emails Hermes could not match to a row in Jobs. Newest first.` Then insert, right after that line, `- <email date> · <sender> · <subject> · <what it says and the stage it would set> · <why it did not match> · [email](<Gmail link>)`.
 
-Call one tool at a time. Do not email, message or notify anyone, and do not change anything other than Stage and the notes above.
+Make each write in its own call, after the reads it needs; reads that don't depend on each other can go together. Do not email, message or notify anyone, and do not change anything other than Stage and the notes above.
 
 Answer with a line reading exactly `JOB-STATUS-RESULT`, then a JSON list with one object per item:
 
@@ -38,4 +38,4 @@ Answer with a line reading exactly `JOB-STATUS-RESULT`, then a JSON list with on
 ]
 ```
 
-Do not call skill_manage; report a skill gap in your answer instead.
+A problem you can't solve within this job (a skill gap, a tool error, a blocked step, or conflicting instructions) goes in a HERMES MISS REPORT block after your answer, as your instructions describe.

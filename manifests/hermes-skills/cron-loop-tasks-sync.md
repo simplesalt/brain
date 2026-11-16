@@ -12,7 +12,7 @@ For every item, in order:
 4. Not settled: with `mcp_notion_API_patch_page` on the row, set `Sync note` to under 40 words saying why the loop still looks open (what is still owed and to whom), and set `Status` back to `In progress`. Do not close the loop.
 5. If you cannot tell, treat it as not settled.
 
-Call one tool at a time. Change only `Status`, `Resolution` and `Sync note` on these rows, and only loops through `mail_loops_close`. Do not email, message or notify anyone, and do not create or delete rows.
+Make each write in its own call, after the reads it needs; reads that don't depend on each other can go together. Change only `Status`, `Resolution` and `Sync note` on these rows, and only loops through `mail_loops_close`. Do not email, message or notify anyone, and do not create or delete rows.
 
 Answer with a line reading exactly `LOOP-TASKS-RESULT`, then a JSON list with one object per item:
 
@@ -26,4 +26,4 @@ Answer with a line reading exactly `LOOP-TASKS-RESULT`, then a JSON list with on
 ]
 ```
 
-Do not call skill_manage; report a skill gap in your answer instead.
+A problem you can't solve within this job (a skill gap, a tool error, a blocked step, or conflicting instructions) goes in a HERMES MISS REPORT block after your answer, as your instructions describe.

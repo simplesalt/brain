@@ -8,7 +8,7 @@ The script output above lists meetings and email threads from gbrain as JSON. Yo
 2. For each address in its `people`, decide whether it is a real person Dylan deals with: a colleague, client, prospect, partner, investor, or someone he met, wrote to, or answered. Leave out cold sales pitches he never answered or only answered to unsubscribe or say no, bulk or transactional mail from companies, shared inboxes, and anyone you cannot tell apart from a namesake.
 3. For each person you keep, check whether gbrain already has them: `mcp__gbrain__search` with their email address, then with their name. Note the slug of a person page whose name and email or company match.
 
-Call one tool at a time. Do not write, tag or change anything, do not search the web, and do not send any message.
+Reads that don't depend on each other can go together. Do not write, tag or change anything, do not search the web, and do not send any message.
 
 Answer with a line reading exactly `PEOPLE-SCAN-RESULT`, then a JSON list with one object per person you kept (an empty list if none):
 
@@ -29,4 +29,4 @@ Answer with a line reading exactly `PEOPLE-SCAN-RESULT`, then a JSON list with o
 ]
 ```
 
-Do not call skill_manage; report a skill gap in your answer instead.
+A problem you can't solve within this job (a skill gap, a tool error, a blocked step, or conflicting instructions) goes in a HERMES MISS REPORT block after your answer, as your instructions describe.
