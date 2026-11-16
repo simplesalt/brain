@@ -84,4 +84,14 @@ spec:
       create: false
       existingConfigMap: claude-rc-skel-permtest
     podAnnotations:
-      simplesalt.company/restart-epoch: "4"
+      simplesalt.company/restart-epoch: "5"
+  postRenderers:
+    - kustomize:
+        patches:
+          - target:
+              kind: Deployment
+              name: ssint-build-brain-permtest
+            patch: |
+              - op: add
+                path: /spec/template/spec/hostname
+                value: ssint-build-brain-permtest
