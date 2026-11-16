@@ -53,6 +53,12 @@ agent:
     - feishu_drive
     - spotify
     - connections
+platform_hints:
+  cron:
+    replace: >-
+      You are running as a scheduled job. No one is present to answer questions:
+      take the most likely reading and say which one you took. Your final response
+      is delivered to the job's destination, so put the job's answer directly in it.
 # Hard-stop repeated failing calls in chats too: Hermes counts api_server as attended, so by
 # default only cron stops (projects#857).
 tool_loop_guardrails:
