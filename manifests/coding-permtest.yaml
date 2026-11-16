@@ -84,7 +84,7 @@ spec:
       create: false
       existingConfigMap: claude-rc-skel-permtest
     podAnnotations:
-      simplesalt.company/restart-epoch: "6"
+      simplesalt.company/restart-epoch: "7"
   postRenderers:
     - kustomize:
         patches:
@@ -95,3 +95,31 @@ spec:
               - op: add
                 path: /spec/template/spec/hostname
                 value: ssint-build-brain-permtest
+              - op: add
+                path: /spec/template/spec/volumes/-
+                value:
+                  name: claude-projects
+                  persistentVolumeClaim:
+                    claimName: ssint-build-brain-permtest-projects
+              - op: add
+                path: /spec/template/spec/containers/0/volumeMounts/-
+                value:
+                  name: claude-projects
+                  mountPath: /home/coder/.claude/projects
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ssint-build-brain-permtest-projects
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
