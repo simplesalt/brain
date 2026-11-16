@@ -1,0 +1,86 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: claude-rc-skel-permtest
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+data:
+  claude.json.tmpl: |
+    {
+      "mcpServers": {
+        "flux": {
+          "type": "http",
+          "url": "http://mcp-flux.flux-system:9090/mcp"
+        },
+        "cloudflare": {
+          "type": "http",
+          "url": "https://mcp.cloudflare.com/mcp",
+          "headers": {
+            "Authorization": "Bearer ${CLOUDFLARE_API_TOKEN}"
+          }
+        }
+      },
+      "projects": {
+        "/home/coder/repo/.claude/worktrees": {
+          "hasTrustDialogAccepted": true
+        }
+      }
+    }
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: build-brain-permtest
+  namespace: flux-system
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: builder
+      version: "0.46.2"
+      sourceRef:
+        kind: HelmRepository
+        name: simplesalt-charts
+        namespace: flux-system
+  targetNamespace: ssint-main-coding
+  install:
+    createNamespace: false
+    timeout: 10m
+    remediation:
+      retries: 3
+    disableWait: true
+  upgrade:
+    timeout: 10m
+    remediation:
+      retries: 3
+    disableWait: true
+  values:
+    instanceId: permtest
+    repo:
+      slug: brain
+      ref: main
+    oauthSecret:
+      create: true
+    resources:
+      builder:
+        requests:
+          memory: 512Mi
+    hindsight:
+      bankId: ssint-build-brain
+    extraEnv:
+      - name: HINDSIGHT_AUTO_RETAIN
+        value: "false"
+    skelOverride:
+      enabled: true
+      create: false
+      existingConfigMap: claude-rc-skel-permtest
+    podAnnotations:
+      simplesalt.company/restart-epoch: "1"
