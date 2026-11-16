@@ -1,0 +1,581 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-replay-arg-probe-script
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+data:
+  probe.py: |
+    import concurrent.futures, json, os, sys, threading, urllib.request
+    sys.path.insert(0, '/opt/hermes')
+    from tools.mcp_tool_schema import _normalize_mcp_input_schema, mcp_prefixed_tool_name
+    from tools.schema_sanitizer import sanitize_tool_schemas
+
+    KEY = os.environ['OPENROUTER_API_KEY']
+    MODEL = os.environ.get('PROBE_MODEL', '@preset/live-reasoning')
+    TRIALS = int(os.environ.get('PROBE_TRIALS', '3'))
+    HOSTS = os.environ['PROBE_HOSTS'].split(',')
+    POINTS = [int(x) for x in os.environ['PROBE_POINTS'].split(',')]
+    SID = os.environ['PROBE_SESSION']
+    CHATS = os.environ.get('CHATS_URL', 'http://hermes-chats:8080')
+    lock = threading.Lock()
+
+    def emit(obj):
+        with lock:
+            print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+    def get(url):
+        with urllib.request.urlopen(url, timeout=60) as r:
+            return json.loads(r.read())
+
+    def mcp_tools(url, token=None):
+        hdr = {'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'}
+        if token:
+            hdr['Authorization'] = 'Bearer ' + token
+        def rpc(body, sid=None):
+            h = dict(hdr)
+            if sid:
+                h['Mcp-Session-Id'] = sid
+            req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=h, method='POST')
+            with urllib.request.urlopen(req, timeout=30) as r:
+                sid = r.headers.get('Mcp-Session-Id') or sid
+                raw = r.read().decode()
+            for line in raw.splitlines():
+                if line.startswith('data:'):
+                    raw = line[5:].strip()
+            return (json.loads(raw) if raw.strip() else None), sid
+        _, sid = rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+            'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'replay-arg-probe', 'version': '1'}}})
+        rpc({'jsonrpc': '2.0', 'method': 'notifications/initialized'}, sid)
+        res, _ = rpc({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}, sid)
+        return {t['name']: t for t in res['result']['tools']}
+
+    GB_INCLUDE = ['search', 'query', 'get_page', 'put_page', 'edit_page', 'append_page', 'list_pages', 'get_timeline',
+                  'chronicle_day', 'add_timeline_entry', 'get_raw_data', 'sources_list', 'add_tag', 'remove_tag', 'get_tags',
+                  'add_link', 'get_backlinks', 'open_loops', 'find_experts', 'resolve_slugs', 'capture',
+                  'mark_page_for_deletion', 'propose_page_replacement', 'withdraw_page_mark', 'get_versions', 'revert_version']
+    raw = []
+    gb = mcp_tools(os.environ['GBRAIN_URL'], os.environ['GBRAIN_REMOTE_TOKEN'])
+    raw += [('gbrain', n, gb[n]['description'], gb[n]['inputSchema']) for n in GB_INCLUDE if n in gb]
+    fixed = json.load(open('/probe/fixed-tools.json'))
+    raw += [('notion', n, t['description'], t['inputSchema']) for n, t in fixed['notion'].items()]
+    raw += [('efforts', n, t['description'], t['inputSchema']) for n, t in fixed['efforts'].items()]
+    try:
+        hm = mcp_tools(os.environ['HERMES_MSG_URL'])
+        raw += [('hermes-msg', n, t.get('description') or '', t['inputSchema']) for n, t in hm.items()]
+    except Exception as e:
+        emit({'kind': 'note', 'hermes_msg_tools': 'unavailable: ' + repr(e)[:200]})
+    TOOLS = sanitize_tool_schemas([{'type': 'function', 'function': {
+        'name': mcp_prefixed_tool_name(srv, n), 'description': d, 'parameters': _normalize_mcp_input_schema(s)}}
+        for srv, n, d, s in raw])
+    emit({'kind': 'tools', 'count': len(TOOLS), 'names': [t['function']['name'] for t in TOOLS]})
+    SYSTEM = open('/probe/SOUL.md').read() + '\n\n' + open('/probe/AGENTS.md').read()
+
+    sess = get(f'{CHATS}/sessions/{SID}')
+    ids = sorted(int(m['msg_id']) for m in sess['messages'])
+    def fetch(i):
+        return i, json.loads(get(f'{CHATS}/messages/{SID}/{i}?part=all&limit=1000000')['text'])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        MSGS = dict(ex.map(fetch, [i for i in ids if i < max(POINTS)]))
+
+    def history(n):
+        out, pending = [], set()
+        for i in sorted(MSGS):
+            if i >= n:
+                break
+            m = MSGS[i]
+            role = m.get('role')
+            if role == 'user':
+                out.append({'role': 'user', 'content': m.get('content') or ''})
+            elif role == 'assistant':
+                a = {'role': 'assistant', 'content': m.get('content') or ''}
+                tcs = m.get('tool_calls')
+                tcs = json.loads(tcs) if isinstance(tcs, str) else (tcs or [])
+                if tcs:
+                    a['tool_calls'] = [{'id': t['id'], 'type': 'function', 'function': {
+                        'name': t['function']['name'], 'arguments': t['function'].get('arguments') or '{}'}} for t in tcs]
+                    pending = {t['id'] for t in tcs}
+                r = m.get('reasoning') or m.get('reasoning_content')
+                if r:
+                    a['reasoning'] = r
+                out.append(a)
+            elif role == 'tool':
+                if m.get('tool_call_id') in pending:
+                    out.append({'role': 'tool', 'tool_call_id': m['tool_call_id'], 'content': m.get('content') or ''})
+                    pending.discard(m['tool_call_id'])
+        fixed_out, i = [], 0
+        while i < len(out):
+            m = out[i]
+            if m['role'] == 'assistant' and m.get('tool_calls'):
+                j = i + 1
+                got = set()
+                while j < len(out) and out[j]['role'] == 'tool':
+                    got.add(out[j]['tool_call_id'])
+                    j += 1
+                m = dict(m)
+                m['tool_calls'] = [t for t in m['tool_calls'] if t['id'] in got]
+                if not m['tool_calls']:
+                    m.pop('tool_calls')
+                fixed_out.append(m)
+                fixed_out.extend(out[i + 1:j])
+                i = j
+                continue
+            fixed_out.append(m)
+            i += 1
+        return [{'role': 'system', 'content': SYSTEM}] + fixed_out
+
+    def original(n):
+        m = MSGS.get(n) or json.loads(get(f'{CHATS}/messages/{SID}/{n}?part=all&limit=1000000')['text'])
+        tcs = m.get('tool_calls')
+        tcs = json.loads(tcs) if isinstance(tcs, str) else (tcs or [])
+        return [{'name': t['function']['name'], 'arguments': t['function'].get('arguments')} for t in tcs]
+
+    def flags(n, name, args):
+        f = []
+        if name == 'mcp__gbrain__query' and not (args.get('query') or args.get('image')):
+            f.append('LOST:query')
+        if name == 'mcp__efforts__effort_find' and not (args.get('why') or args.get('what') or args.get('where')):
+            f.append('LOST:why/what/where')
+        if name == 'mcp__gbrain__add_link' and not args.get('link_type'):
+            f.append('LOST:link_type')
+        if name == 'mcp__gbrain__chronicle_day' and n == 150 and 'week' not in args:
+            f.append('LOST:week' + ('(narrative instead)' if 'narrative' in args else ''))
+        if name == 'mcp__notion__API_query_data_source' and args.get('filter') == {}:
+            f.append('LOST:filter')
+        if name == 'mcp__notion__API_post_search' and not args.get('query') and n == 65:
+            f.append('LOST:query')
+        if name.startswith('mcp__notion__') and args.get('archived') is False:
+            f.append('EXTRA:archived=false')
+        return f
+
+    def stream(body):
+        req = urllib.request.Request('https://openrouter.ai/api/v1/chat/completions', method='POST',
+                                     data=json.dumps(body).encode())
+        req.add_header('Authorization', 'Bearer ' + KEY)
+        req.add_header('Content-Type', 'application/json')
+        out = {'provider': None, 'finish_reason': None, 'reasoning': '', 'content': '', 'calls': {}, 'id': None, 'usage': None}
+        try:
+            with urllib.request.urlopen(req, timeout=900) as r:
+                for line in r:
+                    line = line.decode().strip()
+                    if not line.startswith('data:') or line == 'data: [DONE]':
+                        continue
+                    c = json.loads(line[5:])
+                    if c.get('error'):
+                        out['error'] = str(c['error'])[:400]
+                        continue
+                    out['provider'] = c.get('provider') or out['provider']
+                    out['id'] = c.get('id') or out['id']
+                    out['usage'] = c.get('usage') or out['usage']
+                    for ch in c.get('choices') or []:
+                        d = ch.get('delta') or {}
+                        out['reasoning'] += d.get('reasoning') or ''
+                        out['content'] += d.get('content') or ''
+                        for tc in d.get('tool_calls') or []:
+                            e = out['calls'].setdefault(tc.get('index', 0), {'name': '', 'arguments': ''})
+                            fn = tc.get('function') or {}
+                            if fn.get('name'):
+                                e['name'] = fn['name']
+                            e['arguments'] += fn.get('arguments') or ''
+                        out['finish_reason'] = ch.get('finish_reason') or out['finish_reason']
+        except urllib.error.HTTPError as e:
+            out['error'] = f'HTTP {e.code}: {e.read().decode()[:400]}'
+        except Exception as e:
+            out['error'] = repr(e)[:400]
+        return out
+
+    HIST = {n: history(n) for n in POINTS}
+    for n in POINTS:
+        emit({'kind': 'point', 'msg': n, 'history_messages': len(HIST[n]), 'history_chars': len(json.dumps(HIST[n])),
+              'original_calls': original(n)})
+
+    NOTION = {
+        'notion_query': [{'role': 'system', 'content': 'You are Hermes, an assistant with tools. Do exactly what the user asks: make the one tool call with exactly the arguments given, then stop. Do not add other arguments.'},
+                         {'role': 'user', 'content': 'Call mcp__notion__API_query_data_source once with data_source_id "212e6a5b-9779-813d-9db3-000be6a116cc", filter {"property": "Status", "status": {"does_not_equal": "Done"}}, filter_properties ["title", "Status"] and page_size 25.'}],
+        'notion_search': [{'role': 'system', 'content': 'You are Hermes, an assistant with tools. Do exactly what the user asks: make the one tool call with exactly the arguments given, then stop. Do not add other arguments.'},
+                          {'role': 'user', 'content': 'Call mcp__notion__API_post_search once with query "Tasks", filter {"property": "object", "value": "data_source"} and page_size 10.'}],
+    }
+
+    def nflags(case, name, a):
+        f = []
+        if case == 'notion_query' and name == 'mcp__notion__API_query_data_source':
+            if a.get('filter') in ({}, None, ''):
+                f.append('LOST:filter')
+            if not a.get('filter_properties'):
+                f.append('LOST:filter_properties')
+        if case == 'notion_search' and name == 'mcp__notion__API_post_search':
+            flt = a.get('filter')
+            flt = json.loads(flt) if isinstance(flt, str) and flt.strip().startswith('{') else flt
+            if not isinstance(flt, dict) or flt.get('value') != 'data_source':
+                f.append('CHANGED:filter')
+        if name.startswith('mcp__notion__') and a.get('archived') is False:
+            f.append('EXTRA:archived=false')
+        return f
+
+    def route(spec):
+        kind, _, val = spec.partition(':')
+        return {'only': [val], 'allow_fallbacks': False} if kind == 'only' else {'ignore': [val]}
+
+    def run(host, n, trial):
+        msgs = NOTION[n] if isinstance(n, str) else HIST[n]
+        body = {'model': MODEL, 'stream': True, 'tools': TOOLS, 'messages': msgs, 'provider': route(host)}
+        r = stream(body)
+        calls = [r['calls'][i] for i in sorted(r['calls'])]
+        judged = []
+        for c in calls:
+            try:
+                a = json.loads(c['arguments'] or '{}')
+                fl = nflags(n, c['name'], a) if isinstance(n, str) else flags(n, c['name'], a)
+                judged.append({'name': c['name'], 'arguments': c['arguments'], 'flags': fl})
+            except Exception:
+                judged.append({'name': c['name'], 'arguments': c['arguments'], 'flags': ['BAD_JSON']})
+        rec = {'kind': 'call', 'host': host, 'msg': n, 'trial': trial, 'provider': r['provider'], 'gen_id': r['id'],
+               'finish_reason': r['finish_reason'], 'error': r.get('error'), 'usage': r['usage'], 'calls': judged,
+               'flagged': sorted({f for j in judged for f in j['flags']}),
+               'reasoning_tail': r['reasoning'][-1500:], 'content_head': r['content'][:300]}
+        emit(rec)
+        return rec
+
+    jobs = [(h, n, t) for h in HOSTS for n in POINTS + list(NOTION) for t in range(TRIALS)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=int(os.environ.get('PROBE_WORKERS', '6'))) as ex:
+        results = list(ex.map(lambda a: run(*a), jobs))
+    summary = {}
+    for r in results:
+        s = summary.setdefault(r['host'], {'requests': 0, 'errors': 0, 'calls': 0, 'flagged_calls': 0, 'flags': {}})
+        s['requests'] += 1
+        s.setdefault('served_by', {})
+        s['served_by'][str(r['provider'])] = s['served_by'].get(str(r['provider']), 0) + 1
+        s['errors'] += 1 if r['error'] and not r['calls'] else 0
+        for c in r['calls']:
+            s['calls'] += 1
+            s['flagged_calls'] += 1 if c['flags'] else 0
+            for f in c['flags']:
+                s['flags'][f'{r["msg"]}:{f}'] = s['flags'].get(f'{r["msg"]}:{f}', 0) + 1
+    emit({'kind': 'summary', 'per_host': summary})
+    print('== probe done', flush=True)
+  fixed-tools.json: |-
+    {"notion":{"API-get-users":{"description":"Notion | List all users","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"start_cursor":{"type":"string","description":"If supplied, this endpoint will return a page of results starting after the cursor provided. If not supplied, this endpoint will return the first page of results."},"page_size":{"type":"integer","default":100,"description":"The number of items from the full list desired in the response. Maximum: 100"}},"required":[]}},"API-post-search":{"description":"Notion | Search by title","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"query":{"type":"string","description":"The text that the API compares page and database titles against."},"sort":{"anyOf":[{"type":"object","description":"A set of criteria, `direction` and `timestamp` keys, that orders the results. The **only** supported timestamp value is `\"last_edited_time\"`. Supported `direction` values are `\"ascending\"` and `\"descending\"`. If `sort` is not provided, then the most recently edited results are returned first.","properties":{"direction":{"type":"string","description":"The direction to sort. Possible values include `ascending` and `descending`."},"timestamp":{"type":"string","description":"The name of the timestamp to sort against. Possible values include `last_edited_time`."}},"additionalProperties":true},{"type":"string"}]},"filter":{"anyOf":[{"type":"object","description":"A set of criteria, `value` and `property` keys, that limits the results to either only pages or only data sources. Possible `value` values are `\"page\"` or `\"data_source\"`. The only supported `property` value is `\"object\"`.","properties":{"value":{"type":"string","description":"The value of the property to filter the results by.  Possible values for object type include `page` or `data_source`.  **Limitation**: Currently the only filter allowed is `object` which will filter by type of object (either `page` or `data_source`)","enum":["page","data_source"]},"property":{"type":"string","description":"The name of the property to filter by. Currently the only property you can filter by is the object type.  Possible values include `object`.   Limitation: Currently the only filter allowed is `object` which will filter by type of object (either `page` or `data_source`)"}},"additionalProperties":true},{"type":"string"}]},"start_cursor":{"type":"string","description":"A `cursor` value returned in a previous response that If supplied, limits the response to results starting after the `cursor`. If not supplied, then the first page of results is returned. Refer to [pagination](https://developers.notion.com/reference/intro#pagination) for more details."},"page_size":{"type":"integer","format":"int32","description":"The number of items from the full list to include in the response. Maximum: `100`.","default":100}},"required":[]}},"API-get-block-children":{"description":"Notion | Retrieve block children","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"block_id":{"type":"string","description":"Identifier for a [block](ref:block)"},"start_cursor":{"type":"string","description":"If supplied, this endpoint will return a page of results starting after the cursor provided. If not supplied, this endpoint will return the first page of results."},"page_size":{"type":"integer","format":"int32","default":100,"description":"The number of items from the full list desired in the response. Maximum: 100"}},"required":["block_id"]}},"API-patch-block-children":{"description":"Notion | Append block children","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"block_id":{"type":"string","description":"Identifier for a [block](ref:block). Also accepts a [page](ref:page) ID."},"children":{"type":"array","description":"Child content to append to a container block as an array of [block objects](ref:block)","items":{"anyOf":[{"$ref":"#/$defs/blockObjectRequest"},{"type":"string"},{"type":"object","additionalProperties":true}]}},"after":{"type":"string","description":"The ID of the existing block that the new block should be appended after."}},"required":["block_id","children"]}},"API-update-a-block":{"description":"Notion | Update a block","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"block_id":{"type":"string","description":"Identifier for a Notion block"},"type":{"anyOf":[{"type":"object","description":"The [block object `type`](ref:block#block-object-keys) value with the properties to be updated. Currently only `text` (for supported block types) and `checked` (for `to_do` blocks) fields can be updated.","additionalProperties":true},{"type":"string"}]},"archived":{"type":"boolean","description":"Set to true to archive (delete) a block. Set to false to un-archive (restore) a block.","default":true}},"required":["block_id"]}},"API-delete-a-block":{"description":"Notion | Delete a block","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"block_id":{"type":"string","description":"Identifier for a Notion block"}},"required":["block_id"]}},"API-retrieve-a-page":{"description":"Notion | Retrieve a page","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"page_id":{"type":"string","description":"Identifier for a Notion page"},"filter_properties":{"type":"string","description":"A list of page property value IDs associated with the page. Use this param to limit the response to a specific page property value or values. To retrieve multiple properties, specify each page property ID. For example: `?filter_properties=iAk8&filter_properties=b7dh`."}},"required":["page_id"]}},"API-patch-page":{"description":"Notion | Update page properties","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"page_id":{"type":"string","description":"The identifier for the Notion page to be updated."},"properties":{"anyOf":[{"type":"object","description":"The property values to update for the page. The keys are the names or IDs of the property and the values are property values. If a page property ID is not included, then it is not changed.","additionalProperties":true},{"type":"string"}]},"in_trash":{"type":"boolean","description":"Set to true to delete a block. Set to false to restore a block.","default":false},"archived":{"type":"boolean"},"icon":{"anyOf":[{"type":"object","description":"A page icon for the page. Supported types are [external file object](https://developers.notion.com/reference/file-object) or [emoji object](https://developers.notion.com/reference/emoji-object).","properties":{"emoji":{"type":"string"}},"required":["emoji"],"additionalProperties":false},{"type":"string"}]},"cover":{"anyOf":[{"type":"object","description":"A cover image for the page. Only [external file objects](https://developers.notion.com/reference/file-object) are supported.","properties":{"external":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"],"additionalProperties":false},"type":{"type":"string","enum":["external"]}},"required":["external"],"additionalProperties":false},{"type":"string"}]}},"required":["page_id"]}},"API-post-page":{"description":"Notion | Create a page","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"parent":{"anyOf":[{"$ref":"#/$defs/parentRequest"},{"type":"string"}]},"properties":{"anyOf":[{"type":"object","description":"The property values for the new page. The keys are the names or IDs of the property and the values are property values.","additionalProperties":true},{"type":"string"}]},"children":{"type":"array","description":"The content to be rendered on the new page, represented as an array of [block objects](https://developers.notion.com/reference/block).","items":{"anyOf":[{"type":"string"},{"type":"string"},{"type":"object","additionalProperties":true}]}},"icon":{"type":"string","format":"json","description":"The icon of the new page. Either an [emoji object](https://developers.notion.com/reference/emoji-object) or an [external file object](https://developers.notion.com/reference/file-object).."},"cover":{"type":"string","format":"json","description":"The cover image of the new page, represented as a [file object](https://developers.notion.com/reference/file-object)."}},"required":["parent","properties"]}},"API-create-a-comment":{"description":"Notion | Create comment","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"parent":{"anyOf":[{"type":"object","description":"The page that contains the comment","properties":{"page_id":{"type":"string","description":"the page ID"}},"required":["page_id"],"additionalProperties":true},{"type":"string"}]},"rich_text":{"type":"array","items":{"anyOf":[{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string","description":"The content of the comment"}},"required":["content"],"additionalProperties":true}},"required":["text"],"additionalProperties":true},{"type":"string"},{"type":"object","additionalProperties":true}]}}},"required":["parent","rich_text"]}},"API-query-data-source":{"description":"Notion | Query a data source","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"data_source_id":{"type":"string","description":"Identifier for a Notion data source (database)"},"filter_properties":{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"string"},{"type":"object","additionalProperties":true}]},"description":"A list of page property value IDs to limit the response"},"filter":{"anyOf":[{"type":"object","description":"Filter conditions for querying the data source","additionalProperties":true},{"type":"string"}]},"sorts":{"type":"array","items":{"anyOf":[{"$ref":"#/$defs/sortObject"},{"type":"string"},{"type":"object","additionalProperties":true}]}},"start_cursor":{"type":"string"},"page_size":{"type":"integer","default":100},"archived":{"type":"boolean"},"in_trash":{"type":"boolean"}},"required":["data_source_id"]}},"API-retrieve-a-data-source":{"description":"Notion | Retrieve a data source","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"data_source_id":{"type":"string","description":"Identifier for a Notion data source"}},"required":["data_source_id"]}},"API-update-a-data-source":{"description":"Notion | Update a data source","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"data_source_id":{"type":"string","description":"Identifier for a Notion data source"},"title":{"type":"array","items":{"anyOf":[{"$ref":"#/$defs/richTextRequest"},{"type":"string"},{"type":"object","additionalProperties":true}]}},"description":{"type":"array","items":{"anyOf":[{"$ref":"#/$defs/richTextRequest"},{"type":"string"},{"type":"object","additionalProperties":true}]}},"properties":{"anyOf":[{"type":"object","description":"Property schema updates","additionalProperties":true},{"type":"string"}]}},"required":["data_source_id"]}},"API-create-a-data-source":{"description":"Notion | Create a data source","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"parent":{"anyOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"type":"string"}]},"properties":{"anyOf":[{"type":"object","description":"Property schema of data source","additionalProperties":true},{"type":"string"}]},"title":{"type":"array","items":{"anyOf":[{"$ref":"#/$defs/richTextRequest"},{"type":"string"},{"type":"object","additionalProperties":true}]}}},"required":["parent","properties"]}},"API-move-page":{"description":"Notion | Move a page","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"page_id":{"type":"string","format":"uuid","description":"Identifier for a Notion page"},"parent":{"anyOf":[{"$ref":"#/$defs/movePageParentRequest"},{"type":"string"}]}},"required":["page_id","parent"]}},"API-retrieve-page-markdown":{"description":"Notion | Retrieve a page as Markdown","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"page_id":{"type":"string","format":"uuid","description":"Identifier for a Notion page (or block) to read or update as markdown."},"include_transcript":{"type":"boolean","default":false,"description":"Whether to include meeting note transcripts. When false (default), a placeholder with the meeting note URL is shown instead of the full transcript."}},"required":["page_id"]}},"API-update-page-markdown":{"description":"Notion | Update a page's content as Markdown","inputSchema":{"$defs":{"richTextRequest":{"type":"object","properties":{"text":{"type":"object","properties":{"content":{"type":"string"},"link":{"type":["object","null"]}},"required":["content"],"additionalProperties":false},"type":{"type":"string","enum":["text"]}},"required":["text"],"additionalProperties":false},"pageIdParentRequest":{"type":"object","properties":{"page_id":{"type":"string","format":"uuid"}},"required":["page_id"],"additionalProperties":true},"dataSourceIdParentRequest":{"type":"object","properties":{"type":{"type":"string","const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["database_id"],"additionalProperties":true},"parentRequest":{"oneOf":[{"$ref":"#/$defs/pageIdParentRequest"},{"$ref":"#/$defs/dataSourceIdParentRequest"},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"movePageParentRequest":{"oneOf":[{"type":"object","properties":{"type":{"const":"page_id"},"page_id":{"type":"string","format":"uuid"}},"required":["type","page_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"database_id"},"database_id":{"type":"string","format":"uuid"}},"required":["type","database_id"],"additionalProperties":true},{"type":"object","properties":{"type":{"const":"workspace"}},"required":["type"],"additionalProperties":true}]},"sortObject":{"type":"object","properties":{"property":{"type":"string"},"direction":{"type":"string","enum":["ascending","descending"]}},"required":["property","direction"],"additionalProperties":true},"paragraphBlockRequest":{"type":"object","properties":{"paragraph":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["paragraph"]}},"additionalProperties":false},"bulletedListItemBlockRequest":{"type":"object","properties":{"bulleted_list_item":{"type":"object","properties":{"rich_text":{"type":"array","items":{"$ref":"#/$defs/richTextRequest"}}},"required":["rich_text"],"additionalProperties":false},"type":{"type":"string","enum":["bulleted_list_item"]}},"additionalProperties":false},"blockObjectRequest":{"anyOf":[{"$ref":"#/$defs/paragraphBlockRequest"},{"$ref":"#/$defs/bulletedListItemBlockRequest"}]}},"type":"object","properties":{"page_id":{"type":"string","format":"uuid","description":"Identifier for a Notion page (or block) to read or update as markdown."},"type":{"type":"string","description":"The kind of edit to apply. Prefer `replace_content` (overwrite the whole page) or `update_content` (targeted find-and-replace). `insert_content` and `replace_content_range` are deprecated.","enum":["replace_content","update_content","insert_content","replace_content_range"]},"replace_content":{"anyOf":[{"type":"object","description":"Provide when type is `replace_content`. Replaces the entire page content.","properties":{"new_str":{"type":"string","description":"The complete new page content as enhanced Markdown."},"allow_deleting_content":{"type":"boolean","description":"Permit deletion of existing child pages/databases that are no longer present in the new content."}},"required":["new_str"],"additionalProperties":true},{"type":"string"}]},"update_content":{"anyOf":[{"type":"object","description":"Provide when type is `update_content`. Applies targeted find-and-replace edits.","properties":{"content_updates":{"type":"array","description":"Up to 100 find-and-replace edits applied in order.","items":{"type":"object","properties":{"old_str":{"type":"string","description":"Exact existing Markdown text to find."},"new_str":{"type":"string","description":"Replacement Markdown text."},"replace_all_matches":{"type":"boolean","description":"Replace every occurrence of old_str instead of just the first (default false)."}},"required":["old_str","new_str"],"additionalProperties":true}},"allow_deleting_content":{"type":"boolean","description":"Permit deletion of existing child pages/databases removed by the edits."}},"required":["content_updates"],"additionalProperties":true},{"type":"string"}]},"insert_content":{"anyOf":[{"type":"object","description":"Deprecated. Provide when type is `insert_content`. Inserts Markdown at a position.","properties":{"content":{"type":"string","description":"Enhanced Markdown to insert."},"after":{"type":"string","description":"Ellipsis-format selection (\"start text...end text\") to insert after. Cannot be combined with position."},"position":{"type":"object","description":"Insert at the start or end of the page. Cannot be combined with after.","properties":{"type":{"type":"string","enum":["start","end"]}},"additionalProperties":true}},"required":["content"],"additionalProperties":true},{"type":"string"}]},"replace_content_range":{"anyOf":[{"type":"object","description":"Deprecated. Provide when type is `replace_content_range`. Replaces a selected range of Markdown.","properties":{"content":{"type":"string","description":"New Markdown content for the range."},"content_range":{"type":"string","description":"Ellipsis-format selection (\"start text...end text\") identifying the range to replace."},"allow_deleting_content":{"type":"boolean","description":"Permit deletion of child pages/databases within the replaced range."}},"required":["content","content_range"],"additionalProperties":true},{"type":"string"}]}},"required":["page_id","type"]}}},"efforts":{"effort_find":{"name":"effort_find","description":"Find open Efforts in simplesalt/projects related to a Why/What/Where (find-effort).","inputSchema":{"type":"object","properties":{"why":{"type":"string"},"what":{"type":"string"},"where":{"type":"string"},"limit":{"type":"integer"}}}},"effort_get":{"name":"effort_get","description":"Read one Effort record: status, assigned, In Use, parent, blockers, body, children (get-effort). Every simplesalt/projects issue is an Effort; one not yet on the board is added on first use (coordinator), or read with on_board false (doer).","inputSchema":{"type":"object","properties":{"ref":{"type":"string","description":"owner/repo#N or #N"}},"required":["ref"]}},"effort_create":{"name":"effort_create","description":"Create an Effort on the board, schema- and gate-checked (create-effort).","inputSchema":{"type":"object","properties":{"title":{"type":"string"},"type":{"type":"string","enum":["Feature","Bug","Analysis","Advisory"]},"assigned":{"type":"string"},"why":{"type":"string"},"what":{"type":"string"},"indicators":{"type":"string"},"where":{"type":"string"},"gaps":{"type":"string"},"facts":{"type":"string"},"unknowns":{"type":"string"},"how":{"type":"string"},"tags":{"type":"string"},"parent":{"type":"string","description":"Parent ref, or \"none\". Omitted = top-level; the most related open Effort, if any, is returned as parent_suggestion and never applied"},"blockers":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["Planning","Deferred"]},"dry_run":{"type":"boolean"}},"required":["title","type","assigned","why","what","indicators","where"]}}}}
+  SOUL.md: |
+    # Identity
+
+    You are Hermes, a project manager and orchestrator. You hold the whole body of
+    work in view — organized, prioritized, retained — and keep the people and agents
+    doing it focused on what matters most. You coordinate; you do not execute. Your
+    value is prioritization, clean delegation, and reliable memory of what was
+    decided and what comes next.
+
+    # Style
+
+    - Lead with what matters: priorities, owners, status, next action. Detail only if asked.
+    - Be concise and structured — a short list of clear items, not prose.
+    - Be direct. Surface risks, blockers, and slipping priorities immediately.
+    - Make the state of work legible; resolve ambiguity rather than hide it.
+
+    # Disposition
+
+    - Delegate execution by default. Hand real work — coding, debugging, diagnosis,
+      content, research — to the right worker, not yourself.
+    - Stay in your lane. Never take over another agent's work. If a delegate fails or
+      stalls, report it plainly and ask how to proceed.
+    - Close loops: track every delegated item, follow up, retain the outcome.
+    - Missing context? Recall it before acting — never assume.
+    - Push back when a request conflicts with stated priorities, then defer to the team.
+
+    # Avoid
+
+    - Doing work yourself when a worker exists for it.
+    - Silently absorbing a blocker — escalate.
+    - Letting decisions or outcomes slip — retain them.
+    - Status dumps that bury the signal — lead with the point.
+    - Inventing confidence — if unsure, say so and find out.
+  AGENTS.md: |
+    # Team
+
+    You support Simple Salt, a cybersecurity firm.
+    <!-- TEAM_ROSTER -->
+
+    ## When a step is blocked
+
+    Think the request through and do the steps with the tools you already have. Example: "tell Patrick I can't make today's meeting and cancel it" means: find the platform you usually message Patrick on, send him the message there, find the invite on the calendar, and cancel it through a calendar tool if you have one.
+
+    If a step needs access you don't have, or the only way forward is to install, write or build a tool, stop and ask the user how they'd like to proceed. In one or two lines, say what you've done, what is in the way, and the options you see.
+
+    # Delegating work
+
+    - You never code. Technical work (coding, debugging, diagnosis, deploys) is not
+      yours to do or delegate — tell the user it needs a coding agent.
+    - Use the skill that fits the work; more skills are added over time.
+    - A message with "#fail", or a user saying plainly that you failed: load the
+      `miss-report` skill first, before anything else in that reply.
+    - Never take over another agent's task. If a delegate fails or is blocked, report
+      it and ask for next steps.
+
+    # Environment
+
+    GitOps k3s+flux cluster, defined in `base-stack`. Other pods provide UIs,
+    persistence, and storage.
+
+    # Tool names
+
+    Your gbrain, Notion, HubSpot and hermes-msg tools are all in your tool list,
+    named `mcp__<server>__<tool>` (e.g. `mcp__gbrain__search`). Call them directly,
+    one call per tool, with every required argument. A skill that spells a tool
+    differently (e.g. `mcp_notion_API_post_search`) means the listed tool with that
+    name.
+
+    # Memory
+
+    - gbrain — your PM memory: retains open conversations, work, engagements, and
+      priorities.
+    - hindsight — your own episodic memory, in the `hermes` bank; auto-injects
+      context. Recall from it when you may be missing context. It is not shared
+      with the coding agents: each coding pod writes to its own bank, named
+      `ssint-<pod-name>` (e.g. `ssint-build-brain`), and only ever two narrow
+      categories (dead ends and durable environment facts).
+
+    Hindsight is your trusted record for decisions, conventions, and project status.
+    Save them there. gbrain holds project knowledge.
+
+    - People and companies live in gbrain. Whenever you learn what a person or
+      company does (from the web, LinkedIn, a note or a chat), add it to their
+      gbrain page in an `## About` section, with a `Source:` line: change the
+      existing page with `mcp__gbrain__edit_page`. Create the page with
+      `mcp__gbrain__put_page` if there is none.
+      This is how Dylan finds people later by what they do; Hindsight alone does
+      not make them findable.
+    - gbrain is your source of truth for CRM work: talking to, reaching out to and
+      responding to people outside Simple Salt. Dylan has given standing consent
+      to save that work to gbrain without asking: people, companies, what was
+      said, promised or decided. Do not wait for a "save this".
+    - After a `put_page` on a person or company, add what the page body cannot
+      carry: `mcp__gbrain__add_link` for relationships (works_at, founded, knows)
+      and `mcp__gbrain__add_timeline_entry` for each dated interaction. `put_page`
+      over MCP does not create links or timeline entries from the text. Never
+      remove the page's existing Timeline section; gbrain refuses a change that
+      would drop timeline entries.
+    - Saving a person who works at a company takes all four steps, every time,
+      even when the company is only named in passing:
+      1. Find the company page: `mcp__gbrain__search` with the company name and
+         `"types": ["company"]`. Use a result only if its title is that company.
+      2. None: create it with `mcp__gbrain__put_page`, slug `companies/<name in
+         lowercase-hyphens>` (e.g. `companies/acme-corp`), content
+         `---\ntype: company\ntitle: <name>\n---\n\n# <name>\n` plus an `## About`
+         section if you know what it does.
+      3. Save the person page (`people/<first-last>`) with `company: <name>` in its
+         frontmatter.
+      4. `mcp__gbrain__add_link` with `{"from": "<person slug>", "to": "<company
+         slug>", "link_type": "works_at", "context": "<their role, if known>"}`.
+         Both pages must exist first, or it fails with page_not_found.
+      Check the `add_link` result; a person saved with a company but no link is
+      not saved.
+    - Every `put_page` on an existing page must pass `expected_revision` set to
+      the `revision` from the `get_page` you just read; without it gbrain refuses
+      with `revision_required`. On `revision_conflict`, read the page again,
+      merge, and retry with a new `request_id`.
+    - Change an existing page in place with `mcp__gbrain__edit_page`: to add
+      text, replace a short passage next to where it goes with that passage plus
+      the new text (`mcp__gbrain__append_page`, when it is in your tool list, adds
+      text at the end). Use `put_page`
+      only to create a page, or when you hold its complete content and mean to
+      replace all of it.
+    - Never rewrite a page from an outline or a window. When `get_page` returns
+      an outline or only part of the body (large pages), do not `put_page` what
+      you got back; use `edit_page`.
+    - To delete a page, call `mcp__gbrain__mark_page_for_deletion` with the slug
+      and a reason: the page is hidden from reads at once and deleted after 6
+      months unless you or Dylan call `mcp__gbrain__withdraw_page_mark`. A page
+      that must be replaced wholesale goes through
+      `mcp__gbrain__propose_page_replacement` (applied after 7 days). Searching
+      hard for something you can't find: pass `include_deleted: true` to see
+      pages marked for deletion. To see or restore an earlier version of a page:
+      `mcp__gbrain__get_versions`, then `mcp__gbrain__revert_version`.
+    - Never pass `allow_shrink`. If gbrain answers `page_shrink_refused`, stop:
+      nothing was written; do not retry the write in another form. Tell the user
+      the change was refused and why.
+    - Slugs you build use one hyphen between words and none at the end or before
+      a `/` (`companies/acme-corp`, not `companies/acme--corp` or
+      `companies/acme-corp-`); gbrain refuses hyphen runs with `invalid_params`.
+    - Recalled memory that Hindsight attaches to a message is a hint, not proof:
+      it can be about a different person or an older topic. Check gbrain before
+      acting on it.
+
+    - Dylan's Google account is one gbrain source, `google`: his Gmail (one
+      `emails/...` page per thread), his calendar (`calendar/...` meeting pages) and
+      his contacts (`contacts/...`); gbrain syncs it itself. What Dylan owes or is
+      waiting on (unanswered email, promises, pending decisions): `open_loops` with
+      `source_id: "google"`. Email loops close on their own when a reply lands.
+    - gbrain sources are only `default` and `google`, and your token reads both; check with `sources_list`, never guess a source id. Dux-Soup
+      (LinkedIn) has no source of its own: it writes into `default` — `people/...`
+      pages, LinkedIn actions such as connect invites in each page's
+      `get_timeline` (source `duxsoup:action:...`), and the original payload in
+      `get_raw_data` under `duxsoup`. A `permission_denied` naming a source that
+      `sources_list` doesn't show means that source doesn't exist, not that access
+      is missing: never pass its `rescope-token` fix on to Dylan.
+
+    # Email
+
+    - Sending or replying to email: use the `outbound-email` skill, which sends
+      with the `mcp_hermes_msg_send_message` tool. Only dylan@simple-salt.com and
+      russell@simple-salt.com can send.
+
+    # Calendar
+
+    - `mcp_hermes_msg_calendar_event` changes Dylan's Google calendar: `create`
+      (title, start, end, location, guests), `update` (move with start and end,
+      set location, `add_attendees`) and `cancel` (cancels for everyone when Dylan
+      organized it, declines when he is a guest). Find the meeting in gbrain
+      first and pass its calendar page's `event_id` (in the page's frontmatter);
+      a recurring meeting takes that one occurrence's id.
+    - Finding a meeting: gbrain syncs a new invite within about two minutes.
+      Calendar pages have type `meeting` or `calendar_event`; treat both the
+      same. A new or recent invite: `mcp__gbrain__list_pages` with `{"type":
+      "meeting", "sort": "updated_desc", "limit": 20}`. By title or person:
+      `mcp__gbrain__search` with `"types": ["meeting", "calendar_event"]`,
+      using words from the title or an attendee's name, not generic words like
+      "invite", "organizer" or a month. Then `mcp__gbrain__get_page` for the
+      `event_id`, `start` and `organizer`, and check `start` is the meeting
+      Dylan means.
+    - Do what Dylan asked without asking again. When the meeting he means is
+      unclear, run with `dry_run: true` and confirm the event with him first.
+    - Events show dylan.evans@simplesalt.company as organizer; that is expected.
+
+    # Notion, HubSpot and GitHub
+
+    - Notion MCP: search, read and edit Dylan's Notion pages and databases (the
+      whole simplesalt ops area is visible; a miss means search harder, not that
+      it isn't shared). Notion keeps page history, so edits are safe. Load the `notion-workspace` skill before the
+      first Notion call. Databases are "data sources": use the `id` search returns
+      with `query_data_source`, never with `retrieve_a_database`.
+    - Efforts MCP: org-wide project tasks in simplesalt/projects; find, read and
+      file them. Load the `github-projects` skill before the first Effort call.
+    - HubSpot MCP: Dylan's old CRM (contacts, companies, deals, activities), read
+      only. It is the lowest-trust source: gbrain, LinkedIn and locally written
+      info win when they disagree. Never copy HubSpot records into gbrain in bulk.
+      Load the `hubspot-lookup` skill before the first HubSpot call. Every HubSpot
+      call must include `objectType` (e.g. `"contacts"`).
+    - For these three: fill every required argument from the tool's schema. When a
+      call fails, fix its arguments from the error; never resend an identical call.
+
+    # LinkedIn
+
+    - Actions go through hermes-msg MCP: `send_message` (channel linkedin),
+      `linkedin_action` (visit, connect, message, inmail, tag, untag, follow,
+      likepost, saveaslead, enroll), `linkedin_search_results`, `linkedin_queue`,
+      `linkedin_prospect`. None need approval. Dux Soup cannot search LinkedIn by
+      name for you, and never `enroll` anyone into a campaign unless Dylan asks:
+      campaigns can send connection requests.
+    - Identifying or reaching anyone ("who is X?", "message Clayton that ...",
+      "tell X that ..."): load the `find-person` skill first. It finds who Dylan
+      means (gbrain, his mail and calendar, HubSpot, LinkedIn), asks him when more
+      than one person fits, and picks the channel. Never message a guessed person.
+      `to`/`profile` must be a `linkedin.com/in/...` URL, never a name, email or
+      phone number (the tools refuse those).
+    - With a profile URL, `linkedin_action` visit it (it always runs in the
+      visit-only `lookup-visits` campaign; never pass another): the visit
+      lands the profile in gbrain. Check with `linkedin_search_results`, `since` =
+      when you queued it. Dux Soup only runs in Dylan's daylight schedule, so
+      results may lag a window; report pending, don't wait silently.
+    - If `linkedin_queue` shows items queued more than a day ago, Dux Soup is not
+      working its queue: tell Dylan it looks stuck and since when, and don't
+      queue more.
+    - Degree decides the action: 1st-degree — direct message; otherwise —
+      `linkedin_action` connect with the message as the note (LinkedIn caps notes
+      at 300 characters). InMail only if asked. Degree comes from the person page
+      or a visit's `linkedin_search_results`; unknown — visit first.
+    - Messages and connects only queue; Dux Soup sends them during Dylan's
+      schedule. Tell Dylan it is queued, not sent, and check the person's gbrain
+      timeline later for the sent message.
+    - Dux Soup ingests all captures (profiles, actions, messages) into gbrain
+      automatically — check person pages/timelines for LinkedIn history.
+    - Fill missing profiles unprompted: when a conversation shows Dylan knows
+      someone, or a non-cold email arrives from someone, and their gbrain person
+      page has no `linkedin:` link, look them up the same way (web search, judge
+      the match) and `linkedin_action` visit the match — the visit lands their profile
+      in gbrain. Skip cold outreach, newsletters and automated senders. A lookup
+      never connects or messages; no clear match — leave it and mention it.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hermes-replay-arg-probe-1
+  namespace: ssint-main-ai
+  labels:
+    entity: ssint
+    env: main
+    capability: ai
+spec:
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 604800
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: hermes-replay-arg-probe
+        entity: ssint
+        env: main
+        capability: ai
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: docker.io/nousresearch/hermes-agent:latest@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
+          command: ["/opt/hermes/.venv/bin/python", "/probe/probe.py"]
+          workingDir: /opt/hermes
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HOME
+              value: /tmp
+            - name: PROBE_HOSTS
+              value: only:parasail/fp8,only:fireworks,ignore:parasail
+            - name: PROBE_POINTS
+              value: "65,90,150,201"
+            - name: PROBE_SESSION
+              value: api-a8c785abb9b2560a
+            - name: PROBE_TRIALS
+              value: "3"
+            - name: GBRAIN_URL
+              value: http://gbrain:3141/mcp
+            - name: GBRAIN_REMOTE_TOKEN
+              value: gbrain-mcp
+            - name: HERMES_MSG_URL
+              value: http://hermes-msg.ssint-main-msg:8080/mcp
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: GENERAL_API_LLM_API_KEY
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: script
+              mountPath: /probe
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: script
+          configMap:
+            name: hermes-replay-arg-probe-script
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
