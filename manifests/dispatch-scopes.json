@@ -48,7 +48,7 @@
     "basis": "http://ssint-build-basis-dispatch:8080/dispatch",
     "cloud-basis": "http://ssint-build-cloud-basis-dispatch:8080/dispatch",
     "brain": "http://ssint-build-brain-dispatch:8080/dispatch",
-    "oci": "http://ssint-build-oci-t961-dispatch:8080/dispatch",
+    "oci": "http://ssint-build-oci-dispatch:8080/dispatch",
     "projects": "http://ssint-build-projects-dispatch:8080/dispatch"
   },
   "hints": [
