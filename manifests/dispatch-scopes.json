@@ -54,7 +54,7 @@
     {
       "name": "oci",
       "repo": "simplesalt/oci",
-      "dispatch": "http://ssint-build-oci-dispatch:8080/dispatch",
+      "dispatch": "http://ssint-build-oci-t961-dispatch:8080/dispatch",
       "will": [
         "Building and publishing container images: builder-sb, cred-rotator, cluster, gbrain, agentdb",
         "The builder Helm chart and its releases",
