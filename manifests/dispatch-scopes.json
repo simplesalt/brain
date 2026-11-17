@@ -11,6 +11,7 @@
         "Platform services shared by every namespace: the flux MCP, the logs API and logs MCP, alerting and cluster health checks"
       ],
       "wont": [
+        "Kyverno policies that generate Crossplane resources (cloud-basis)",
         "Crossplane, Cloudflare or Google Workspace resources (cloud-basis)",
         "AI apps, builder pod releases or app namespaces (brain)",
         "Container images, the builder chart, node bootstrap or kube-vip (oci)",
@@ -25,7 +26,8 @@
         "Crossplane install and its Cloudflare and GCP providers",
         "Cloudflare resources: DNS, tunnels, Access apps and policies, Workers and Workers VPC services, Zero Trust",
         "Google Workspace and GCP resources for the internal apps project",
-        "The cluster MCP connector's routes into the cluster (30-mcp)"
+        "The cluster MCP connector's routes into the cluster (30-mcp)",
+        "Kyverno policies that template and generate Crossplane resources (for example a Cloudflare or GCP resource created from a label or annotation on an app object)"
       ],
       "wont": [
         "In-cluster operators or Kyverno policies (basis)",
