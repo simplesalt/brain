@@ -41,6 +41,8 @@ for row in TABLE:
 def router_prompt():
     lines = [
         'Classify the task with two questions.',
+        'Classify by what the task is about, even when it only asks a question or reads something: '
+        'a question about a Helm chart is target registry, a question about a cluster policy is target cluster.',
         'Answer with only a JSON object: {"layer": "<layer>", "target": "<target>"}.',
         'If you cannot tell, answer "unsure" for that value.',
     ]
@@ -78,10 +80,14 @@ def parse_answer(content):
         doc = json.loads(m.group(0))
     except ValueError:
         return None, None
-    layer = str(doc.get('layer', '')).strip().lower()
-    target = str(doc.get('target', '')).strip().lower()
-    return (layer if layer in QUESTIONS['layer'] else None,
-            target if target in QUESTIONS['target'] else None)
+    if not isinstance(doc, dict):
+        return None, None
+
+    def known(q):
+        words = re.findall(r'[a-z]+', str(doc.get(q, '')).lower())
+        return words[0] if words and words[0] in QUESTIONS[q] else None
+
+    return known('layer'), known('target')
 
 
 def post_json(url, payload, timeout, headers=None):
@@ -118,7 +124,7 @@ def pick_builder(text):
         status, doc = post_json(OPENROUTER_URL, {
             'model': MODEL,
             'temperature': 0,
-            'max_tokens': 60,
+            'max_tokens': 400,
             'messages': [{'role': 'system', 'content': PROMPT}, {'role': 'user', 'content': text}],
         }, MODEL_TIMEOUT, {'authorization': f'Bearer {key}'})
     except Exception as e:
@@ -133,7 +139,9 @@ def pick_builder(text):
     route = {'layer': layer, 'target': target}
     builder = lookup(layer, target) if target else None
     if not builder:
-        return FALLBACK, {**route, 'route': 'fallback', 'route_reason': 'no table row fits the answer'}
+        answer = content[:200] if isinstance(content, str) else None
+        return FALLBACK, {**route, 'route': 'fallback', 'route_reason': 'no table row fits the answer',
+                          'model_answer': answer}
     return builder, {**route, 'route': 'table'}
 
 
