@@ -6,19 +6,43 @@
       "app": "software that does work people use, and its data, agents and jobs (Hermes, gbrain, Hindsight, collectors, ingest jobs, agent harnesses, the dispatch server)."
     },
     "target": {
-      "cluster": "lands in the Kubernetes cluster: manifests, config, policies, deployed versions.",
-      "cloud": "lands at a cloud provider (Cloudflare, Google Workspace, GCP).",
-      "registry": "builds or changes a container image or Helm chart published to ghcr.",
-      "none": "design, planning or coordination, or work a person wants to steer in their own thread."
+      "cluster": "the work is about something deployed in the Kubernetes cluster: manifests, config, policies, deployed versions, a broken or unhealthy pod. Example: 'Hermes crashloops after the config change'.",
+      "cloud": "the work is about something at a cloud provider (Cloudflare, Google Workspace, GCP). Example: 'add a DNS record for the grammar app'.",
+      "registry": "the work is about a container image or Helm chart, or the source in simplesalt/oci, including only reading or listing it. Example: 'list the files in the builder chart'.",
+      "none": "only design, planning or coordination with no repo or system named, or a person wants to steer the work in their own thread. Example: 'plan next quarter's roadmap'."
     }
   },
   "table": [
-    { "layer": "platform", "target": "cluster", "builder": "basis" },
-    { "layer": "platform", "target": "cloud", "builder": "cloud-basis" },
-    { "layer": "app", "target": "cluster", "builder": "brain" },
-    { "layer": "app", "target": "cloud", "builder": "brain" },
-    { "layer": "*", "target": "registry", "builder": "oci" },
-    { "layer": "*", "target": "none", "builder": "projects" }
+    {
+      "layer": "platform",
+      "target": "cluster",
+      "builder": "basis"
+    },
+    {
+      "layer": "platform",
+      "target": "cloud",
+      "builder": "cloud-basis"
+    },
+    {
+      "layer": "app",
+      "target": "cluster",
+      "builder": "brain"
+    },
+    {
+      "layer": "app",
+      "target": "cloud",
+      "builder": "brain"
+    },
+    {
+      "layer": "*",
+      "target": "registry",
+      "builder": "oci"
+    },
+    {
+      "layer": "*",
+      "target": "none",
+      "builder": "projects"
+    }
   ],
   "builders": {
     "basis": "http://ssint-build-basis-dispatch:8080/dispatch",
@@ -26,5 +50,10 @@
     "brain": "http://ssint-build-brain-dispatch:8080/dispatch",
     "oci": "http://ssint-build-oci-t961-dispatch:8080/dispatch",
     "projects": "http://ssint-build-projects-dispatch:8080/dispatch"
-  }
+  },
+  "hints": [
+    "Use target none only when the task names no repo, system, image, chart or cloud resource.",
+    "A task that reads, lists or asks about something is classified like a change to that thing.",
+    "Repo names: simplesalt/oci is target registry; simplesalt/basis is layer platform, target cluster; simplesalt/cloud-basis is layer platform, target cloud; simplesalt/brain is layer app, target cluster."
+  ]
 }

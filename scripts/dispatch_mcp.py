@@ -41,11 +41,12 @@ for row in TABLE:
 def router_prompt():
     lines = [
         'Classify the task with two questions.',
-        'Classify by what the task is about, even when it only asks a question or reads something: '
-        'a question about a Helm chart is target registry, a question about a cluster policy is target cluster.',
         'Answer with only a JSON object: {"layer": "<layer>", "target": "<target>"}.',
         'If you cannot tell, answer "unsure" for that value.',
     ]
+    hints = REGISTRY.get('hints', [])
+    if hints:
+        lines += ['', 'rules'] + [f'- {h}' for h in hints]
     for q in ('layer', 'target'):
         lines += ['', q]
         lines += [f'- {name}: {desc}' for name, desc in QUESTIONS[q].items()]
