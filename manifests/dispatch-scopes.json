@@ -2,14 +2,14 @@
   "fallback": "projects",
   "questions": {
     "layer": {
-      "platform": "what every app runs on: cluster policy, operators, shared services, cloud accounts, identity, networking, and the templates apps use to get them (Kyverno policies, public ingress, CDN, identity providers, storage).",
-      "app": "software that does work people use, and its data, agents and jobs (Hermes, gbrain, Hindsight, collectors, ingest jobs, agent harnesses, the dispatch server)."
+      "platform": "what every app runs on: cluster policy, operators, shared services, cloud accounts, identity, networking, and the templates apps use to get them.",
+      "app": "software that does work people use, and its data, agents and jobs (Hermes, gbrain, Hindsight, collectors, agent harnesses)."
     },
     "target": {
-      "cluster": "the work changes or inspects something deployed in the Kubernetes cluster, or the repo that deploys it, including that repo's own files and CI workflows: manifests, config, policies, deployed versions, a broken or unhealthy pod. Example: 'Hermes crashloops after the config change'.",
-      "cloud": "the work is about something at a cloud provider (Cloudflare, Google Workspace, GCP). Example: 'add a DNS record for the grammar app'.",
-      "registry": "the work changes or inspects the image and chart sources kept in simplesalt/oci (Dockerfiles, chart templates, the builder image), including only reading or listing them. Example: 'list the files in the builder chart'.",
-      "none": "only design, planning or coordination with no repo or system named, or a person wants to steer the work in their own thread. Example: 'plan next quarter's roadmap'."
+      "cluster": "lands in the Kubernetes cluster.",
+      "cloud": "lands at a cloud provider (Cloudflare, Google).",
+      "registry": "builds or changes a container image or Helm chart.",
+      "none": "design, planning or coordination, or work a person wants to steer in their own thread."
     }
   },
   "table": [
@@ -50,11 +50,5 @@
     "brain": "http://ssint-build-brain-dispatch:8080/dispatch",
     "oci": "http://ssint-build-oci-dispatch:8080/dispatch",
     "projects": "http://ssint-build-projects-dispatch:8080/dispatch"
-  },
-  "hints": [
-    "Classify by where the change is made, not by what it produces or mentions. A CI workflow in simplesalt/brain that builds and pushes an image to ghcr is a change to simplesalt/brain, so layer app, target cluster.",
-    "Use target none only when the task names no repo, system, image, chart or cloud resource.",
-    "A task that reads, lists or asks about something is classified like a change to that thing.",
-    "Repo names decide the answer when the task says the work is done in that repo: simplesalt/oci is target registry; simplesalt/basis is layer platform, target cluster; simplesalt/cloud-basis is layer platform, target cloud; simplesalt/brain is layer app, target cluster. A repo only mentioned as something to read or copy from does not decide it."
-  ]
+  }
 }
