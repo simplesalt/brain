@@ -1,0 +1,177 @@
+name: publish-harness
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'harness/**'
+  workflow_dispatch:
+    inputs:
+      harness:
+        description: Harness folder to publish (blank for every harness)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-harness
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      harnesses: ${{ steps.detect.outputs.harnesses }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find changed harnesses
+        id: detect
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REQUESTED: ${{ inputs.harness }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          harnesses=()
+          for version_file in harness/*/VERSION; do
+            [ -f "${version_file}" ] || continue
+            dir=$(dirname "${version_file}")
+            name=$(basename "${dir}")
+            if [ "${EVENT}" = "workflow_dispatch" ]; then
+              if [ -z "${REQUESTED}" ] || [ "${REQUESTED}" = "${name}" ]; then
+                harnesses+=("${name}")
+              fi
+              continue
+            fi
+            if [ -z "${BEFORE}" ] || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ] \
+              || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              harnesses+=("${name}")
+              continue
+            fi
+            if [ -n "$(git diff --name-only "${BEFORE}" "${AFTER}" -- "${dir}/")" ]; then
+              harnesses+=("${name}")
+            fi
+          done
+          json=$(printf '%s\n' "${harnesses[@]}" | jq -R . | jq -sc 'map(select(length > 0))')
+          echo "harnesses=${json}" >> "${GITHUB_OUTPUT}"
+          echo "harnesses to publish: ${json}"
+
+  publish:
+    needs: detect
+    if: ${{ needs.detect.outputs.harnesses != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        harness: ${{ fromJSON(needs.detect.outputs.harnesses) }}
+    env:
+      IMAGE_PATH: ${{ github.repository }}/harness/${{ matrix.harness }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < "harness/${{ matrix.harness }}/VERSION")
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "harness/${{ matrix.harness }}/VERSION must be MAJOR.MINOR.PATCH, got '${version}'"
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "image=ghcr.io/${IMAGE_PATH,,}" >> "${GITHUB_OUTPUT}"
+          echo "epoch=$(git log -1 --format=%ct)" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to overwrite a published version
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "::error::${IMAGE}:${VERSION} already exists; bump harness/${{ matrix.harness }}/VERSION"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.version.outputs.epoch }}
+        with:
+          context: ./harness
+          file: ./harness/Containerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            HARNESS=${{ matrix.harness }}
+          tags: ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.title=harness-${{ matrix.harness }}
+          outputs: type=image,rewrite-timestamp=true
+
+      - name: Confirm anonymous pull is refused
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          repo="${IMAGE#ghcr.io/}"
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r '.token // empty' || true)
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json' \
+            "https://ghcr.io/v2/${repo}/manifests/${VERSION}")
+          echo "anonymous manifest fetch returned ${status}"
+          if [ "${status}" = "200" ]; then
+            echo "::error::${IMAGE} is publicly pullable; set the ghcr package to private"
+            exit 1
+          fi
+
+      - name: Tag the version
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          tag="harness/${{ matrix.harness }}/v${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" -m "${IMAGE}:${VERSION}" -m "${IMAGE}@${DIGEST}"
+          git push origin "refs/tags/${tag}"
+          {
+            echo "## harness ${{ matrix.harness }} ${VERSION}"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| tag | \`${IMAGE}:${VERSION}\` |"
+            echo "| pinned | \`${IMAGE}@${DIGEST}\` |"
+            echo "| git tag | \`${tag}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
