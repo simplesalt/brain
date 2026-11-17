@@ -47,6 +47,8 @@ spec:
         value: "false"
     skelOverride:
       enabled: false
+    podAnnotations:
+      simplesalt.company/restart-epoch: "1"
     dispatch:
       enabled: true
       port: 8080
