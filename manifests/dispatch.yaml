@@ -1,0 +1,167 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dispatch-openrouter-api-key
+  namespace: ssint-main-coding
+  labels:
+    entity: ssint
+    env: main
+    capability: coding
+  annotations:
+    kustomize.toolkit.fluxcd.io/ssa: merge
+type: Opaque
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dispatch
+  namespace: ssint-main-coding
+  labels:
+    app: dispatch
+    entity: ssint
+    env: main
+    capability: coding
+    resiliency.simplesalt.company/ha: required
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dispatch
+  template:
+    metadata:
+      labels:
+        app: dispatch
+        entity: ssint
+        env: main
+        capability: coding
+        scheduling.simplesalt.company/class: work
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dispatch
+          image: node:22-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/app/dispatch-mcp.mjs"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: SCOPES_PATH
+              value: /etc/dispatch/scopes.json
+            - name: KEY_PATH
+              value: /secrets/openrouter/OPENROUTER_API_KEY
+            - name: MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: llm-models
+                  key: LIVE_DUMB_MODEL
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 48Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: app
+              mountPath: /app
+              readOnly: true
+            - name: scopes
+              mountPath: /etc/dispatch
+              readOnly: true
+            - name: openrouter
+              mountPath: /secrets/openrouter
+              readOnly: true
+      volumes:
+        - name: app
+          configMap:
+            name: dispatch-mcp-script
+        - name: scopes
+          configMap:
+            name: dispatch-scopes
+        - name: openrouter
+          secret:
+            secretName: dispatch-openrouter-api-key
+            optional: true
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dispatch
+  namespace: ssint-main-coding
+  labels:
+    app: dispatch
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: dispatch
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dispatch
+  namespace: ssint-main-coding
+  labels:
+    app: dispatch
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  selector:
+    app: dispatch
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dispatch-allow-builders
+  namespace: ssint-main-coding
+  labels:
+    app: dispatch
+    entity: ssint
+    env: main
+    capability: coding
+spec:
+  podSelector:
+    matchLabels:
+      app: dispatch
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8080

@@ -39,6 +39,7 @@ resources:
   - manifests/gbrain-pg-backup.yaml
   - manifests/gbrain-mark-review.yaml
   - manifests/gbrain-networkpolicy.yaml
+  - manifests/dispatch.yaml
 configMapGenerator:
   - name: hermes-config
     namespace: ssint-main-ai
@@ -116,6 +117,34 @@ configMapGenerator:
         capability: efforts
     files:
       - effort-mcp.mjs=scripts/effort-mcp.mjs
+  - name: dispatch-mcp-script
+    namespace: ssint-main-coding
+    options:
+      labels:
+        entity: ssint
+        env: main
+        capability: coding
+    files:
+      - dispatch-mcp.mjs=scripts/dispatch-mcp.mjs
+  - name: dispatch-scopes
+    namespace: ssint-main-coding
+    options:
+      labels:
+        entity: ssint
+        env: main
+        capability: coding
+    files:
+      - scopes.json=manifests/dispatch-scopes.json
+  - name: llm-models
+    namespace: ssint-main-coding
+    envs:
+      - manifests/llm-models.env
+    options:
+      disableNameSuffixHash: true
+      labels:
+        entity: ssint
+        env: main
+        capability: coding
   # One model list (manifests/llm-models.env), one stable-named copy per consuming
   # namespace: a pod can only read a ConfigMap in its own namespace.
   - name: llm-models
