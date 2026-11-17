@@ -254,7 +254,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.53.0"
+      version: "0.55.0"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
@@ -288,3 +288,8 @@ spec:
         value: "false"
     skelOverride:
       enabled: false
+    harness:
+      images:
+        - name: claude-code
+          repository: ghcr.io/simplesalt/brain/harness/builder
+          digest: sha256:c64f7c55b5b614f0fe169edeff6beab2dfda057720d85eb7aa713b1b5cebc740
