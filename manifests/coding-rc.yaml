@@ -254,7 +254,7 @@ spec:
   chart:
     spec:
       chart: builder
-      version: "0.48.0"
+      version: "0.53.0"
       sourceRef:
         kind: HelmRepository
         name: simplesalt-charts
