@@ -30,11 +30,6 @@ QUESTIONS = REGISTRY['questions']
 TABLE = REGISTRY['table']
 if FALLBACK not in BUILDERS:
     raise SystemExit(f"fallback builder '{FALLBACK}' is not in the registry")
-NAMES = REGISTRY.get('names', {})
-for name, b in NAMES.items():
-    if b not in BUILDERS:
-        raise SystemExit(f"name '{name}' points at unknown builder '{b}'")
-NAME_RES = [(re.compile(r'(?:(?<=github\.com/)|(?<![\w/.-]))' + re.escape(name) + r'(?![\w-])', re.I), b) for name, b in NAMES.items()]
 for row in TABLE:
     if row['builder'] not in BUILDERS:
         raise SystemExit(f"table names unknown builder '{row['builder']}'")
@@ -119,16 +114,8 @@ def err_text(e):
     return str(e)
 
 
-def named_builder(text):
-    named = {b for rx, b in NAME_RES if rx.search(text)}
-    return named.pop() if len(named) == 1 else None
-
-
 def pick_builder(text):
     route = {'layer': None, 'target': None}
-    named = named_builder(text)
-    if named:
-        return named, {**route, 'route': 'named'}
     key = openrouter_key()
     if not MODEL:
         return FALLBACK, {**route, 'route': 'fallback', 'route_reason': 'no model configured'}
@@ -209,8 +196,7 @@ def dispatch(args):
 TOOL = {
     'name': 'dispatch',
     'description': ("Start a new session on the builder pod whose scope fits the task, and return that session's "
-                    'bridge address to message it. Text that names exactly one builder (ssint-build-<name>) or its '
-                    'repo (simplesalt/<repo>) goes to that builder. Text that fits no builder goes to the projects pod. '
+                    'bridge address to message it. Text that fits no builder goes to the projects pod. '
                     'Keeps no state; a retry may start a second session.'),
     'inputSchema': {
         'type': 'object',
