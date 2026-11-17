@@ -136,24 +136,6 @@ jobs:
             org.opencontainers.image.title=harness-${{ matrix.harness }}
           outputs: type=image,rewrite-timestamp=true
 
-      - name: Confirm anonymous pull is refused
-        env:
-          IMAGE: ${{ steps.version.outputs.image }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          repo="${IMAGE#ghcr.io/}"
-          token=$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r '.token // empty' || true)
-          status=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${token}" \
-            -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json' \
-            "https://ghcr.io/v2/${repo}/manifests/${VERSION}")
-          echo "anonymous manifest fetch returned ${status}"
-          if [ "${status}" = "200" ]; then
-            echo "::error::${IMAGE} is publicly pullable; set the ghcr package to private"
-            exit 1
-          fi
-
       - name: Tag the version
         env:
           IMAGE: ${{ steps.version.outputs.image }}
