@@ -1,0 +1,751 @@
+schema: 1
+researched: 2026-11-11
+about: "Stepwise upgrade path for gbrain, hermes-agent and hindsight, carried by the brain-upgrade coding-agent skill in simplesalt/oci (builder-sb policy), moved from simplesalt/brain 6a46ac6 under simplesalt/projects#745; walked by a coding agent, by hand or on a schedule (simplesalt/projects#528), one stop per run; researched under simplesalt/projects#527; the gbrain section was revised under simplesalt/projects#523. next stops past the live pins were researched under simplesalt/projects#896 (2026-11-11). Data only."
+rules:
+  - "Per service, land on the first stop after the live pin, one stop per run, in listed order."
+  - "Never skip a stop, never jump to target, never use a floating tag."
+  - "Never land on a skip range in prod; a bisect entry is a fallback when the hop to its stop fails, not a stop."
+  - "Before a stop, satisfy before_first_stop (once) and the stop's before; after it, run every validate check."
+  - "Every place in pinned_in moves in the same commit."
+  - "order holds the cross-service constraints."
+  - "pin is authoritative (full git SHA or multi-arch index digest); version is a label."
+  - "Adoption rule (gbrain, decided 2026-10-06 under simplesalt/projects#523): hop to a stop no earlier than 14 days after its release, only after screening finds no reported data-loss, migration, never-Ready, auth or MCP-tool bug affecting our profile (Postgres, unmanaged, HTTP bearer MCP) present and unfixed in it, and only after it passed our checks on a restored copy where the stop says so; trail upstream by about 4 weeks at most, and when no screened release is inside that, stay put and flag it."
+  - "File paths in this plan (manifests/..., kustomization.yaml) are in simplesalt/brain unless an entry names repo simplesalt/oci."
+  - "gbrain is baked into ghcr.io/simplesalt/oci/gbrain: a gbrain stop first moves GBRAIN_SHA in oci gbrain/pins.env (and BUN_IMAGE in oci gbrain/Containerfile when the stop needs another Bun) on oci main, waits for the 'Build gbrain image' workflow, then repins the four ai.yaml image digests and GBRAIN_SHA in install-cli-tools in one brain commit; the oci and brain commits are one stop."
+  - "The live pin (pinned_in) is where a service stands; current is the pin when this plan was last revised."
+  - "Report each step's outcome for the upgrade Effort (its planner records it), not in this file."
+  - "Every gbrain and hermes-agent stop runs its skill_review before the bump commit; Hermes's skill allow-list (manifests/hermes-skills.yaml) changes only with the user's approval, in the same commit as the bump."
+order:
+  - "Move gbrain skills sync (hermes-agent install-cli-tools) to the same SHA as the gbrain server in the same commit as every gbrain stop; never move it with a hermes stop. The sync moves with the allow-list approved in that stop's skill_review (manifests/hermes-skills.yaml, same commit)."
+  - "hindsight server must reach 0.10.2 before hermes-agent moves to v2026.9.24 (its hindsight plugin needs hindsight-client >= 0.10.1)."
+  - "hermes-agent stops 1-3 keep the baked-in hindsight client 0.6.1; it works against today's 0.8.2, and each hindsight stop's validate (hindsight_recall and a Hermes reflect) is what proves it against 0.8.6-0.10.2."
+  - "put_page callers (calendar-collector, duxsoup-ingest, email-collector) must send expected_revision or force before any gbrain stop past v0.48.2.0 (simplesalt/projects#658; done in simplesalt/brain c895be7, ff07a3a)."
+  - Hermes plugins through v0.23.0 pin hindsight-client >=0.10.1,<1, so hindsight 1.0.0 and 1.1.0 run against a 0.x client (API changes in 0.10.3-1.1.0 are additive for the endpoints we use); each hindsight stop's Hermes hindsight_recall and reflect validate proves it. Hindsight and hermes-agent stops never move in the same commit.
+services:
+  gbrain:
+    upstream: https://github.com/garrytan/gbrain
+    pin_kind: git-sha
+    pinned_in:
+      - {repo: simplesalt/oci, file: gbrain/pins.env, where: "GBRAIN_SHA=<sha>; a push to oci main builds ghcr.io/simplesalt/oci/gbrain with 'bun install -g github:garrytan/gbrain#<sha>' on the BUN_IMAGE pinned in oci gbrain/Containerfile"}
+      - {file: manifests/ai.yaml, where: "Deployment gbrain, initContainer seed-admin-assets: image ghcr.io/simplesalt/oci/gbrain:main@sha256:<digest> of the image built from that pins.env"}
+      - {file: manifests/ai.yaml, where: "Deployment gbrain, container gbrain: image ghcr.io/simplesalt/oci/gbrain:main@sha256:<digest>, same digest"}
+      - {file: manifests/ai.yaml, where: "Deployment gbrain, container autopilot: image ghcr.io/simplesalt/oci/gbrain:main@sha256:<digest>, same digest"}
+      - {file: manifests/ai.yaml, where: "Deployment gbrain, container addon-worker: image ghcr.io/simplesalt/oci/gbrain:main@sha256:<digest>, same digest"}
+      - {file: manifests/ai.yaml, where: "Deployment hermes-agent, initContainer install-cli-tools: skills sync, pinned (simplesalt/brain 0d196b2) by the literal GBRAIN_SHA=<sha>, which feeds the gbrain archive tarball URL and the .gbrain-version marker; must equal the Deployment gbrain SHA"}
+    current: {version: v0.60.214.0, pin: "23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc", date: 2026-10-13, live_since: "2026-10-27 (simplesalt/brain e706223, simplesalt/projects#778)"}
+    target: {version: v0.60.483.0, pin: "5b94dca630d3af7a8eb2e42eacfafd9db52672f1", date: 2026-10-28}
+    notes:
+      - "Upstream tags are sparse (some versions untagged): always pin by full SHA."
+      - "Hermes skills sync used to track gbrain master (v0.60.x) against the v0.46.29.0 server; it is now pinned to the server SHA (simplesalt/brain 0d196b2) and moves with each stop."
+      - "Treat each vX.0.0.0 as a checkpoint: re-review the CLI surfaces we use (init, serve, embed, autopilot, config keys, GBRAIN_* env, access_tokens/content_chunks schema)."
+      - "No breaks found in our used CLI surfaces, env vars or schema between the current pin and v0.51.6.0; put_page is the one caller-visible contract change (v0.51.0.0)."
+      - "Upstream fixes forward: broken releases stay published, no stable branch; latest-stable follows every gated release (docs/RELEASING.md)."
+      - "Releases from 2026-10-26 (garrytan/gbrain da31e3e4) require Bun >= 1.4.4 (TLS postgres.js leak, Brotli CVE); the gbrain image runs Bun 1.4.2 (BUN_IMAGE oven/bun:1.4.2-alpine in oci gbrain/Containerfile), so BUN_IMAGE moves first (simplesalt/projects#783) before any stop past that date."
+      - "Every stop records vector and timeline baselines first (gbrain MCP get_stats: page_count, chunk_count, embedded_count, timeline_entry_count; get_health: embed_coverage, missing_embeddings) and a set of canned bearer search/query probes that target pages written before the walk (never pages the smoke test wrote)."
+      - Upstream publishes a stable channel (tags stable-v<version>, and stable/latest-stable); pins still follow the adoption rule, and a stable promotion is evidence, not a substitute for screening.
+    before_first_stop:
+      - "DONE (simplesalt/brain 0d196b2): the hermes-agent skills sync is pinned to the gbrain server SHA (see pinned_in) so it moves with each stop."
+      - "DONE (simplesalt/brain 1228967 then 2414304): the gbrain Deployment uses strategy Recreate so no older gbrain process overlaps a newer schema; switching a live Deployment needs Flux to own rollingUpdate first (restate it explicitly, then drop it), 'rollingUpdate: null' is rejected."
+      - "DONE (simplesalt/brain 8e4c61c, now oci gbrain/Containerfile BUN_IMAGE): every gbrain container and initContainer runs on oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f (Bun >= 1.3.11 is enforced from v0.50.5.0; 1.4.2 is in upstream's musl native-lock CI matrix)."
+      - "DONE (simplesalt/brain 8e4c61c): the gbrain container has a startupProbe on /health:3131 (10s x 90) because /health waits for migrations."
+      - "DONE (simplesalt/brain 8e4c61c): GBRAIN_EMBEDDING_DIMENSIONS=1536 on the gbrain and autopilot containers (simplesalt/projects#743); runtime never reads the DB row, so keep it on every gbrain process."
+      - "DONE (simplesalt/brain ac056f3): the DB config row embedding_dimensions is 1536 and facts/query_cache embeddings are halfvec(1536) (gbrain migrate embeddings, guarded so content_chunks vectors stayed byte-identical); migrations read only the DB row (v142 would otherwise rebuild takes.embedding at 1280, and v0.56.2.0+ fact embedding refuses a mismatch). manifests/gbrain-align-embedding-width.yaml can rerun it; manifests/gbrain-preflight.yaml prints a read-only state snapshot (add either to kustomization.yaml to run, then remove)."
+      - "gbrain-pg has no backup automation: tracked in simplesalt/projects#549; until it lands take a manual pg_dump where a stop asks for one."
+      - "DONE (simplesalt/brain 77c2b7c): Job gbrain-migrate-embedding-dims-2 is removed (simplesalt/projects#681); the autopilot embeds new pages."
+    skip:
+      - {from: v0.46.35.0, to: v0.47.4.0, reason: "Wedge schema upgrades on Postgres brains created before v0.46.35.0 (ours); fixed in v0.47.5.0 (#4657)."}
+      - {from: v0.48.3.0, to: v0.60.4.0, reason: "Bearer (remote) search/query withhold every page chunked before v0.48.3.0 (chunker_version < 4, all of ours) until 'gbrain reindex --markdown' (#5004, #5050); 'gbrain repair safe-chunks' arrives in v0.60.5.0."}
+      - {from: v0.51.0.0, to: v0.59.20.0, reason: "Timeline rows that exist only in the database (no bullet in the page body) are deleted when a page is re-imported or rewritten (#5567); on v0.51+ add_timeline_entry also writes the bullet, so rows written before v0.51 (all of ours, e.g. Dux Soup's) are the exposed ones; fixed in v0.60.5.0. Also in this range: #5497, embedding invalidation nulls vectors on projection-pending pages (v0.51.0.0-v0.59.9.x)."}
+      - {from: v0.57.0.0, to: v0.59.2.0, reason: "Likely never Ready under bun install -g: /health hits 'Postgres cancellation requires the pinned driver patch'; fixed by vendoring in v0.59.3.0."}
+      - {from: v0.60.12.0, to: v0.60.160.x, reason: "Data loss on our path: a remote put_page whose content omits the timeline block deletes every timeline row on the page while reporting committed (#5969, fixed v0.60.105.0); #6383 (fixed v0.60.150.0); #6398 facts-fence body overwrite (fixed v0.60.161.0). v0.60.5.0 and v0.60.11.0 carry #5969 too and are restored-copy-only bisect entries."}
+      - from: v0.60.215.0
+        to: v0.60.248.0
+        reason: 'remember and facts onto an unbound Postgres source refuse owner_unavailable unless persistence.unbound_write=database_only (#6608, #6610); fixed v0.60.249.0 (changelog 0.60.249.0).'
+      - from: v0.60.215.0
+        to: v0.60.283.0
+        reason: '#6755 v0.11.0 app-migration phase F wedges on a Postgres brain with no sync.repo_path; fixed v0.60.284.0 (changelog 0.60.284.0). Reached only by apply-migrations or gbrain upgrade, which we do not run.'
+      - from: v0.60.389.0
+        to: v0.60.465.0
+        reason: 'A brain at schema 265 (what 389.0 and 390.0 leave) cannot reach 266: the schema replay indexes derived_generation_items.pending before v266 adds it (''column "pending" does not exist'', #7645, closed 2026-10-26); fixed v0.60.466.0. Not rehearsed from 242 straight to a release in this range; never park the brain at 389.0 or 390.0.'
+    stops:
+      - version: v0.60.214.0
+        pin: "23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc"
+        date: 2026-10-13
+        expected_schema: 242
+        why: "Retarget decided by Dylan 2026-10-27 (simplesalt/projects#778 G1): v0.60.5.0 and v0.60.11.0 silently delete timeline rows on a put_page that omits the timeline block (#5969, fixed v0.60.105.0), so they are no longer prod stops. One hop from v0.48.2.0 applies migrations 146-242 in order and carries v0.48.3-v0.60.4 (migration 149 and the minion_queue_protocol trigger, Bun >= 1.3.11 enforcement and the security wave, v0.51.0.0 write-path rewrite, put_page expected_revision/force contract), the safe-chunk withholding fix (#5004, #5050), the timeline-deletion fixes (#5567, #5969) and the #6383/#6398 fixes; engines.bun >= 1.4.0; no MCP tool removed or renamed vs v0.60.11.0 (simplesalt/projects#778 F13, F14)."
+        skill_review:
+          script: "python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py gbrain <live pin> 23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc"
+          inputs:
+            - "Live pin (old, <live pin>): GBRAIN_SHA in oci gbrain/pins.env (org.simplesalt.gbrain.commit label of the ai.yaml gbrain image digest), equal to GBRAIN_SHA in install-cli-tools; this stop's pin (new): 23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc."
+            - "Allow-list: the gbrain section of manifests/hermes-skills.yaml."
+            - "tools/list for the hermes-mcp bearer token (scopes read,write,admin) on the gbrain-rehearsal copy, restored from a fresh prod dump for this hop and pointed at this pin (ConfigMap gbrain-rehearsal-version GBRAIN_REHEARSAL_SHA and restart-epoch in manifests/gbrain-rehearsal.yaml, a brain commit by the brain workstream), and the same call on prod (gbrain.ssint-main-ai:3131); compare tool names, not counts."
+          outputs:
+            - "The skill-diff JSON and exit code (0: no skill added, removed or changed; 3: something changed; 1: could not tell, stop; 2: usage error)."
+            - "If exit 3: a works / partly works / cannot work verdict with a one-line reason per added or changed skill and per allow-listed removed skill; the proposal of additions and removals put to the user; the user's decision; the approved list written to manifests/hermes-skills.yaml in the bump commit (unchanged if nothing is approved)."
+        before:
+          - "DONE (simplesalt/brain c895be7, ff07a3a; simplesalt/projects#658): writers fixed first. Dux Soup sends expected_revision from the same get_page (force would delete entries added between get_page and put_page), re-reads on revision_conflict, skips unchanged pages, neutralises bullet-shaped detail lines, skips invalid_params timeline entries, and dead-letters an event after MAX_EVENT_ATTEMPTS (12); email and calendar send force; every page and timeline write carries a deterministic UUID request_id, because on v0.60.x a refused write still spends a permanent write ID (250,000 per principal shared by all bearer clients). The current pin ignores unknown params, so the writers changed first."
+          - "Take a fresh pg_dump of gbrain-pg."
+          - "Rehearse on a copy restored from that fresh prod dump: init with our exact flags, migrations, projection drain, both repairs, canned probes."
+          - "Database config.embedding_model equals openai:text-embedding-3-small (init refuses a populated brain otherwise, from v0.56.2.0); settle on the restored copy first."
+          - "gbrain sources list --json shows local_path null on every non-archived source and gbrain config get sync.repo_path is unset; if either is set, stop: on Postgres a source root without a claimed writer refuses writes with owner_unavailable."
+          - "Do not run apply-migrations, sources writer claim or sources writer activate: init applies the schema, and the brain stays unmanaged with database-only writes (activation needs persistent canonical checkout and lock dirs we do not have, and refuses cycle.conversation_facts_backfill)."
+          - "No active minion jobs (migration 149 aborts on them)."
+          - "Env is injected via the pod spec, not a .env file in the working directory (.env quarantine)."
+          - "Bun >= 1.4.0 (satisfied by the 1.4.2 pin)."
+          - "Save the timeline baseline (total row count and get_timeline counts per page) to compare after the hop."
+          - "Rebuild ghcr.io/simplesalt/oci/gbrain from oci gbrain/pins.env at this SHA, then repin its digest in the four ai.yaml places and GBRAIN_SHA in install-cli-tools in one brain commit; Recreate or scale to 0."
+        validate:
+          - "gbrain --version reports v0.60.214.0 and the Bun version check passes at startup."
+          - "Config version row equals schema 242."
+          - "Config key readback: mcp.publish_advisor, search.reranker.model, facts.extraction_model, cycle.conversation_facts_backfill.enabled."
+          - "Startup log shows 'hermes-mcp bearer asserted'; bearer token still accepted."
+          - "GET /health returns 200 with the version."
+          - "Bearer MCP smoke: search, get_page, put_page, add_timeline_entry, put_raw_data."
+          - "Repairs: run 'gbrain repair safe-chunks' and 'gbrain repair timeline' as dry runs and record them; apply them (cost: cents of re-embedding; timeline conversion of Dux Soup and other DB-only rows was agreed by the operator on 2026-10-06) only as rehearsed on the restored copy; any other repair the doctor proposes stops the walk for operator review."
+          - "gbrain doctor --json and the gbrain repair previews are recorded; repairs follow the Repairs rule above."
+          - "SELECT count(*) FROM pages WHERE deleted_at IS NULL AND chunker_version < 4 is 0 (or doctor contextual_retrieval_coverage details.unsealed_pages 0)."
+          - "Timeline row counts match the saved baseline."
+          - "DB-only timeline rows are materialized as marked bullets (<!-- gbrain:materialized v1 ... -->) and get_timeline counts per page match the baseline."
+          - "Bearer search and get_page still return existing pages (not withheld as projection_pending or safe_index_pending); if withheld, the Repairs rule above applies."
+          - "Vectors survive: get_stats embedded_count == chunk_count and get_health missing_embeddings 0, embed_coverage 1 (counts are scoped per source, compare ratios; allow one autopilot cycle or 'gbrain embed --stale --yes' to recover a transient dip)."
+          - "Canned bearer search and query probes on pre-walk pages return the same slugs as the baseline, with no safe_index_pending or projection_pending in degraded."
+          - "hermes-agent init log shows 'gbrain skills synced to <sha>' and 'skills: kept <n> gbrain, <m> bundled; removed N; missing 0' (<n> and <m> are the counts listed in manifests/hermes-skills.yaml after this stop's skill_review) with no 'ERROR: allow-listed gbrain skill missing'; a rename or drop updates manifests/hermes-skills.yaml in the same commit."
+          - "Hermes' gbrain MCP tools answer a read-only call after the gbrain restart; if not, restart hermes-agent (simplesalt/projects#738)."
+          - "put_page on an existing slug without revision is refused (revision_required); with expected_revision or force it succeeds."
+          - "gbrain sources writer status --probe --json: native_lock.target linux-x64-musl with acquired true, enabled false, no worktrees or bindings, every onboarding source database_only (none claim_required), publication_concurrency >= 1; writer status shows a single writer version 0.60.214.0."
+          - "gbrain container startup log still contains 'Resolve IPC:'; if it is missing, confirm the native lock through the writer status probe above before proceeding."
+          - "Smoke put_page and add_timeline_entry receipts show persistence.mode database, never owner_unavailable or write_pending; afterwards writer status blockers are empty and no '[persistence] phase=' lines appear in either container log."
+          - "gbrain doctor shows unbound_source ok."
+          - "One email-collector and one calendar-collector CronJob run completes, or where they are suspended, gbrain's gmail and gcal sources keep syncing (autopilot sync jobs succeed)."
+          - "Autopilot cycle completes and embed --stale succeeds."
+          - "The autopilot embed phase succeeds."
+        rollback: "Restore database and binary together, never binary only (migration 149's minion_queue_protocol trigger makes older producers and workers fail): repin the previous gbrain image digest in ai.yaml with the previous GBRAIN_SHA (and revert oci gbrain/pins.env) and restore the pg_dump taken before this stop."
+        bisect:
+          - {version: v0.50.5.0, pin: "668b9bac302705f3bca0ae4792a49fab0a79a74e", date: 2026-09-16, use: "Restored copy only, never prod (inside the safe-chunk skip range): isolates migrations 146-149 and the Bun/security wave if the v0.60.214.0 hop fails on the copy."}
+          - {version: v0.51.0.0, pin: "d13aa742fd68b71bfd6c98be3dda5813791f1d6c", date: 2026-09-17, use: "Restored copy only, never prod (inside the skip range): isolates the v0.51.0.0 write-path rewrite if this hop fails."}
+          - {version: v0.60.5.0, pin: "6e1e826286079c0ebc0a6a3b07ccd11475b3cf33", date: 2026-09-29, expected_schema: 173, use: "Restored copy only, never prod (#5969 timeline data loss, fixed v0.60.105.0): isolates migrations 146-173 if this hop fails."}
+          - {version: v0.60.11.0, pin: "f8d1e3936d908935ce96e18c14249aecd85fb5b2", date: 2026-09-30, expected_schema: 178, use: "Restored copy only, never prod (#5969): isolates migrations 174-178 including the one-time fact expiry if this hop fails."}
+      - version: v0.60.467.0
+        pin: 53b482504cfc37d5011f7e2259eb99357f650564
+        date: 2026-10-26
+        released: 2026-10-26T17:10:35Z (GitHub release); merge commit 2026-10-26T17:06:26Z
+        expected_schema: 276
+        bun: engines.bun >=1.4.0 (verified in package.json at the pin); runs on the gbrain image's current Bun 1.4.2 (BUN_IMAGE oven/bun:1.4.2-alpine in oci gbrain/Containerfile; bun --version in ghcr.io/simplesalt/oci/gbrain@sha256:260fcc99 prints 1.4.2); da31e3e4 is not an ancestor (compare da31e3e4...53b48250 diverged)
+        why: 'Newest release before the Bun 1.4.4 floor (v0.60.468.0), so it needs no image change and is not blocked by simplesalt/projects#783. Carries the three known fixes: .249 (persistence.unbound_write for remember/facts), .284 (#6755), .323 (v221 batches; already applied on our schema-242 brain). Adds the 466 fix for #7645 (brain at schema 265 cannot upgrade), the 462 fix for facts lost when two notes mention one entity, the 467 security fix for --flag=value being silently ignored (#7619, p0: ''auth create --scopes=read'' minted a full token; ''serve --access=read-only'' ran read-write, fixed in 464), v275 RLS backfill on every table, v276 index, #7183 pooler read-only fix (412), the 346 fix for add_timeline_entry statement timeouts, the 347 fix for one over-limit fact blocking embed --stale, and the 379 Bun doctor warning. Schema 242 to 276 is 34 migrations (243-276). No MCP tool removed or renamed vs v0.60.214.0 (docs/TOOL_CATALOG.md: 149 tools at 214, 162 at 467; 13 added: abort_page_upload, append_page, begin_page_upload, commit_page_upload, get_brain_health, get_page_upload, list_write_conflicts, rank_entities, search_exact, sources_resolve_path, upload_page_part, wait_job, whois; no scope or gate change on an existing tool). Isolates the 242-to-276 schema and write-path move from the Bun move and from the v277-279 function rewrites of the next stop.'
+        caveats:
+          - 'On Bun 1.4.2 gbrain doctor bun_runtime warns (since 379.0) and lowers the health score; expected, not a failure. The Bun 1.4.0-1.4.2 TLS read leak (#7596, #7644) stays until Bun moves.'
+          - 'Not carried (fixed later, none reachable without the feature): #7778 extract-conversation-facts drops terminal rows after a purge tombstone (fixed 478; needs a forget --purge tombstone), #7814 v0.13.1 app migration stamps validate:false on every page (fixed 479; reached only by apply-migrations or gbrain upgrade), outside-text fact/timeline injection through imported mail (changelog 476.0).'
+        skill_review:
+          script: python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py gbrain <live pin> 53b482504cfc37d5011f7e2259eb99357f650564
+          expected: 'Dry-run on 2026-11-11 against live 23fdb464: exit 3; 75 skills at both; added 0, removed 0, changed 15; allow-listed (20 names): changed brain-ops, briefing, meeting-ingestion, query; none removed or missing.'
+          inputs:
+            - 'Live pin (old, <live pin>): GBRAIN_SHA in oci gbrain/pins.env (org.simplesalt.gbrain.commit label of the ai.yaml gbrain image digest), equal to GBRAIN_SHA in install-cli-tools; this stop''s pin (new): 53b482504cfc37d5011f7e2259eb99357f650564.'
+            - 'Allow-list: the gbrain section of manifests/hermes-skills.yaml.'
+            - tools/list for the hermes-mcp bearer on the gbrain-rehearsal copy at this pin (restored from a fresh prod dump) and on prod; compare tool names, expect the 13 additions above and no removal.
+        before:
+          - 'Rehearsal infrastructure: simplesalt/projects#783 (Deferred, ssint-build-brain) plans to remove the gbrain-rehearsal Deployment, its Postgres cluster and the pre-upgrade dumps after 7 clean days on v0.60.214.0. Hold that removal until the last gbrain stop has been rehearsed, or recreate the copy; each hop needs a rehearsal copy restored from a fresh prod dump (restore date, not the old copy).'
+          - 'Take a fresh pg_dump of gbrain-pg (no backup automation, simplesalt/projects#549) and restore it into the rehearsal copy; rehearse the hop there with our exact flags: init migrations, projection drain, canned probes, writer smoke, embed --stale, one autopilot cycle.'
+          - 'Writer contract changes to clear on the rehearsal copy (duxsoup-ingest, email-collector, calendar-collector, Hermes): (a) 366.0: put_page or capture of a NEW slug with a hyphen run or a segment-final hyphen is refused invalid_params detail slug_hyphen_run; (b) 231.0: a remote put_page of a page over 256 KB needs expected_revision (force no longer stands in) and content under half the stored page is refused page_shrink_refused unless allow_shrink true; (c) 253.0: a write less trusted than a confirmed take or timeline row no longer deletes it, put_page lists such rows under contested; (d) get_page on a large page returns an outline and window (231.0).'
+          - 'DB role: gbrain''s database role owns its tables or has BYPASSRLS (select rolname, rolbypassrls, rolsuper from pg_roles where rolname = current_user). v275 enables RLS on every gbrain table; a role that is neither is refused from v278 (stop 2) and reads zero rows once RLS is on.'
+          - '467 CLI change: grep manifests/ai.yaml for every gbrain serve, autopilot, embed, init, auth command written with --flag=value. Values for serve bind address, public URL, port, token lifetime now APPLY (a bind written with = to an all-interfaces address now listens on every interface; a public URL now sets the OAuth issuer); an = spelling the command does not read exits 2. Rewrite as --flag value or confirm the intended effect.'
+          - 'Do not run gbrain upgrade or apply-migrations (unchanged rule): at this stop the v0.13.1 app migration would stamp validate:false into every page (#7814, fixed 479).'
+          - 'gbrain sources list --json local_path null on every non-archived source and sync.repo_path unset (unchanged precondition; also keeps #7630/#6982/#7671 out of reach).'
+          - Save vector and timeline baselines (get_stats page_count, chunk_count, embedded_count, timeline_entry_count; get_health embed_coverage, missing_embeddings) and canned search/query probes on pre-walk pages.
+          - Rebuild ghcr.io/simplesalt/oci/gbrain from oci gbrain/pins.env at this SHA (BUN_IMAGE unchanged, Bun 1.4.2), then repin its digest in the four ai.yaml places and GBRAIN_SHA in install-cli-tools in one brain commit; Recreate or scale to 0 so no older process overlaps the newer schema (autopilot and serve containers in one pod move together).
+        validate:
+          - gbrain --version reports v0.60.467.0; config version row equals schema 276.
+          - GET /health 200 with the version; startup log shows 'hermes-mcp bearer asserted'; bearer token accepted.
+          - 'Config key readback: mcp.publish_advisor, search.reranker.model (set, so the 228.0 default change to Voyage rerank-3-lite does not apply), facts.extraction_model, cycle.conversation_facts_backfill.enabled, persistence.unbound_write, memory.auto_writeback (salient).'
+          - 'tools/list for hermes-mcp on prod: no tool lost versus the saved list; only the 13 additions.'
+          - 'Bearer MCP smoke: search, get_page (large page returns outline and window), put_page with expected_revision and with force, add_timeline_entry, put_raw_data; put_page on an existing slug without revision refused revision_required.'
+          - 'Smoke receipts show persistence.mode database, never owner_unavailable or write_pending; gbrain sources writer status --probe --json: native_lock linux-x64-musl acquired true, enabled false, every source database_only; no ''[persistence] phase='' lines in either container log.'
+          - 'doctor --json recorded: rls ok, persistence_request_indexes ok (v276 index persistence_requests_foreground_committed valid), unbound_source ok; bun_runtime warn is expected on Bun 1.4.2.'
+          - Timeline row counts and get_timeline per page match the baseline; vectors survive (embedded_count == chunk_count, missing_embeddings 0).
+          - Canned search and query probes on pre-walk pages return the baseline slugs.
+          - gmail and gcal sources keep syncing (autopilot sync jobs succeed) or the collector CronJobs complete; autopilot cycle and embed --stale succeed.
+          - 'hermes-agent init log shows ''gbrain skills synced to <sha>'' and ''skills: kept <n> gbrain, <m> bundled; removed N; missing 0'' after the skill_review decision.'
+        rollback: 'Restore database and binary together, never binary only: repin the previous gbrain image digest in ai.yaml with the previous GBRAIN_SHA (and revert oci gbrain/pins.env) and restore the pg_dump taken before this stop. An older binary on the upgraded database re-creates superseded function bodies in initSchema (#7776, open) and gbrain says a downgrade below 0.60.255.0 must be quiescent (serve, autopilot and sync stopped).'
+        bisect:
+          - version: v0.60.323.0
+            pin: feb3855e92ab3c452c038c584c3c491a21fcb0b1
+            date: 2026-10-20
+            expected_schema: 262
+            use: Carries .249/.284/.323; isolates migrations 243-262 if the 242-to-276 hop fails on the copy. Not in a skip range.
+          - version: v0.60.466.0
+            pin: bf60577141665860e1a5c0200c62fee282a80118
+            date: 2026-10-26
+            expected_schema: 276
+            use: Same schema as the stop without the 467 --flag=value gate; isolates that CLI change if serve or autopilot misbehave.
+        prerequisites:
+          - what: 'A gbrain-rehearsal copy restored from a fresh prod dump; #783 plans to remove the copy after 7 clean days on v0.60.214.0, so hold that removal or recreate the copy'
+            effort: simplesalt/projects#783
+          - what: A fresh manual pg_dump of gbrain-pg (no backup automation yet)
+            effort: simplesalt/projects#549
+          - what: fireflies-ingest transcript rewrites keep working on this gbrain version
+            effort: simplesalt/projects#908
+            require: done
+          - what: Hermes writes gbrain pages safely on this gbrain version
+            effort: simplesalt/projects#909
+            require: done
+          - what: The plan's gbrain pin places match how gbrain is deployed
+            effort: simplesalt/projects#910
+            require: done
+      - version: v0.60.483.0
+        pin: 5b94dca630d3af7a8eb2e42eacfafd9db52672f1
+        date: 2026-10-28
+        released: 2026-10-28T20:09:14Z (GitHub release); merge commit 2026-10-28T20:04:34Z
+        expected_schema: 279
+        bun: engines.bun >=1.4.4 (package.json at the pin); every command except --version exits 1 below 1.4.4 (468.0)
+        why: 'Newest release inside the adoption window (14 days old on 2026-11-11). Past the Bun floor, so it is gated on simplesalt/projects#783 (every gbrain container on a digest-pinned oven/bun 1.4.4+ alpine image). Over stop 1 it adds: Bun floor and the end of the TLS read leak (#7596, #7644); 470 pg_temp function search_path (v277); 474 writer guards refuse a role that cannot read persistence_brain (v278); 476 text in imported Gmail, calendar, GitHub and chat pages can no longer plant facts, takes, links or timeline rows (our gmail/gcal native sources import third-party text); 478 #7778 extract-conversation-facts completion after a purge tombstone; 479 #7814 v0.13.1 no longer stamps validate:false on every page; 481 and 483 refuse private-visibility requests spelled in a form gbrain does not apply instead of publishing them world-readable; v279 (outcome markers skip the purge guard) belongs to the 478 fix. No MCP tool change versus stop 1 (TOOL_CATALOG identical, 162 tools). Skill review result identical to stop 1.'
+        caveats:
+          - 'Not fixed in it (all outside our profile or low impact): #7873 edit_page provenance and trust tier (managed brains; fixed 486.0, 2026-10-29); #8906 Google People sync-token re-list overruns autopilot''s 10-minute job limit (only with a Google contacts source of thousands of contacts; fixed 625.0, 2026-11-09); #7632 guard triggers fail open under a scoped role without lookup policies (owner role unaffected; fixed 543.0); #7698 fact UPDATE deadlock against a concurrent fact purge (open); #7671 copied or restored brain directory makes every put_page fail recovery_required (open; only sources with a local_path); #7900 apply-migrations 0.53.0 wedge after a host move (fixed 488.0; we do not run apply-migrations).'
+          - '474.0 ''A role that can''t see persistence_brain is now refused even on an unmanaged brain'': the DB role check in stop 1''s before is a hard gate here.'
+        skill_review:
+          script: python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py gbrain <live pin> 5b94dca630d3af7a8eb2e42eacfafd9db52672f1
+          expected: 'Dry-run on 2026-11-11 against live 23fdb464: exit 3; 75 skills at both; added 0, removed 0, changed 15; allow-listed changed brain-ops, briefing, meeting-ingestion, query; none removed or missing. Run it again against the live pin of that day (stop 1''s pin if stop 1 landed).'
+          inputs:
+            - 'Live pin (old, <live pin>): GBRAIN_SHA in oci gbrain/pins.env (stop 1''s pin once landed); this stop''s pin (new): 5b94dca630d3af7a8eb2e42eacfafd9db52672f1.'
+            - 'Allow-list: the gbrain section of manifests/hermes-skills.yaml.'
+            - tools/list for the hermes-mcp bearer on the rehearsal copy at this pin and on prod; compare names.
+        before:
+          - Stop 1 landed and validated, or the rehearsal covers both hops in order (one stop per run).
+          - 'simplesalt/projects#783 done: BUN_IMAGE in oci gbrain/Containerfile is a digest-pinned oven/bun 1.4.4+ alpine image (currently 1.4.2), moved in the same oci rebuild as GBRAIN_SHA or before it; bun --version checked in the built image before the digest is repinned. Note the #783 plan removes the rehearsal copy and dumps after 7 clean days on v0.60.214.0: keep or recreate the copy for this hop.'
+          - Fresh pg_dump of gbrain-pg and a rehearsal copy restored from it; rehearse the hop (migrations 277-279 are small function rewrites; v277 and v278 ALTER or replace functions the migrating role must own, otherwise doctor function_search_path prints the ALTER FUNCTION to run as the owner).
+          - DB role owns its tables or has BYPASSRLS (hard gate, see 474.0).
+          - 'Imported gmail/gcal text changes: 476.0 escapes gbrain: markers, timeline sentinels and dated lines in imported pages (new imports only); doctor outside_content_fences lists old pages that already carry indexed rows from a sender, review with the operator, remove nothing automatically.'
+          - Same writer-contract, flag= spelling, no apply-migrations, null local_path and baseline items as stop 1.
+          - Rebuild ghcr.io/simplesalt/oci/gbrain from oci gbrain/pins.env at this SHA on a Bun 1.4.4+ BUN_IMAGE, then repin its digest in the four ai.yaml places and GBRAIN_SHA in install-cli-tools in one brain commit; Recreate.
+        validate:
+          - gbrain --version reports v0.60.483.0; Bun version check passes at startup; config version row equals schema 279.
+          - 'gbrain doctor --json: bun_runtime ok, function_search_path ok, rls ok, persistence_request_indexes ok, unbound_source ok; recorded with the repair previews; any proposed repair stops the walk for operator review.'
+          - All stop 1 validate items (health, bearer smoke, tools/list, writer smoke receipts persistence.mode database, timeline and vector baselines, canned probes, gmail/gcal sync, autopilot cycle, embed --stale, hermes skills init log).
+          - 'A put_page smoke asking visibility private in lowercase on its own frontmatter line still works; a Visibility: Private spelling is refused visibility_not_applied (481.0).'
+        rollback: Restore database and binary together from the pg_dump taken before this stop, repinning the previous gbrain image digest (previous Bun and previous SHA) when stop 1 was the live pin (stop 1 runs on Bun 1.4.2; 467 and older start on either Bun). Never run the older binary against the schema-279 database (#7776).
+        bisect:
+          - version: v0.60.474.0
+            pin: d458d8dc2cb7384476bacad5379bf48c3f44e0a1
+            date: 2026-10-27
+            expected_schema: 278
+            use: Upstream's first stable-channel release (tag stable-v0.60.474.0, promoted 2026-10-28T04:52:51Z after soak run 40603223271); fallback if 483 fails on the copy; lacks 476, 478, 479, 481, 483.
+          - version: v0.60.468.0
+            pin: 0bca88e360e9f9d28e87611edd53d503063c9f1c
+            date: 2026-10-26
+            expected_schema: 276
+            use: Bun floor only (per changelog); isolates the Bun 1.4.4 move from schema 277-279 if the hop fails.
+        prerequisites:
+          - what: Every gbrain container and initContainer on a digest-pinned oven/bun 1.4.4+ alpine image
+            effort: simplesalt/projects#783
+          - what: Stop v0.60.467.0 landed and validated
+          - what: A gbrain-rehearsal copy restored from a fresh prod dump
+            effort: simplesalt/projects#783
+          - what: A fresh manual pg_dump of gbrain-pg
+            effort: simplesalt/projects#549
+    future:
+      - version: v0.60.486.0
+        pin: 85e39d3893ed7a93204cbd9faf2588a36a99ef1b
+        date: 2026-10-29
+        expected_schema: 279
+        note: edit_page provenance/trust-tier fix (#7873); adoptable 2026-11-12 if screened.
+      - version: v0.60.531.0
+        pin: 3ec766c40664b652b14e39788d177139f5a7b105
+        date: 2026-10-31
+        expected_schema: 281
+        note: remember no-vector fallback when the embedder is slow (#8135); adoptable 2026-11-14.
+      - version: v0.60.543.0
+        pin: b85dd645056dee018f9c4b451435ef9fafb77822
+        date: 2026-11-02
+        expected_schema: 285
+        note: guard triggers no longer fail open under a scoped role (#7632); adoptable 2026-11-16.
+      - version: v0.60.593.0
+        pin: 27f8b9d6287c2ba635532c7d3bc015c50e1d769b
+        date: 2026-11-06
+        expected_schema: 291
+        note: 'upstream stable-promoted 2026-11-06T20:40Z (stable-v0.60.593.0, previous 474); #8738 soak regression reports remember p95 and serve RSS at 65 ms RTT (open); adoptable 2026-11-20.'
+      - version: v0.60.625.0
+        pin: 431a7ee6bb20c117fe662bc220ae0986dc6720fd
+        date: 2026-11-09
+        expected_schema: 296
+        note: Google People sync-token re-list fix (#8906); adoptable 2026-11-23.
+      - version: v0.60.654.0
+        pin: eb74799ee8d3debeea34cdd7cd2f30a3406e11af
+        date: 2026-11-10
+        expected_schema: 297
+        note: current upstream stable (tag stable, promoted 2026-11-11T05:24Z); adoptable 2026-11-24.
+      - version: v0.60.675.0
+        pin: 84033e3d5f1bf832ee9fe9ef643dc21aee9ee586
+        date: 2026-11-11
+        expected_schema: 302
+        note: upstream latest on 2026-11-11 (latest-stable tag points here); adoptable 2026-11-25. Not screened.
+    screened_not_applicable:
+      - '#6982 extract_facts fence step overwrites a newer database-only page body with the stale checkout file (classic Postgres, sync.write_through=false): fixed 302.0; needs a source with a checkout, ours have local_path null.'
+      - '#7630 relative default local_path ''.'' makes sync git-init and import the working folder: fixed 469.0 (sync_anchor_relative); needs a relative local_path or sync.repo_path.'
+      - '#7438/#7778 purge tombstones and extract-conversation-facts: needs forget --purge tombstones; stop 1 sits in the 433.0-477.0 window, stop 2 has the fix.'
+      - '#7172 add_timeline_entry 57014 on large pages: fixed 346.0; reported on large vector indexes (hundreds of thousands of chunks), ours ~1500 chunks.'
+      - '#6693, #7949, #8644, #8645: managed sync or classic Google purge-tombstone failures; no tombstones on our brain.'
+      - '#8345 brain_search hang behind a transaction pooler (open, needs-repro, no version tied to a stop): applies only if gbrain reaches Postgres through a pooler.'
+      - '#8450 doctor and other read-only commands apply pending migrations on connect (open, seen from 0.60.551): never run doctor from a newer staged build against prod before the planned hop.'
+    page_history:
+      baseline_pin: 23fdb464a944cb95ec9e55ddaec68f7abdd8b3dc
+      effort: simplesalt/projects#926
+      snapshot: 'src/core/import-file.ts:711 and :722 call tx.createVersion for an existing page before tx.putPage (:724) in one transaction; prod 2026-11-12: put_page, edit_page, add_timeline_entry and delete_page each snapshot (#926 F11).'
+      pruning: No statement in src/ deletes from or truncates page_versions, and no config key bounds version age or count.
+      purge: 'runPhasePurge (src/core/cycle.ts:1721) hard-deletes only: pages with deleted_at older than SOFT_DELETE_TTL_HOURS_FOR_PURGE = 72 (cycle.ts:1827) with their dependent rows, through purgeDeletedPagesCoordinated (src/core/persistence/purge-deleted.ts:62-86), which on managed persistence submits delete_page with purge: true per page (handled in src/core/persistence/page-purge.ts) and otherwise calls engine.purgeDeletedPages (src/core/engine-sql/pages.ts:285); sources with archived = true and archive_expires_at <= now() with their pages (purgeExpiredSources, src/core/destructive-guard.ts:476); and stale clone temp dirs.'
+      stop_if:
+        - tx.createVersion is gone from import-file.ts or runs after tx.putPage, or an edit_page or put_page on the rehearsal copy adds no version
+        - 'anything removes page_versions rows of a page whose deleted_at is null, or a config key or default bounds versions under 6 months or to a fixed count, except the large-page bounds dylan accepted on 2026-11-14 (simplesalt/projects#952): an inline page whose body is over 1 MiB (PAGE_INLINE_MAX_BYTES) keeps at least its newest 5 versions over 1 MiB and every version at or under 1 MiB, and a segmented page keeps at least its newest 50 segmented versions within at least 64 MiB of pinned body bytes; still stop if such a bound applies to an inline page at or under 1 MiB, removes an inline version at or under 1 MiB, or keeps fewer than those 5 versions, 50 versions or 64 MiB'
+        - the purge hard-deletes pages or page_versions on any condition beyond the purge baseline, or its window drops below 72 hours
+  hermes-agent:
+    upstream: https://github.com/NousResearch/hermes-agent
+    pin_kind: image-digest
+    pinned_in:
+      - {file: manifests/ai.yaml, where: "Deployment hermes-agent, initContainer install-cli-tools: image docker.io/nousresearch/hermes-agent:latest@sha256:<digest>"}
+      - {file: manifests/ai.yaml, where: "Deployment hermes-agent, initContainer seed-hermes-config: same image ref; must equal the others"}
+      - {file: manifests/ai.yaml, where: "Deployment hermes-agent, initContainer patch-tool-bridge: same image ref; must equal the others"}
+      - {file: manifests/ai.yaml, where: "Deployment hermes-agent, initContainer install-qr-decoder: same image ref; must equal the others (simplesalt/brain 95b901d)"}
+      - {file: manifests/ai.yaml, where: "Deployment hermes-agent, container hermes-agent: same image ref; must equal the others"}
+    current: {version: v2026.9.24, pin: 'sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7', date: 2026-09-24, live_since: "simplesalt/projects#766"}
+    target: {version: v0.22.5, pin: 'sha256:9c5561579f3ffdf333401797094ac3a743738d6c25d40f4331c7bf77b694238d', date: 2026-10-23}
+    notes:
+      - "Pins are multi-arch index digests of the dated tag. Never the floating :latest (sha256:d4da4a40... differs from the v2026.9.24 tag and was re-pushed ~10h later)."
+      - "Curated release notes exist only for v2026.7.1, v2026.7.20, v2026.8.3 and v2026.8.31; v2026.9.11 has its own state.db patch-release write-up; v2026.9.7, v2026.9.14, v2026.9.21 and v2026.9.24 defer to v0.22.0 notes, which had not shipped as of 2026-09-30 (v2026.9.24 = v0.21.5). Hold full prod trust in the uncurated stops until they ship."
+      - "Probes are TCP 9119 only: API (8642), webhook (8644) and gateway health are unprobed, so every stop relies on the explicit validate checks."
+      - "/opt/data is a 5Gi emptyDir: all state and any lazy installs rebuild on every pod recreation."
+      - "The Claude Code hindsight plugin config was removed with Claude Code in 0d196b2 (simplesalt/projects#742)."
+      - "Hermes skills come from the git allow-list manifests/hermes-skills.yaml and its bundled-skill sync is skipped (.no-bundled-skills)."
+      - "initContainer patch-tool-bridge rewrites tool_call's arguments schema to a JSON string (NousResearch/hermes-agent#96610): our OpenRouter key allows only Groq for minimax-m2.7, which fills a property-less object only as {}. It also patches other files copied from the image (tool_search.py, conversation_loop.py, vision_message_prep.py); at every stop its log must show no 'WARNING ... left unchanged'. Drop the patch once upstream fixes #96610."
+      - 'Upstream moved from date tags to semver: v2026.9.24 = v0.21.5, and v0.21.6 (2026-10-08) is the first semver release. Pins stay multi-arch index digests of the vX.Y.Z tag; never :stable, :latest, -desktop, rc.N or +canary tags.'
+      - Images from v0.21.6 carry no org.opencontainers.image.revision label; skill-diff.py then takes the image's single vX.Y.Z Docker Hub tag and its NousResearch/hermes-agent commit (simplesalt/projects#904), and says so on stderr.
+    before_first_stop:
+      - "Bump the digest in every pinned_in place in the same commit at every stop."
+    skip:
+      - {from: v2026.8.31, to: v2026.8.31, reason: "First tag with the state.db connection rewrite that upstream calls fragile (fixed in v2026.9.11 and v2026.9.14); its curated notes can be read without deploying it."}
+      - {from: v2026.9.7, to: v2026.9.7, reason: "Uncurated modularisation rollup that lands after the state.db rewrite and before its fixes in v2026.9.11 and v2026.9.14; v2026.9.14 isolates it."}
+      - from: v0.21.6
+        to: v0.21.6
+        reason: 'First PM-based Docker image: the first dependency generation drops the image''s baked extras, so after a restart every MCP server fails (''requires the mcp Python SDK'') and api_server can lose aiohttp (#135329, fixed by #135726 only from v0.21.7); and api_server is silently never started when API_SERVER_KEY is injected only through env and a named profile directory exists (#135298, still open, fix #128063 unmerged). Notes are a stub plus security fixes. Includes the dashboard auth hardening that every later stop also carries.'
+      - from: v0.21.7
+        to: v0.21.7
+        reason: No published Docker release tag, notes are a stub deferring to v0.22.0, superseded two days later; its only isolation value is covered by the v0.22.0 bisect entry and the rc.15 diagnostic entry.
+      - from: v0.22.0
+        to: v0.22.0
+        reason: 'Curated notes but lacks the recycled-PID gateway wedge fix (#138594 merged 2026-10-14T21:59Z, first in v0.22.2), so a container restart on an emptyDir that keeps the pid record can leave the supervised gateway never Ready (#138594 fixes #133744; #140041 and #138343 are the same symptom class, closed 2026-10-16); image venv out of sync with uv.lock (#138220). Kept only as a bisect entry.'
+      - from: v0.22.1
+        to: v0.22.1
+        reason: Built from the wrong commit (shipped unreleased gateway work; Microsoft Store app stuck on Connecting); v0.22.2 notes say 0.22.2 is the release 0.22.1 was meant to be.
+      - from: v0.22.3
+        to: v0.22.4
+        reason: 'Not skipped for a fault: v0.22.3 is the 620-PR rollup (kept as the v0.22.5 bisect entry; control socket becomes fatal, MCP SDK 2.3.0, session authority) and v0.22.4 is 14 desktop-only commits on top, so neither adds an isolation point between v0.22.2 and v0.22.5 that a stop needs.'
+    stops:
+      - version: v2026.8.27
+        pin: sha256:e0df6adebddf29b91112aefc999d4aaf6846c9eb544faca5672a16a13590ff79
+        date: 2026-08-27
+        why: "Entrypoint dispatcher and Node 26 (8.3), MCP SDK 2.0 stateless protocol (8.16.2), lazy MCP start and always-deferred MCP tools, auxiliary.web_extract removed, stage2 API-key logic; last tag before the state.db rewrite."
+        skill_review:
+          script: "python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py hermes <live pin> sha256:e0df6adebddf29b91112aefc999d4aaf6846c9eb544faca5672a16a13590ff79"
+          inputs:
+            - "Live pin (old, <live pin>): the hermes-agent image digest in manifests/ai.yaml (every pinned_in place is equal); this stop's pin (new): sha256:e0df6adebddf29b91112aefc999d4aaf6846c9eb544faca5672a16a13590ff79."
+            - "Allow-list: the bundled section of manifests/hermes-skills.yaml (built-ins come from the Hermes image, not from the gbrain sync)."
+            - "The new image's contents and revision: for each allow-listed built-in, the binaries and Python libraries it needs; the release notes for MCP client or toolset changes in this range; gbrain's tools on prod (gbrain.ssint-main-ai:3131, hermes-mcp token), unchanged by a hermes-agent stop."
+          outputs:
+            - "The skill-diff JSON and exit code (0: no skill added, removed or changed; 3: something changed; 1: could not tell, stop; 2: usage error)."
+            - "If exit 3: a works / partly works / cannot work verdict with a one-line reason per added or changed skill and per allow-listed removed skill; the proposal of additions and removals put to the user; the user's decision; the approved list written to manifests/hermes-skills.yaml in the bump commit (unchanged if nothing is approved)."
+        before:
+          - "Drop the dead auxiliary.web_extract seed key from manifests/hermes-config.yaml."
+        validate:
+          - "Pod Ready with 0 restarts for 30 min; s6 dashboard and gateway both up; runs non-root (uid 10000)."
+          - "Dashboard basic auth works; 8642 /health, /health/detailed, /v1/models and /v1/toolsets respond directly and via hermes-proxy."
+          - "A streaming chat completion succeeds."
+          - "All four MCP servers (flux, gbrain, hermes-msg, cloudflare) connect, one read-only call each; hermes-msg speaks hand-rolled MCP 2024-11-05, so check it against the MCP SDK 2.0 stateless protocol."
+          - "No config, toolset or 'Disabled suspicious MCP' warnings in logs."
+          - "hindsight_recall returns bank hermes data; firecrawl search works."
+          - "hermes-agent init log shows 'skills: kept <n> gbrain, <m> bundled; removed N; missing 0' (<n> and <m> are the counts listed in manifests/hermes-skills.yaml after this stop's skill_review) with no 'ERROR: allow-listed bundled skill missing' (built-ins come from the new image)."
+        rollback: "Revert the digest in every pinned_in place; /opt/data is an emptyDir, so no state persists across pod recreation."
+        bisect:
+          - {version: v2026.7.20, pin: 'sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a', date: 2026-07-20, covers: "MCP tool renames (7.7), dual-stack webhook listener and smart-approval default; curated notes exist."}
+          - {version: v2026.8.3, pin: 'sha256:16788311e2fa3035456bdc1bafb8ec2b1777db64ebf020af9bb7eb73c3712c9e', date: 2026-08-03, covers: "Entrypoint dispatcher and Node 26; curated notes exist."}
+          - {version: v2026.8.16.2, pin: 'sha256:a39fc11620213e3669a327aff5c6cb1eb2b8a238c6044e33e7ef8885833d89a7', date: 2026-08-17, covers: "MCP SDK 2.0 stateless protocol; land here if MCP breaks at v2026.8.27."}
+      - version: v2026.9.14
+        pin: sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294
+        date: 2026-09-14
+        why: "Isolates the 9.7 modularisation rollup: instant-deny approvals for api_server/webhook, core tools deferred behind tool_search, state.db fixes (fixes the gateway+dashboard duplicate-writer leak, our topology), config fail-closed guard, watchdog."
+        skill_review:
+          script: "python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py hermes <live pin> sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294"
+          inputs:
+            - "Live pin (old, <live pin>): the hermes-agent image digest in manifests/ai.yaml (every pinned_in place is equal); this stop's pin (new): sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294."
+            - "Allow-list: the bundled section of manifests/hermes-skills.yaml (built-ins come from the Hermes image, not from the gbrain sync)."
+            - "The new image's contents and revision: for each allow-listed built-in, the binaries and Python libraries it needs; the release notes for MCP client or toolset changes in this range; gbrain's tools on prod (gbrain.ssint-main-ai:3131, hermes-mcp token), unchanged by a hermes-agent stop."
+          outputs:
+            - "The skill-diff JSON and exit code (0: no skill added, removed or changed; 3: something changed; 1: could not tell, stop; 2: usage error)."
+            - "If exit 3: a works / partly works / cannot work verdict with a one-line reason per added or changed skill and per allow-listed removed skill; the proposal of additions and removals put to the user; the user's decision; the approved list written to manifests/hermes-skills.yaml in the bump commit (unchanged if nothing is approved)."
+        before: []
+        validate:
+          - "Pod Ready with 0 restarts for 30 min; s6 dashboard and gateway both up."
+          - "8642 /health, /health/detailed, /v1/models and /v1/toolsets respond directly and via hermes-proxy; a streaming chat completion succeeds."
+          - "A flagged terminal command sent via the API server is denied instantly (expected new default); ordinary chat via hermes-proxy and big-agi still works."
+          - "All four MCP servers connect with core tools deferred behind tool_search; one read-only call each."
+          - "No config fail-closed, toolset or 'Disabled suspicious MCP' warnings; state.db has no duplicate-writer errors."
+          - "hindsight_recall returns bank hermes data."
+          - "hermes-agent init log shows 'skills: kept <n> gbrain, <m> bundled; removed N; missing 0' (<n> and <m> are the counts listed in manifests/hermes-skills.yaml after this stop's skill_review) with no 'ERROR: allow-listed bundled skill missing' (built-ins come from the new image)."
+        rollback: "Revert the digest in every pinned_in place."
+        bisect:
+          - {version: v2026.9.11, pin: 'sha256:9469b3e78b9545b6d576eb8887a95352e9a0ea83730eaf31431cf862ca1010e1', date: 2026-09-11, covers: "Fallback if v2026.9.14 fails: carries the state.db connection fix; the gateway+dashboard duplicate-writer leak is fixed only in v2026.9.14."}
+      - version: v2026.9.21
+        pin: sha256:6bece0644e29a347e5ae17db43c36938c86f171c6f5e0cef18aa2075d331f3a3
+        date: 2026-09-21
+        why: "Host-wide singleton lock with exit-75 retry, multiplex profiles resolving to standalone for single-profile, placeholder-secret rejection; last tag with in-tree hindsight."
+        skill_review:
+          script: "python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py hermes <live pin> sha256:6bece0644e29a347e5ae17db43c36938c86f171c6f5e0cef18aa2075d331f3a3"
+          inputs:
+            - "Live pin (old, <live pin>): the hermes-agent image digest in manifests/ai.yaml (every pinned_in place is equal); this stop's pin (new): sha256:6bece0644e29a347e5ae17db43c36938c86f171c6f5e0cef18aa2075d331f3a3."
+            - "Allow-list: the bundled section of manifests/hermes-skills.yaml (built-ins come from the Hermes image, not from the gbrain sync)."
+            - "The new image's contents and revision: for each allow-listed built-in, the binaries and Python libraries it needs; the release notes for MCP client or toolset changes in this range; gbrain's tools on prod (gbrain.ssint-main-ai:3131, hermes-mcp token), unchanged by a hermes-agent stop."
+          outputs:
+            - "The skill-diff JSON and exit code (0: no skill added, removed or changed; 3: something changed; 1: could not tell, stop; 2: usage error)."
+            - "If exit 3: a works / partly works / cannot work verdict with a one-line reason per added or changed skill and per allow-listed removed skill; the proposal of additions and removals put to the user; the user's decision; the approved list written to manifests/hermes-skills.yaml in the bump commit (unchanged if nothing is approved)."
+        before: []
+        validate:
+          - "Pod Ready with 0 restarts for 30 min (no crash-loop from the singleton lock exit-75 retry); s6 dashboard and gateway both up."
+          - "No placeholder-value secrets rejected at boot (check hermes-secrets); single-profile resolves to standalone."
+          - "8642 /health, /health/detailed, /v1/models and /v1/toolsets respond directly and via hermes-proxy; a streaming chat completion succeeds."
+          - "All four MCP servers connect, one read-only call each."
+          - "hindsight_recall returns bank hermes data with the in-tree hindsight client."
+          - "hermes-agent init log shows 'skills: kept <n> gbrain, <m> bundled; removed N; missing 0' (<n> and <m> are the counts listed in manifests/hermes-skills.yaml after this stop's skill_review) with no 'ERROR: allow-listed bundled skill missing' (built-ins come from the new image)."
+        rollback: "Revert the digest in every pinned_in place."
+      - version: v2026.9.24
+        pin: sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
+        date: 2026-09-24
+        why: "Hindsight removed from core and lazy-installed as a catalog plugin at first agent init (git + PyPI into /opt/data/lazy-packages); needs hindsight-client/embed >= 0.10.1 vs 0.6.1 baked in."
+        skill_review:
+          script: "python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py hermes <live pin> sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7"
+          inputs:
+            - "Live pin (old, <live pin>): the hermes-agent image digest in manifests/ai.yaml (every pinned_in place is equal); this stop's pin (new): sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7."
+            - "Allow-list: the bundled section of manifests/hermes-skills.yaml (built-ins come from the Hermes image, not from the gbrain sync)."
+            - "The new image's contents and revision: for each allow-listed built-in, the binaries and Python libraries it needs; the release notes for MCP client or toolset changes in this range; gbrain's tools on prod (gbrain.ssint-main-ai:3131, hermes-mcp token), unchanged by a hermes-agent stop."
+          outputs:
+            - "The skill-diff JSON and exit code (0: no skill added, removed or changed; 3: something changed; 1: could not tell, stop; 2: usage error)."
+            - "If exit 3: a works / partly works / cannot work verdict with a one-line reason per added or changed skill and per allow-listed removed skill; the proposal of additions and removals put to the user; the user's decision; the approved list written to manifests/hermes-skills.yaml in the bump commit (unchanged if nothing is approved)."
+        before:
+          - "hindsight server is already at 0.10.2 (see order)."
+          - "Consider an initContainer that pre-installs the hindsight plugin into /opt/data/lazy-packages: the lazy install re-runs on every pod recreation (emptyDir), needs git and PyPI egress, and is not retried until process restart."
+        validate:
+          - "Pod Ready with 0 restarts for 30 min; s6 dashboard and gateway both up."
+          - "hindsight plugin installed at first agent init (hindsight-client >= 0.10.1 present); hindsight_recall returns bank hermes data."
+          - "8642 /health, /health/detailed, /v1/models and /v1/toolsets respond directly and via hermes-proxy; a streaming chat completion succeeds."
+          - "All four MCP servers connect, one read-only call each; no config, toolset or 'Disabled suspicious MCP' warnings."
+          - "Firecrawl search works."
+          - "hermes-agent init log shows 'skills: kept <n> gbrain, <m> bundled; removed N; missing 0' (<n> and <m> are the counts listed in manifests/hermes-skills.yaml after this stop's skill_review) with no 'ERROR: allow-listed bundled skill missing' (built-ins come from the new image)."
+        rollback: "Revert the digest in every pinned_in place; the hindsight server can stay at 0.10.2 (v2026.9.21 keeps the baked-in 0.6.1 client)."
+      - version: v0.22.2
+        pin: sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919
+        date: 2026-10-15
+        why: 'Hop 1 of 2 (age 27 days at 2026-11-11, eligible since 2026-10-29). First tag after the v0.21.x to v0.22.0 rollup (v0.21.6 window 8,867 commits, v0.21.7 740, v0.22.0 notes cover about 24,200 commits and 7,180 closed issues since v0.21.0) that is clean for our profile: it is the corrected v0.22.1 (v0.22.1 was built from the wrong commit); it has the Docker baked-extras fix (#135726, absent in v0.21.6: first PM generation dropped mcp and aiohttp so every MCP server failed after a restart), and the recycled-PID gateway wedge fix (#138594, absent in v0.22.0: a container restart can leave the supervised gateway unable to start). It stays before v0.22.3, where the gateway control socket becomes fatal, MCP SDK moves 2.0.0 to 2.3.0 and the session-authority cutover lands (users report 0.22.2 works and 0.22.3+ regresses: #149477, #143197 reporter rolled the fleet back to 0.22.2). Carries v0.21.6 dashboard auth hardening (X-Forwarded-For rate-limit bypass, login redirect takeover, git filter, email allowlist) and curated v0.22.0 notes (Python 3.14 PM runtime, Debian 13 base, sessions.auto_prune default on, Hindsight/memory providers as catalog plugins, tool renames, config.yaml last-good fallback). Docker now bootstraps dependencies with the package manager: stage2 mints a PM dependency generation under /opt/data/installs (about 1.9 GB each per #140349; the live image uses /opt/data/lazy-packages), which is the main new operational risk for a 5Gi emptyDir. Patch-tool-bridge: all four patterns match exactly once in the image bytes at this digest, #96610 is still open (last update 2026-10-31) and tool_search.py still declares the same schema, so the patch stays. Hindsight catalog pin is plugin 1.2.2 (vectorize-io/hindsight f843f173), pip requirement hindsight-client>=0.10.1,<1, unchanged config keys (local_external, recall_*, api_url, banks).'
+        skill_review:
+          script: python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py hermes <live pin> sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919
+          inputs:
+            - 'Live pin (old, <live pin>): the hermes-agent image digest in manifests/ai.yaml (all pinned_in places are equal; today sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7 = v2026.9.24, revision f97608f178d1ffeca59860195ab7da295f7c8e5f); this stop''s pin (new): sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919.'
+            - 'Allow-list: the bundled section of manifests/hermes-skills.yaml (arxiv, hermes-agent, humanizer, maps, youtube-content at research time; read from simplesalt/brain default branch by the script).'
+            - 'The image''s contents and revision: for each allow-listed built-in, the binaries and Python libraries it needs; release notes for MCP client or toolset changes in this range; gbrain''s tools on prod (gbrain.ssint-main-ai:3131, hermes-mcp token), unchanged by a hermes-agent stop.'
+          outputs:
+            - 'Computed result (exit 3, review needed): 58 bundled skills at f97608f1 -> 58 at d923a5eb; added 0, removed 0, changed 13 (baoyu-infographic, claude-code, docx, google-workspace, grounded-citations, hermes-agent, hermes-agent-skill-authoring, p5js, pdf, powerpoint, python-debugpy, xlsx, youtube-content); allow-listed and changed: hermes-agent, youtube-content; allow-listed and removed or missing: none. Verdicts (SKILL.md diff f97608f..bf0203a7, identical file set at v0.22.0, v0.22.2, v0.22.5): hermes-agent WORKS (one comment line about the installer wording changed); youtube-content PARTLY WORKS (setup rewritten to the PM workflow, needs the terminal toolset and a PM-prepared Python, neither available under platform_toolsets api_server or cron; it already could not run its helper script, so no regression, but the user should decide whether to keep it allow-listed). arxiv, humanizer, maps unchanged.'
+            - 'If the user approves a change: the approved list is written to manifests/hermes-skills.yaml in the bump commit (unchanged if nothing is approved).'
+        before:
+          - 'Pull the new digest and confirm all pinned_in places are edited in one commit: initContainers install-cli-tools, seed-hermes-config, patch-tool-bridge, install-qr-decoder and container hermes-agent (five image lines in manifests/ai.yaml).'
+          - 'Check patch-tool-bridge patterns still match at this image. DONE by research: against the image layer bytes of this digest (tools/tool_search.py 30432 B, agent/conversation_loop.py 94505 B, agent/vision_message_prep.py 16959 B, identical to commit d923a5eb), the arguments regex hits 1, the calls regex hits 1, the cut-off string hits 1, the vision line hits 1, and the patched tool_search.py compiles. Re-run the same four counts on the pulled image in the bump commit; adjust or drop a patch only if a count is not 1. Upstream #96610 (tool_call arguments object schema) is open, so no patch can be dropped. Note: manifests/hermes-config.yaml sets tools.tool_search.enabled: off, so the two tool_search patches are inert in live use.'
+          - 'Config seed: manifests/hermes-config.yaml agent.disabled_toolsets still lists homeassistant and spotify, which are no longer core toolsets from v0.22.0 (moved to catalog plugins; yuanbao is gone from toolsets.py at v0.23.1). Confirm they cause no warning at boot; drop them in the bump commit if they do. All other seeded keys (stall_guards, intent_ack_continuation, budget_warning_ratio, tool_loop_guardrails, skills.write_approval, memory.*, auxiliary.*, platforms.webhook, mcp_servers.*) still exist in hermes_cli/config_defaults.py at this tag. _config_version 46 (live image) -> 50 migrates on first start; the seed pins 39 and is deep-merged over the live file.'
+          - 'ls /opt/data/profiles on the live pod shows no named profile (the live image''s stage2 creates the empty directory): with a named profile and API_SERVER_KEY injected only through env, api_server is silently dropped under multiplexing (#135298, open, fix #128063 unmerged).'
+          - 'Measure ephemeral-storage headroom: after this hop /opt/data holds PM dependency generations (about 1.9 GB each; #140349 reports two per boot on Docker/s6). If the first boot on a scratch pod exceeds about 3.5Gi, raise the home emptyDir sizeLimit in the same commit or stop.'
+          - 'Egress: boot-time dependency resolution and plugin install need PyPI plus GitHub (git clone of vectorize-io/hindsight at f843f173; GitHub release assets in uv.lock per #137930); confirm the pod already reaches both, as it must for the live lazy hindsight install.'
+          - hindsight server is at 0.10.2 (order rule); plugin 1.2.2 needs hindsight-client>=0.10.1,<1.
+          - Run the skill_review above and put the youtube-content decision to the user before the bump.
+        validate:
+          - Pod Ready with 0 restarts for 30 min; s6 dashboard (service 'dashboard') and gateway (service 'main-hermes') both up.
+          - 8642 /health, /health/detailed, /v1/models and /v1/toolsets respond directly and via hermes-proxy; webhook listener 8644 answers.
+          - A streaming chat completion succeeds directly and via hermes-proxy.
+          - 'Every MCP server enabled in manifests/hermes-config.yaml connects and answers one read-only call: at simplesalt/brain 556d7f9 that is efforts, gbrain, gbrain-mail, hermes-msg, notion and hubspot; flux and github are set enabled: false there and must stay unconnected without an error line; if the file has changed since, follow the file.'
+          - hindsight_recall returns bank hermes data (hindsight plugin active, hindsight-client >= 0.10.1 importable by the gateway process, server 0.10.2).
+          - patch-tool-bridge init log shows its four success lines and no 'WARNING ... left unchanged', 'cut-off wording not found' or 'image description line not found'.
+          - 'install-cli-tools init log shows ''skills: kept <n> gbrain, <m> bundled, ... removed N; missing 0'' with the counts in manifests/hermes-skills.yaml and no ''ERROR: allow-listed ... skill missing''.'
+          - 'seed-hermes-config init log shows ''cron: <name> scheduled'' or ''already scheduled'' for every seeded job and no ''WARN: cron ... not scheduled''; after 5 min the every-1m people-scan job has a fresh last run (hermes cron list) and its script exited 0.'
+          - No 'no dependency environment is committed' (#138990), 'Disabled suspicious MCP', config or unknown-toolset warnings in the hermes-agent logs; 'No messaging platforms enabled' is acceptable only if 'api_server connected' is also logged.
+          - 'Disk: du -sh /opt/data and /opt/data/installs stay under 3.5Gi of the 5Gi emptyDir after boot and again after 30 min; pod not evicted.'
+          - 'Stop-specific: kill the gateway process once (s6 restart of main-hermes) and confirm it comes back without ''gateway already running'' (recycled-PID fix #138594) and 8642 answers again.'
+          - 'Stop-specific: stage2 log shows ''[stage2] dependency environment: <current|base|...>'' and no ''[stage2] Warning: dependency refresh failed''; MCP servers still connect after the first restart (the #135329 failure mode: ''requires the mcp Python SDK, but it is not installed'').'
+          - 'Stop-specific: /opt/data/lazy-packages is no longer the hindsight install path; confirm via hermes memory status (or the plugin log) that hindsight is loaded from the PM generation and that hindsight_recall works after a gateway restart, not only on first boot.'
+          - 'Stop-specific: sessions.auto_prune now defaults on and config _config_version migrates 46 to 50: config.yaml in /opt/data is still valid YAML with the seed keys after boot.'
+          - 'Stop-specific: hermes-proxy continuity: two consecutive chat completions for one user return the same X-Hermes-Session-Id response header (proxy sends X-Hermes-Session-Key only, which is memory scope on /v1/chat/completions, same as live).'
+        rollback: Revert the digest to sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7 in every pinned_in place (all five image lines in manifests/ai.yaml); /opt/data is an emptyDir, so state and PM generations vanish with the pod. If the hop added a sizeLimit or seed-config change in the same commit, revert those too.
+        bisect:
+          - version: v0.22.0
+            pin: sha256:c69536a39e885b8943329bda68cdf44492458b96aa74a212239bde9d2aeb406a
+            date: 2026-10-14
+            covers: 'Curated notes (118 KB, rolls up v0.21.1-v0.21.7). Fallback if v0.22.2 fails and the cause is in the 21.x to 22.0 rollup: it has the baked-extras fix but NOT the recycled-PID wedge fix (#138594) and its image has a venv out of sync with uv.lock (#138220), so never leave it on a pod that restarts containers; diagnostic only, not a resting pin.'
+          - version: v0.21.7 (Docker tag rc.15-v0.21.7)
+            pin: sha256:444b42594e7f467425872fc35e077a227d377f0fe0726bc818706d62175fad8b
+            date: 2026-10-12
+            covers: No published vX.Y.Z Docker tag exists for v0.21.7; this is the last release-candidate attempt of its pipeline (commit 71d34bad, same as the git tag). Restored copy or scratch pod only, never prod; use only to separate the v0.21.6/v0.21.7 changes from v0.22.0.
+        prerequisites: []
+      - version: v0.22.5
+        pin: sha256:9c5561579f3ffdf333401797094ac3a743738d6c25d40f4331c7bf77b694238d
+        date: 2026-10-23
+        why: 'Hop 2 of 2 (published 2026-10-23T05:28Z, age 19 days, eligible since 2026-11-06; trails upstream v0.23.1 by about 2.5 weeks). Latest tag on or before 2026-10-28. Carries v0.22.3 (about 620 PRs: session authority and one gateway per host, MCP SDK 2.0.0 to 2.3.0, MCP progress notifications, plugin OAuth clients, auto-prune back to opt-in), v0.22.4 (13 desktop and plugin fixes, 14 commits) and v0.22.5 (81 PRs: Pillow 13 and dependency security bumps, hermes mcp serve moved out of core, long Claude answers no longer cut by the stall timer). Notes for v0.22.3 and v0.22.5 are uncurated stubs deferring to v0.23.0. Screened and not disqualifying for our profile (emptyDir state, HTTP bearer MCP, API server and webhook, single default profile): #142743 and #144696 (gateway.sock unsafe_control_permissions or EPERM crash-loop, only on Docker Desktop VirtioFS or sshfs bind mounts), #143818 and #143686 (sessions carried over from older releases become unwritable; our state starts empty every pod), #143197 (X-Hermes-Session-Key does not bind a session on chat completions; maintainer confirmed Session-Id is the selector and the key is memory scope only, which is also true on the live image), #144082 (model_routes with api_key; not used), #146453 and #148455 (MCP header problems for plugin-provided portable servers and for expired static tokens; ours are native servers with live bearer tokens), #144491 (tools/list_changed refresh after reconnect, server-specific), #138990 (Docker image dashboard actions and store-Python children fail with ''no dependency environment is committed''; reported on 0.22.1, reproduced on the v0.22.5 image per #145738; open in this stop, fixed in v0.22.6 by #145738; validate that cron scripts and the loopback dashboard are unaffected), #145750 (streaming client disconnect does not interrupt the agent turn since 0.22.4), #146676 (single report of a silent cron-ticker freeze on a 14-profile multiplexed fleet). Rule check: no reported data-loss, state.db-migration, never-Ready, auth or MCP-tool bug affecting our profile found unfixed here beyond those watch items; if hop 2 fails, #138990 is the likeliest cause and v0.22.6 (eligible 2026-11-16) is the fix.'
+        skill_review:
+          script: python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py hermes <live pin> sha256:9c5561579f3ffdf333401797094ac3a743738d6c25d40f4331c7bf77b694238d
+          inputs:
+            - 'Live pin (old, <live pin>): the hermes-agent image digest in manifests/ai.yaml (all pinned_in places are equal; today sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7 = v2026.9.24, revision f97608f178d1ffeca59860195ab7da295f7c8e5f); this stop''s pin (new): sha256:9c5561579f3ffdf333401797094ac3a743738d6c25d40f4331c7bf77b694238d.'
+            - 'Allow-list: the bundled section of manifests/hermes-skills.yaml (arxiv, hermes-agent, humanizer, maps, youtube-content at research time; read from simplesalt/brain default branch by the script).'
+            - 'The image''s contents and revision: for each allow-listed built-in, the binaries and Python libraries it needs; release notes for MCP client or toolset changes in this range; gbrain''s tools on prod (gbrain.ssint-main-ai:3131, hermes-mcp token), unchanged by a hermes-agent stop.'
+          outputs:
+            - 'Computed result (exit 3, review needed): 58 bundled skills at f97608f1 -> 58 at bf0203a7; added 0, removed 0, changed 13, the same 13 as v0.22.2 (SKILL.md for allow-listed hermes-agent and youtube-content is identical to the v0.22.2 verdicts: hermes-agent WORKS, youtube-content PARTLY WORKS/needs terminal); allow-listed removed or missing: none. Run it against the live pin of that day; from v0.22.2 (run 2026-11-11, simplesalt/projects#904) it exits 3 with 1 changed skill, allow-listed hermes-agent.'
+            - 'If the user approves a change: the approved list is written to manifests/hermes-skills.yaml in the bump commit (unchanged if nothing is approved).'
+        before:
+          - Hop 1 (v0.22.2) landed, passed every validate check and soaked at least 24 h; live pin read from simplesalt/brain, not from this file.
+          - Pull the new digest; the bump commit edits every image line (five in manifests/ai.yaml).
+          - 'Check patch-tool-bridge patterns still match at this image. DONE by research on the image layer bytes of this digest (tool_search.py, conversation_loop.py, vision_message_prep.py identical to commit bf0203a7): counts 1/1/1/1, patched file compiles; re-run the counts on the pulled image; #96610 still open.'
+          - 'MCP SDK moves 2.0.0 to 2.3.0 at v0.22.3 (pyproject mcp extra): hermes-msg is a hand-rolled MCP 2024-11-05 server, so run its read-only call on a scratch pod first or treat that validate item as the gate; no MCP protocol-version change is documented in the notes, which are stubs for this range (ASSUMPTION).'
+          - 'Gateway control socket: from v0.22.3 a gateway that cannot start its control listener on /opt/data aborts startup (run_bootstrap: ''gateway session bootstrap control listener unavailable''). emptyDir on a node filesystem supports 0600 sockets, but confirm on a scratch pod before the bump.'
+          - Hindsight catalog pin moves to plugin 1.2.3 (vectorize-io/hindsight d952b6e6), hindsight-client>=0.10.1,<1, config keys unchanged; server 0.10.2 is compatible.
+          - ls /opt/data/profiles shows no named profile (#135298 still open at this stop and at v0.23.1).
+          - 'Decide whether to carry a one-line patch of pm/environments.py _payload_manifest (probe /opt/hermes/manifest.json, the #145738 change) in patch-tool-bridge if the cron or dashboard validate items fail; otherwise wait for v0.22.6.'
+          - Run the skill_review above; the user decides the allow-list.
+        validate:
+          - Pod Ready with 0 restarts for 30 min; s6 dashboard (service 'dashboard') and gateway (service 'main-hermes') both up.
+          - 8642 /health, /health/detailed, /v1/models and /v1/toolsets respond directly and via hermes-proxy; webhook listener 8644 answers.
+          - A streaming chat completion succeeds directly and via hermes-proxy.
+          - 'Every MCP server enabled in manifests/hermes-config.yaml connects and answers one read-only call: at simplesalt/brain 556d7f9 that is efforts, gbrain, gbrain-mail, hermes-msg, notion and hubspot; flux and github are set enabled: false there and must stay unconnected without an error line; if the file has changed since, follow the file.'
+          - hindsight_recall returns bank hermes data (hindsight plugin active, hindsight-client >= 0.10.1 importable by the gateway process, server 0.10.2).
+          - patch-tool-bridge init log shows its four success lines and no 'WARNING ... left unchanged', 'cut-off wording not found' or 'image description line not found'.
+          - 'install-cli-tools init log shows ''skills: kept <n> gbrain, <m> bundled, ... removed N; missing 0'' with the counts in manifests/hermes-skills.yaml and no ''ERROR: allow-listed ... skill missing''.'
+          - 'seed-hermes-config init log shows ''cron: <name> scheduled'' or ''already scheduled'' for every seeded job and no ''WARN: cron ... not scheduled''; after 5 min the every-1m people-scan job has a fresh last run (hermes cron list) and its script exited 0.'
+          - No 'no dependency environment is committed' (#138990), 'Disabled suspicious MCP', config or unknown-toolset warnings in the hermes-agent logs; 'No messaging platforms enabled' is acceptable only if 'api_server connected' is also logged.
+          - 'Disk: du -sh /opt/data and /opt/data/installs stay under 3.5Gi of the 5Gi emptyDir after boot and again after 30 min; pod not evicted.'
+          - 'Stop-specific: /opt/data/gateway.sock exists with mode 0600 owned by uid 10000 and the log has no ''unsafe_control_permissions'' or ''control listener unavailable''.'
+          - 'Stop-specific: restart the gateway process once (s6) and also the whole container once (kubectl-equivalent via Flux restart-epoch): the gateway returns each time and 8642 answers (emptyDir keeps gateway.sock and pid records across container restarts, the stale-socket EADDRINUSE variant in #144696).'
+          - 'Stop-specific: hermes-msg read-only call succeeds on MCP SDK 2.3.0 (initialize negotiation against the hand-rolled 2024-11-05 server); no new ''MCP server ... failed after N reconnection attempts, parking'' lines.'
+          - 'Stop-specific: two consecutive chat completions through hermes-proxy for one user keep the same X-Hermes-Session-Id response header (session authority is on from 0.22.3); the number of api-* sessions does not grow per request.'
+          - 'Stop-specific: abort a streaming chat completion mid-turn (client disconnect) and confirm the agent log shows the interrupt (#145750 says it may not).'
+          - 'Stop-specific: no ''no dependency environment is committed'' in cron script runs or dashboard action logs (#138990 open here); every seeded cron job still advances its last run for 30 min (#146676).'
+        rollback: Revert the digest to the previous live pin (the v0.22.2 pin sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919 after hop 1, or sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7 if hop 1 was never taken) in every pinned_in place; /opt/data is an emptyDir, so no state persists across pod recreation.
+        bisect:
+          - version: v0.22.3
+            pin: sha256:2f305c9bdc81731f48664586d23cb6a6f838a15ad7be1bfabe0c3c269d8e09b9
+            date: 2026-10-21
+            covers: 'Fallback if v0.22.5 fails: isolates the 620-PR rollup, MCP SDK 2.3.0, the session-authority cutover and the fatal control socket. v0.22.4 (sha256:7a69201726bc64db2072a1371557137c23312d29705cda2b8ea2a0214a50a4cf, 2026-10-21) is 14 desktop-only commits on top of it and adds nothing to isolate.'
+          - version: v0.22.2
+            pin: sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919
+            date: 2026-10-15
+            covers: Hop-1 stop; the resting pin to fall back to.
+        prerequisites:
+          - what: Stop v0.22.2 landed, validated and soaked 24 h
+    future:
+      - version: v0.22.6
+        date: 2026-11-02
+        pin: sha256:d27689bc6e8581ec884a7227c9101fdaebf6c853cff8859020dac14f21452b4d
+        eligible_from: 2026-11-16
+        note: 776 PRs (webapp on the gateway listener, /model reset, per-skill locks); stub notes; first tag with the Docker sealed-payload manifest fix (#145738, merged 2026-10-27) that v0.22.2 to v0.22.5 lack.
+      - version: v0.22.7
+        date: 2026-11-03
+        pin: sha256:e6d81ae52ebf6a43efa529701405509f20054ba818f179ddd748bed4f8af584c
+        eligible_from: 2026-11-17
+        note: 174 PRs, desktop group chats and plugin catalog entries only; stub notes; no stop value alone.
+      - version: v0.23.0
+        date: 2026-11-05
+        pin: sha256:adb7890916de63245523492be8f68f9d2095fecbec4e2a6dab7960381f0fc002
+        eligible_from: 2026-11-19
+        note: 'Curated notes (80 KB): old browser_* tools removed (we disable browser), hermes mcp serve renamed to mcp-serve, GLM-5.3 silent default, streamed MiniMax tool calls no longer split, MCP spend limits, 1 MiB MCP results over Streamable HTTP, Webapp off by default, _config_version 53; best next stop after v0.22.5 once screened (open: #150920 OpenRouter 403 on Windows, #147938 Windows updater restore, neither ours).'
+      - version: v0.23.1
+        date: 2026-11-10
+        pin: sha256:276d44685c65c0cb2a25f190b63c65c8906f9dc76486fb1c05ae71b5826bda08
+        eligible_from: 2026-11-24
+        note: '618 PRs since v0.23.0, stub notes deferring to v0.24.0; plugin catalog size cap raised to 16 MiB so hindsight plugin 1.2.4 (hindsight-client>=0.10.1,<2) is installable from the live catalog; open: #152519 hermes pm install --extra mcp refuses on the Docker image; sha256 is also what :stable and :latest resolve to on 2026-11-11.'
+    hold:
+      stop: v0.22.2
+      since: "2026-11-12"
+      recheck_from: "2026-11-19"
+      reason: 'The v0.22.2 hop was rolled back to v2026.9.24 on 2026-11-12: its catalog Hindsight plugin fails at runtime with ModuleNotFoundError (NousResearch/hermes-agent#144642, #143970, both open). dylan: wait for upstream fixes.'
+      release_when: 'An upstream hermes-agent release fixes #144642 and #143970, and a test pod on it shows Hermes hindsight_recall working; that release replaces or follows v0.22.2 as the next stop.'
+      effort: simplesalt/projects#912
+  hindsight:
+    upstream: https://github.com/vectorize-io/hindsight
+    pin_kind: image-digest
+    pinned_in:
+      - {file: manifests/hindsight-chart.yaml, where: "HelmRelease hindsight-main, values.image.digest (chart hindsight@0.2.0 renders repository:tag@digest, so this one value moves the pod; no chart cut needed)"}
+    current: {version: "1.1.0", pin: 'sha256:50311d02b4d5d2b7c5242bd336edf8735df8374eaad496a92f49c83b37d2aa06', date: 2026-10-21, live_since: "simplesalt/brain fb626cc (simplesalt/projects#912)"}
+    target: {version: "1.1.0", pin: 'sha256:50311d02b4d5d2b7c5242bd336edf8735df8374eaad496a92f49c83b37d2aa06', date: 2026-10-21}
+    notes:
+      - "Alembic migrations run inside the API process at startup under session advisory lock 123456789, before the port opens; there is no separate migrator Job."
+      - "34 alembic revisions across 0.8.2 -> 0.10.2 (13 + 12 + 9); v0.10.0 is the only breaking release in the range."
+      - "Own CNPG cluster hindsight-pg (database hindsight, non-superuser, direct hindsight-pg-rw, no Pooler); not shared with gbrain-pg."
+      - "0.10.2 carries the migrator advisory-lock leak fix (vectorize-io/hindsight#4611, fix #4623); exposure on earlier hops is negligible here: a failing migration surfaces as InFailedSqlTransaction, read postgres logs, cleared by container restart."
+      - "Open upstream regression #4939 (temporal recall boosts) does not apply: this repo sets no RECALL_STRATEGY_BOOSTS."
+      - "0.10.0 breaking changes reach us only via 503 admission control on overload for recall/reflect/retain: scripts/hindsight-ingest.sh does a synchronous retain with no retry (flagged in simplesalt/projects#525)."
+    before_first_stop:
+      - "DONE: startupProbe (tcp 8888, 90 x 10s = 15 min) and HelmRelease upgrade timeout 20m are in place (simplesalt/brain 7fcd5c7); in-process migrations are no longer bounded by the ~130s liveness window."
+      - "hindsight-pg has no Backup, ScheduledBackup, object store or VolumeSnapshotClass (backups tracked in simplesalt/projects#657): take a manual pg_dump or hindsight-admin backup before stops 1 and 2."
+      - "Deployment strategy is still RollingUpdate: scale to 0 or patch Recreate via postRenderers where a stop says so."
+      - "Record a pre-hop recall baseline before each hop, to compare after."
+    skip:
+      - {from: "0.10.0", to: "0.10.0", reason: "Only breaking release in the range (profile/background endpoints 410 Gone, curl dropped from image, mental-models list defaults to metadata, count_chunks hook removed) and #4581 wedged operations."}
+      - {from: "0.10.1", to: "0.10.1", reason: "Lacks the #4611 lock-leak fix and #4618 fix; both land in 0.10.2."}
+      - from: 1.2.0
+        to: 1.2.0
+        reason: 'Released 2026-11-03 (after the 2026-10-28 cutoff) and carries an open never-Ready report (vectorize-io/hindsight#6494: container stalls after local reranker init, port never opens; our reranker is the default provider=local, so the exposure applies) plus 1.2.0-only reflect/consolidation tool-call failures (#6302, #6420) that only 1.2.1 fixes; never land here.'
+    stops:
+      - version: "0.8.6"
+        pin: sha256:ffa391a77284e49f6b55e32c86f33529ac4257831407b14038a72b6a0a232039
+        date: 2026-07-29
+        alembic: {revisions: 13, long_running: ["3 CONCURRENTLY index builds"], lossy: ["2 cold-archive column drops"]}
+        why: "Smallest hop: prove the mechanics (in-process migrations inside the startupProbe window, non-superuser role, CONCURRENTLY builds, config-apply hook) before the larger, destructive 0.9.x hop."
+        before:
+          - "Take a DB dump of hindsight-pg (2 lossy cold-archive column drops cannot be undone without it)."
+          - "Change only values.image.digest."
+          - "Do not hop near the 03:30 UTC hygiene CronJob."
+        validate:
+          - "Pod Ready, imageID equals the target digest, /version and /health respond."
+          - "No ERRORs in hindsight-pg-1 postgres logs; migration completes inside the startupProbe window."
+          - "hindsight-ingest.sh and hindsight-get-document.sh probe succeed; hindsight-get-page.sh works."
+          - "hindsight-config-apply Job returns 2xx for all banks."
+          - "Recall matches the pre-hop baseline."
+          - "Metrics and alerts quiet; async_operations drain."
+        rollback: "Image-only rollback boots cleanly (migrator skips with a warning when the DB is newer); undoing the 2 lossy archive-column drops needs the DB dump."
+      - version: "0.9.2"
+        pin: sha256:84ab276b8f501546deb6ea9c64a57291718b4e16a59dd9e02a02fdd5adfe9028
+        date: 2026-08-25
+        alembic: {revisions: 12, long_running: ["CONCURRENTLY index builds on entities and memory_units"], lock_timeout: {revision: f2a6d8c4b1e9, seconds: 10, note: "fails if old and new pods overlap"}, irreversible: [d1e2f3a4b5c6], lossy: ["memory_units.access_count (dead column) and an FK dropped", "f2a6d8c4b1e9 stale index not recreated on downgrade"]}
+        why: "Last pre-breaking rollback anchor: 0.9.0 pluggable storage backend migration, CONCURRENTLY index builds, f2a6d8c4b1e9 index change, irreversible d1e2f3a4b5c6."
+        before:
+          - "Take a fresh DB dump of hindsight-pg (needed to undo d1e2f3a4b5c6 and the f2a6d8c4b1e9 index drop)."
+          - "No overlapping old and new pods: scale hindsight to 0 or patch Recreate (f2a6d8c4b1e9 has a 10s lock_timeout)."
+          - "Do not hop near the 03:30 UTC hygiene CronJob."
+          - "Change only values.image.digest."
+        validate:
+          - "Pod Ready, imageID equals the target digest, /version and /health respond."
+          - "No ERRORs in hindsight-pg-1 postgres logs; migration completes inside the startupProbe window."
+          - "hindsight-ingest.sh and hindsight-get-document.sh probe succeed; hindsight-get-page.sh works."
+          - "hindsight-config-apply Job returns 2xx for all banks."
+          - "Recall matches the pre-hop baseline."
+          - "Metrics and alerts quiet; async_operations drain."
+        rollback: "Image-only rollback boots cleanly; undoing d1e2f3a4b5c6 and the f2a6d8c4b1e9 index drop needs the DB dump taken before this stop."
+      - version: "0.10.2"
+        pin: sha256:d1840062a5b79940ab7a9f4809ceb90fc776d4ad737cd9329e9b5836cc64ab70
+        date: 2026-09-29
+        alembic: {revisions: 9, long_running: ["CONCURRENTLY rebuild of the entities trigram index as a bank-scoped btree_gin index (the long step to watch)"]}
+        why: "Target: only release with the #4611 migrator lock-leak fix; 0.10.2 has no Breaking Changes block of its own, but the 0.10.0 breaking changes (skipped as a stop) arrive with this hop."
+        before:
+          - "Do not hop near the 03:30 UTC hygiene CronJob."
+          - "Change only values.image.digest."
+        validate:
+          - "Pod Ready, imageID equals the target digest, /version and /health respond."
+          - "No ERRORs in hindsight-pg-1 postgres logs; the entities index rebuild completes inside the startupProbe window."
+          - "hindsight-ingest.sh and hindsight-get-document.sh probe succeed (retain not shed by 503 admission control; ingest has no retry, simplesalt/projects#525); hindsight-get-page.sh works."
+          - "hindsight-config-apply Job returns 2xx for all banks."
+          - "Recall matches the pre-hop baseline."
+          - "Profile and background endpoints return 410 (we do not call them)."
+          - "A Hermes reflect completes within the 30s default."
+          - "Metrics and alerts quiet; async_operations drain."
+        rollback: "Image-only rollback boots cleanly (migrator skips with a warning when the DB is newer); 0.9.2 is the last pre-breaking rollback anchor."
+      - version: 0.10.3
+        pin: sha256:b5da1a9aece1f53a15f12821fb1470f358ed6c74dfaa0c4b1a39c3f3ae93e002
+        date: 2026-10-08
+        alembic:
+          revisions: 1
+          new:
+            - c8e2f4a6b1d3
+          long_running: []
+          irreversible: []
+          lossy: []
+          lock_timeout: none; c8e2f4a6b1d3 is Oracle-only (CTXSYS text index) and a no-op on PostgreSQL, so the hop only restamps alembic_version e5b1c7d3a902 -> c8e2f4a6b1d3
+        why: 'Smallest hop and the last pre-1.0 rollback anchor: no PostgreSQL schema change. Fixes #5384, which the live 0.10.2 has (mental-model delta refresh re-asks send the first reply back as an object, so OpenAI-compatible endpoints answer 400 and the delta is never applied; fixed by #4999). Breaking Changes block is only the removed worker --max-retries and --log-level flags, which our Deployment does not pass. HTTP metrics now label by route template; our alert expressions use metric names and status_class, which are unchanged.'
+        before:
+          - 'Run manifests/hindsight-pg-dump.yaml for a fresh hindsight-pg dump (set DUMP_LABEL to pre-0.10.3 in both hindsight-pg-dump and hindsight-pg-dump-verify-restore) and confirm the hindsight-pg-dump-verify-restore log ends RESULT: PASS (checksum, table counts, alembic head, table and index counts); the hindsight-pg-dumps PVC is 5Gi, so remove stale dumps if the free-space check fails.'
+          - Do not hop near the 03:30 UTC hygiene CronJob.
+          - Change only values.image.digest.
+          - 'Record a pre-hop recall baseline for bank hermes (a fixed set of queries: ids and order, top-k) and the output of GET /v1/default/banks/hermes/stats.'
+          - 'Confirm entity_maintenance_queue has its primary key: SELECT conname FROM pg_constraint WHERE conrelid = ''entity_maintenance_queue''::regclass AND contype = ''p''; (vectorize-io/hindsight#6361 reported a drifted table on an old upgraded database; upstream could not reproduce; a missing key would break re-ingest retain on every later stop).'
+        validate:
+          - Pod Ready, imageID equals the target digest, /version reports 0.10.3 and /health responds.
+          - No ERRORs in hindsight-pg-1 postgres logs; migration completes inside the startupProbe window (only an alembic_version restamp is expected, so seconds).
+          - hindsight-ingest.sh and hindsight-get-document.sh probe succeed (synchronous retain, no retry); hindsight-get-page.sh works.
+          - hindsight-config-apply Job returns 2xx for all banks.
+          - Recall matches the pre-hop baseline.
+          - A Hermes hindsight_recall and a Hermes reflect succeed.
+          - Metrics and alerts quiet; async_operations drain; a mental-model delta refresh completes without a 400 from the LLM endpoint.
+        rollback: 'Image-only rollback boots cleanly: 0.10.2 skips migrations with a warning when the DB is at a newer revision, and the schema is identical, so the dump is not needed unless data was damaged.'
+        prerequisites:
+          - what: A fresh hindsight-pg dump with a passing restore check (manifests/hindsight-pg-dump.yaml in simplesalt/brain, run by the brain workstream)
+            effort: simplesalt/projects#766 (dump manifest); simplesalt/projects#657 (backup automation)
+      - version: 1.0.0
+        pin: sha256:a88678c038b0e4340822b02a5efc566c56d8176b5bffa731bc433fd37f978e4c
+        date: 2026-10-13
+        alembic:
+          revisions: 0
+          new: []
+          long_running: []
+          irreversible: []
+          lossy: []
+          lock_timeout: none; alembic head unchanged at c8e2f4a6b1d3 (no new revision files between v0.10.3 and v1.0.0)
+        why: 'Anchors the 1.x major with no schema change, so image-only rollback to 0.10.3 is exact and API-surface changes are validated apart from the five migrations of 1.1.0. The 1.0 announcement says the architecture and API are stable from here and Postgres remains the default store; the only Breaking Changes entries are refusing tag-scoped callers on whole-bank operations (we have none) and removing the OpenClaw agent-sdk package (not ours). Behaviour changes that reach us: a store that sheds a request answers 503 with Retry-After instead of 500 (ingest has no retry, flagged in simplesalt/projects#525), and Python/Go/TS clients decode new response fields. Optional merge: with no migration and no workload-relevant feature, 0.10.3 straight to 1.1.0 is legal if an operator prefers fewer runs, at the cost of this anchor.'
+        before:
+          - 'Run manifests/hindsight-pg-dump.yaml for a fresh hindsight-pg dump (set DUMP_LABEL to pre-1.0.0 in both Jobs) and confirm the hindsight-pg-dump-verify-restore log ends RESULT: PASS.'
+          - Do not hop near the 03:30 UTC hygiene CronJob.
+          - Change only values.image.digest.
+          - Record a pre-hop recall baseline for bank hermes.
+        validate:
+          - Pod Ready, imageID equals the target digest, /version reports 1.0.0 and /health responds.
+          - No ERRORs in hindsight-pg-1 postgres logs; migration completes inside the startupProbe window (no new revision, seconds).
+          - hindsight-ingest.sh and hindsight-get-document.sh probe succeed (a 503 with Retry-After is overload shedding, not a failure of the hop; retry once); hindsight-get-page.sh works.
+          - hindsight-config-apply Job returns 2xx for all banks.
+          - Recall matches the pre-hop baseline.
+          - A Hermes hindsight_recall and a Hermes reflect succeed with the already-installed 0.x hindsight-client (the Hermes plugin constrains hindsight-client <1 until its 1.2.4, shipped with server 1.2.1).
+          - Metrics and alerts quiet; async_operations drain.
+        rollback: Image-only rollback to 0.10.3 is exact (same alembic head, nothing to undo); the dump is needed only for data damage.
+        prerequisites:
+          - what: A fresh hindsight-pg dump with a passing restore check (manifests/hindsight-pg-dump.yaml in simplesalt/brain, run by the brain workstream)
+            effort: simplesalt/projects#766 (dump manifest); simplesalt/projects#657 (backup automation)
+      - version: 1.1.0
+        pin: sha256:50311d02b4d5d2b7c5242bd336edf8735df8374eaad496a92f49c83b37d2aa06
+        date: 2026-10-21
+        alembic:
+          revisions: 5
+          new:
+            - b2429c65cc20
+            - d4f7a2c9e1b5
+            - e8c1a4f7b2d9
+            - f2a9c4e7b1d3
+            - c7e2f9a4d1b8
+          long_running: []
+          irreversible:
+            - c7e2f9a4d1b8 (downgrade is a no-op; placeholder dates cannot be restored)
+            - e8c1a4f7b2d9 (downgrade is a no-op; dropped index is not recreated)
+            - f2a9c4e7b1d3 (downgrade is a no-op by design)
+            - 'b2429c65cc20 (downgrade is a no-op, harmless: same signature and results)'
+          lossy:
+            - c7e2f9a4d1b8 sets memory_units.event_date to NULL where it is before 0002-01-01 or on/after 9999-01-01 (placeholder values); zero rows if none exist
+            - e8c1a4f7b2d9 drops every non-partial hnsw/vchordrq/diskann/scann index on memory_units.embedding (unused on the per-bank pgvector backend)
+          lock_timeout: 'e8c1a4f7b2d9: SET LOCAL lock_timeout = ''10s'' before DROP INDEX (ACCESS EXCLUSIVE on memory_units; fails the migration if another session holds a lock); b2429c65cc20 and d4f7a2c9e1b5: 250ms is set inside the plpgsql routine bodies at runtime, not during DDL; f2a9c4e7b1d3 (ALTER COLUMN TYPE TEXT on mental_model_history and knowledge_pages), d4f7a2c9e1b5 (ADD COLUMN, CREATE INDEX on mental_models, DROP and CREATE FUNCTION) and c7e2f9a4d1b8 (UPDATE) set none and wait on locks; no CONCURRENTLY anywhere in the five; no global lock_timeout in migrations.py or env.py for PostgreSQL'
+        why: 'Latest release inside the 2026-10-28 cutoff and 21 days old, so it is the trailing-4-weeks target. Five revisions touch memory_units only through a catalog-driven index drop and a one-column UPDATE served by idx_memory_units_event_date, plus two plpgsql routine rewrites, one new nullable column (mental_models.last_full_refreshed_at), a partial index on mental_models and two column widenings; nothing builds an index on memory_units. The release note''s warning that the release alters high-volume tables is generated boilerplate; no revision rewrites memory_units. Native LLM tool calling is still in use here (the response-schema transport arrives in 1.2.0). Fixes that matter to us: consolidation work discovery no longer seq-scans memory_units, deadlock between consolidation and retain/delete, mental-model ids over 64 chars no longer break refresh, extreme date values no longer break temporal recall and consolidation, and a large GET /graph limit no longer blocks the event loop long enough for liveness probes to restart the pod (#5703). Screened open: #5941 and #5983 are Voyage/OpenAI-compatible embeddings only (we use local embeddings) and are closed. Behaviour change: recall prefer_observations becomes a server/bank default (off unless configured, so unchanged for us); bank imports reject reserved underscore ids (unused).'
+        before:
+          - 'Run manifests/hindsight-pg-dump.yaml for a fresh hindsight-pg dump (set DUMP_LABEL to pre-1.1.0 in both Jobs) and confirm the hindsight-pg-dump-verify-restore log ends RESULT: PASS; this dump is the only way to undo c7e2f9a4d1b8 and e8c1a4f7b2d9.'
+          - Do not hop near the 03:30 UTC hygiene CronJob.
+          - Change only values.image.digest.
+          - Scale hindsight to 0 (or patch strategy to Recreate) so no old pod holds locks during e8c1a4f7b2d9 and f2a9c4e7b1d3; the live strategy is RollingUpdate with maxSurge 0 and maxUnavailable 1, which already stops the old pod before the new one starts, but confirm no old pod remains.
+          - Pause the hindsight-hygiene CronJob run window and stop other clients (Hermes retain, ingest scripts) for the hop so nothing writes memory_units or holds locks on mental_model_history and knowledge_pages while the migrations run.
+          - 'Size the lossy steps on the live database: SELECT count(*) FROM memory_units WHERE event_date < ''0002-01-01T00:00:00Z''::timestamptz OR event_date >= ''9999-01-01T00:00:00Z''::timestamptz; and SELECT indexname FROM pg_indexes WHERE tablename = ''memory_units'' AND indexdef ~* ''(hnsw|vchordrq|diskann|scann)'' AND indexdef !~* '' WHERE '' (expected: none or a stale idx_memory_units_embedding*); record both.'
+          - Record a pre-hop recall baseline for bank hermes and the /stats output; recall ranking is not strictly deterministic before 1.2.0 (BM25 ties, vectorize-io/hindsight#6056), so compare sets and top-k overlap, not exact order.
+          - 'Optional rehearsal per the adoption rule: restore the fresh dump into gbrain-pg-rehearsal and boot the 1.1.0 image against it (the verify-restore Job drops its restore database at exit, so this is a separate manual step) before touching hindsight-pg.'
+        validate:
+          - Pod Ready, imageID equals the target digest, /version reports 1.1.0 and /health responds.
+          - No ERRORs in hindsight-pg-1 postgres logs; migration completes inside the startupProbe window; alembic_version is c7e2f9a4d1b8 and mental_models has last_full_refreshed_at.
+          - hindsight-ingest.sh and hindsight-get-document.sh probe succeed; hindsight-get-page.sh works (mental-models/{id}?detail=content response gains full_refresh_cron, last_full_refreshed_at and is_knowledge_page; existing fields unchanged).
+          - hindsight-config-apply Job returns 2xx for all banks (config keys retain_mission, retain_custom_instructions, reflect_mission, max_observations_per_scope, retain_strategies, retain_default_strategy, enable_observations, observations_mission exist unchanged in config.py).
+          - Recall matches the pre-hop baseline (set and top-k overlap).
+          - A Hermes hindsight_recall and a Hermes reflect succeed; forced tool use in reflect still works with the OpenRouter presets.
+          - 'Re-run the two lossy-step queries from before: no placeholder event_date rows and no non-partial vector index on memory_units remain.'
+          - The 03:30 UTC hygiene run after the hop returns 2xx for config PATCH, consolidate and stats.
+          - Metrics and alerts quiet; async_operations drain; consolidation completes for bank hermes.
+        rollback: Image-only rollback to 1.0.0 or 0.10.3 boots (older code skips migrations with a warning when the DB is at c7e2f9a4d1b8) and the widened columns, new nullable column and routines are harmless to older code, but older code reading the mental_models_with_cron() routine in its new shape is not verified; the NULLed event_date values and dropped vector index are not restored by rollback, so undoing those needs the dump taken before this stop (restore to the same database name).
+        prerequisites:
+          - what: A fresh hindsight-pg dump with a passing restore check (manifests/hindsight-pg-dump.yaml in simplesalt/brain, run by the brain workstream)
+            effort: simplesalt/projects#766 (dump manifest); simplesalt/projects#657 (backup automation)
+    future:
+      - '1.2.0 (2026-11-03, eligible 2026-11-17): skip; open never-Ready #6494 on the local reranker path, default local reranker changes to hindsight-ai/hs-rerank-1 (baked into the image, but recall ranks differently and RAM grows), response-schema tool transport replaces native tool calling (breaking for models that do not enforce schemas), open #6443 batch_retain AttributeError and #6437 oversized recall query 500.'
+      - '1.2.1 (2026-11-10, eligible 2026-11-24, outside the 4-week trail until then): 3 new revisions (d3f8a1c6e9b2 Oracle-only no-op, d3e8a1f5c7b2 ADD COLUMN claimed_at on graph_maintenance_queue, 05867433a58c banks_with_attachments_in_window routine; none long-running or lossy), renames Knowledge Pages to Pages with deprecated aliases, one id rule (no ''/'') for new banks and mental models, Hermes plugin 1.2.4 allows hindsight-client <2; fixes #6302 and #6420 but its cross_encoder.py is unchanged from 1.2.0 so #6494 must be re-screened (and checked against a restored copy) first.'

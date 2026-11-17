@@ -1,0 +1,16 @@
+{
+  "default": {
+    "profile": "doer"
+  },
+  "banks": {
+    "ssint-build-projects": {
+      "mission": "keep the SimpleSalt Delivery board an accurate, current record of every Effort and coordinate cross-repo delivery through it.",
+      "profile": "wwwhw"
+    }
+  },
+  "skillBanks": {
+    "brain-upgrade": [
+      "ssint-build-brain"
+    ]
+  }
+}

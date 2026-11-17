@@ -1,0 +1,3 @@
+FROM scratch
+ARG HARNESS
+COPY ${HARNESS}/ /

@@ -1,0 +1,140 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "mcp__flux__patch_kubernetes_resource"
+    ]
+  },
+  "model": "opus",
+  "allowManagedHooksOnly": true,
+  "deniedMcpServers": [
+    { "serverName": "Claude_Code_Remote" },
+    { "serverName": "github" },
+    { "serverName": "Notion" },
+    { "serverName": "claude.ai Notion" }
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/effort-session-title.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/effort-session-title.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/require-own-repo-commit.sh"
+          },
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/require-no-sed-awk.sh"
+          },
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/strip-comments-precommit.py"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__flux__delete_kubernetes_resource|mcp__flux__apply_kubernetes_manifest",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/require-node-mutation-confirmation.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__efforts__effort_select|mcp__efforts__effort_release",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/record-effort-selection.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__hearthbot__set_thread_resolved",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/remove-resolved-session.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/gitops-push-flux-check.sh",
+            "asyncRewake": true,
+            "timeout": 180,
+            "statusMessage": "git push complete — waiting 2 min for gitops reconcile before checking flux status"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/subagent-tools-only.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/git-resilience-flush.sh"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/release-selected-effort.sh"
+          },
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/remove-resolved-session.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "alwaysThinkingEnabled": true,
+  "autoMemoryEnabled": false,
+  "theme": "light",
+  "effortLevel": "high",
+  "syncClaudeAiSkills": false
+}

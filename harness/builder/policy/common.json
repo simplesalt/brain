@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "mcp__flux__patch_kubernetes_resource"
+    ]
+  },
+  "model": "opus",
+  "alwaysThinkingEnabled": true,
+  "autoMemoryEnabled": false,
+  "theme": "light",
+  "effortLevel": "high"
+}
