@@ -1,5 +1,16 @@
 {
   "fallback": "projects",
+  "names": {
+    "ssint-build-basis": "basis",
+    "ssint-build-cloud-basis": "cloud-basis",
+    "ssint-build-brain": "brain",
+    "ssint-build-oci": "oci",
+    "ssint-build-projects": "projects",
+    "simplesalt/basis": "basis",
+    "simplesalt/cloud-basis": "cloud-basis",
+    "simplesalt/brain": "brain",
+    "simplesalt/oci": "oci"
+  },
   "questions": {
     "layer": {
       "platform": "what every app runs on: cluster policy, operators, shared services, cloud accounts, identity, networking, and the templates apps use to get them (Kyverno policies, public ingress, CDN, identity providers, storage).",
