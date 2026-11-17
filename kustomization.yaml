@@ -126,7 +126,7 @@ configMapGenerator:
         env: main
         capability: coding
     files:
-      - dispatch-mcp.mjs=scripts/dispatch-mcp.mjs
+      - dispatch_mcp.py=scripts/dispatch_mcp.py
   - name: dispatch-scopes
     namespace: ssint-main-coding
     options:

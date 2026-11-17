@@ -1,87 +1,30 @@
 {
   "fallback": "projects",
-  "builders": [
-    {
-      "name": "basis",
-      "repo": "simplesalt/basis",
-      "dispatch": "http://ssint-build-basis-dispatch:8080/dispatch",
-      "will": [
-        "Cluster-wide Flux content of the base stack: operator installs (cert-manager, Kyverno, CloudNativePG, observability)",
-        "Kyverno cluster policies and cleanup policies (resiliency, scheduling, stateful protection, Flux governance)",
-        "Platform services shared by every namespace: the flux MCP, the logs API and logs MCP, alerting and cluster health checks"
-      ],
-      "wont": [
-        "Kyverno policies that generate Crossplane resources (cloud-basis)",
-        "Crossplane, Cloudflare or Google Workspace resources (cloud-basis)",
-        "AI apps, builder pod releases or app namespaces (brain)",
-        "Container images, the builder chart, node bootstrap or kube-vip (oci)",
-        "Planning or writing Efforts (projects)"
-      ]
+  "questions": {
+    "layer": {
+      "platform": "what every app runs on: cluster policy, operators, shared services, cloud accounts, identity, networking, and the templates apps use to get them (Kyverno policies, public ingress, CDN, identity providers, storage).",
+      "app": "software that does work people use, and its data, agents and jobs (Hermes, gbrain, Hindsight, collectors, ingest jobs, agent harnesses, the dispatch server)."
     },
-    {
-      "name": "cloud-basis",
-      "repo": "simplesalt/cloud-basis",
-      "dispatch": "http://ssint-build-cloud-basis-dispatch:8080/dispatch",
-      "will": [
-        "Crossplane install and its Cloudflare and GCP providers",
-        "Cloudflare resources: DNS, tunnels, Access apps and policies, Workers and Workers VPC services, Zero Trust",
-        "Google Workspace and GCP resources for the internal apps project",
-        "The cluster MCP connector's routes into the cluster (30-mcp)",
-        "Kyverno policies that template and generate Crossplane resources (for example a Cloudflare or GCP resource created from a label or annotation on an app object)"
-      ],
-      "wont": [
-        "In-cluster operators or Kyverno policies (basis)",
-        "AI apps, builder pod releases or app manifests (brain)",
-        "Container images or the builder chart (oci)",
-        "Planning or writing Efforts (projects)"
-      ]
-    },
-    {
-      "name": "brain",
-      "repo": "simplesalt/brain",
-      "dispatch": "http://ssint-build-brain-dispatch:8080/dispatch",
-      "will": [
-        "AI infrastructure manifests via Flux: Hermes, gbrain, Hindsight, Big AGI, collectors and ingest jobs, model config",
-        "Builder pod releases and their values: chart version pins, MCP config, secrets placeholders in the coding namespaces",
-        "The Effort MCP server deployment and other app services in the ssint namespaces",
-        "Moving image and chart pins for gbrain, hermes-agent and hindsight"
-      ],
-      "wont": [
-        "Building container images or changing the builder chart or builder policy (oci)",
-        "Cluster operators or Kyverno policies (basis)",
-        "Cloudflare, Crossplane or Google Workspace resources (cloud-basis)",
-        "Planning or writing Efforts (projects)"
-      ]
-    },
-    {
-      "name": "oci",
-      "repo": "simplesalt/oci",
-      "dispatch": "http://ssint-build-oci-t961-dispatch:8080/dispatch",
-      "will": [
-        "Building and publishing container images: builder-sb, cred-rotator, cluster, gbrain, agentdb",
-        "The builder Helm chart and its releases",
-        "Builder policy baked into every coding pod: managed settings, hooks, skills, agent prompts",
-        "Node bootstrap and kube-vip, the Kyverno upstream check"
-      ],
-      "wont": [
-        "Deploying or moving pins in the cluster (brain)",
-        "Cluster operators or Kyverno policies (basis)",
-        "Cloudflare, Crossplane or Google Workspace resources (cloud-basis)",
-        "Planning or writing Efforts (projects)"
-      ]
-    },
-    {
-      "name": "projects",
-      "repo": "simplesalt/projects",
-      "dispatch": "http://ssint-build-projects-dispatch:8080/dispatch",
-      "will": [
-        "Planning and coordinating cross-repo delivery on the SimpleSalt Delivery board",
-        "Creating, splitting, updating and closing Efforts and their tasks",
-        "Anything that fits no other builder, to be raised with dylan"
-      ],
-      "wont": [
-        "Changing code or manifests in basis, cloud-basis, brain or oci"
-      ]
+    "target": {
+      "cluster": "lands in the Kubernetes cluster: manifests, config, policies, deployed versions.",
+      "cloud": "lands at a cloud provider (Cloudflare, Google Workspace, GCP).",
+      "registry": "builds or changes a container image or Helm chart published to ghcr.",
+      "none": "design, planning or coordination, or work a person wants to steer in their own thread."
     }
-  ]
+  },
+  "table": [
+    { "layer": "platform", "target": "cluster", "builder": "basis" },
+    { "layer": "platform", "target": "cloud", "builder": "cloud-basis" },
+    { "layer": "app", "target": "cluster", "builder": "brain" },
+    { "layer": "app", "target": "cloud", "builder": "brain" },
+    { "layer": "*", "target": "registry", "builder": "oci" },
+    { "layer": "*", "target": "none", "builder": "projects" }
+  ],
+  "builders": {
+    "basis": "http://ssint-build-basis-dispatch:8080/dispatch",
+    "cloud-basis": "http://ssint-build-cloud-basis-dispatch:8080/dispatch",
+    "brain": "http://ssint-build-brain-dispatch:8080/dispatch",
+    "oci": "http://ssint-build-oci-t961-dispatch:8080/dispatch",
+    "projects": "http://ssint-build-projects-dispatch:8080/dispatch"
+  }
 }
