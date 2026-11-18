@@ -4,20 +4,17 @@
       "type": "http",
       "url": "http://mcp-flux.flux-system:9090/mcp"
     },
-    "cloudflare": {
-      "type": "http",
-      "url": "https://mcp.cloudflare.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${CLOUDFLARE_API_TOKEN}"
-      }
-    },
-    "efforts": {
-      "type": "http",
-      "url": "http://efforts.ssint-main-efforts.svc:8080/mcp/coordinator"
-    },
     "logs": {
       "type": "http",
       "url": "http://logs-mcp.cluster-main-observability:8080/mcp"
+    },
+    "efforts": {
+      "type": "http",
+      "url": "http://efforts.ssint-main-efforts.svc:8080/mcp/builder"
+    },
+    "dispatch": {
+      "type": "http",
+      "url": "http://dispatch.ssint-main-coding:8080/mcp"
     }
   }
 }

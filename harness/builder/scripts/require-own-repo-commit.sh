@@ -195,10 +195,9 @@ def check_commit_or_push(command, data):
         "land it in a repo no one asked this agent to change, with no other "
         "session expecting or reviewing it there. Discard whatever you were "
         f"about to commit here. If {other_name} genuinely needs a change, "
-        "file that as its own Effort (the effort_create tool) with "
-        f"assigned=ssint-build-{other_name} (if that bank doesn't exist, "
-        f"note where={other_name} instead) so an agent actually provisioned "
-        "for that repo picks it up — don't make that change from here."
+        "tell your requester \"I can't do that because it needs other agents\" "
+        f"and name ssint-build-{other_name} as the owner of that part — "
+        "don't make that change from here."
     )
 
 
@@ -223,9 +222,10 @@ def check_clone(command):
             f"({repo_url}). Couldn't confidently tell what this `git clone` "
             "targets, but if it's a different repo, you can read that clone "
             "freely — a later `git commit`/`git push` inside it will be "
-            "denied. If that repo genuinely needs a change, file it as its "
-            "own Effort (effort_create tool, assigned=ssint-build-<repo>) "
-            "instead of trying to commit it from here."
+            "denied. If that repo genuinely needs a change, tell your "
+            "requester \"I can't do that because it needs other agents\" and "
+            "name ssint-build-<repo> as its owner instead of trying to commit "
+            "it from here."
         )
 
     if normalize_git_url(target) == normalize_git_url(repo_url):
@@ -237,10 +237,9 @@ def check_clone(command):
         f"can read this clone of {other_name} freely, but a later `git "
         "commit`/`git push` inside it will be denied (this pod is only "
         f"provisioned for its own repo). If {other_name} genuinely needs a "
-        "change, file that as its own Effort (the effort_create tool) with "
-        f"assigned=ssint-build-{other_name} (if that bank doesn't exist, "
-        f"note where={other_name} instead) instead of trying to commit it "
-        "from here."
+        "change, tell your requester \"I can't do that because it needs "
+        f"other agents\" and name ssint-build-{other_name} as its owner "
+        "instead of trying to commit it from here."
     )
 
 

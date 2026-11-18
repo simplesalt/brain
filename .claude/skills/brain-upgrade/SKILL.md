@@ -7,7 +7,7 @@ description: Use when moving the gbrain, hermes-agent or hindsight pin in simple
 
 ## What it carries
 
-- `/etc/claude-code/.claude/skills/brain-upgrade/upgrade-path.yaml`: the stepwise plan (rules, order, stops with before/validate/rollback, skip ranges, bisect fallbacks) for the gbrain, hermes-agent and hindsight pins.
+- `.claude/skills/brain-upgrade/upgrade-path.yaml`: the stepwise plan (rules, order, stops with before/validate/rollback, skip ranges, bisect fallbacks) for the gbrain, hermes-agent and hindsight pins.
 - `scripts/skill-diff.py` in the same folder: tells whether a pin move adds, removes or changes skills.
 - The Hermes skill review below, run in every gbrain and hermes-agent stop.
 
@@ -47,8 +47,8 @@ A scheduled run walks with nobody watching. It asks dylan only when a Hermes ski
 Hermes loads only the skills in `manifests/hermes-skills.yaml`: `gbrain:` (names from garrytan/gbrain `skills/` at the commit the gbrain server runs) and `bundled:` (Hermes built-ins from the Hermes image, including always-on hermes-agent). It reaches gbrain over MCP with the bearer token hermes-mcp (scopes read,write,admin). Never print the token.
 
 1. Run the stop's `skill_review.script`, with `<live pin>` from step 2 of the walk:
-   `python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py gbrain <old-sha> <new-sha>`
-   `python3 /etc/claude-code/.claude/skills/brain-upgrade/scripts/skill-diff.py hermes <old-digest> <new-digest>`
+   `python3 .claude/skills/brain-upgrade/scripts/skill-diff.py gbrain <old-sha> <new-sha>`
+   `python3 .claude/skills/brain-upgrade/scripts/skill-diff.py hermes <old-digest> <new-digest>`
    SHAs are full 40-hex; digests are `sha256:` index digests of nousresearch/hermes-agent. A Hermes image without an `org.opencontainers.image.revision` label (v0.21.6 on) resolves through its single `vX.Y.Z` Docker Hub tag to that tag's commit, named on stderr. `--allow-list FILE` tests a candidate list; by default it reads `manifests/hermes-skills.yaml` from simplesalt/brain's default branch. stdout is JSON (`added`, `removed`, `changed`, `allow_list`, `changed_any`); stderr has a summary.
 2. Act on the exit code.
    - 0: nothing added, removed or changed. Note it and continue the step.

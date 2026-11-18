@@ -2,10 +2,22 @@
   "permissions": {
     "defaultMode": "bypassPermissions",
     "deny": [
-      "mcp__flux__patch_kubernetes_resource"
-    ]
+      "mcp__flux__patch_kubernetes_resource",
+      "mcp__efforts__effort_create",
+      "mcp__efforts__effort_select",
+      "mcp__efforts__effort_update",
+      "mcp__efforts__effort_release",
+      "mcp__efforts__effort_depend"
+    ],
+    "blockReadsOutsideWorkingDirectories": true,
+    "blockWritesOutsideWorkingDirectories": true
   },
-  "model": "opus",
+  "model": "sonnet",
+  "agent": "builder",
+  "autoCompactEnabled": false,
+  "env": {
+    "DISABLE_AUTO_COMPACT": "1"
+  },
   "allowManagedHooksOnly": true,
   "deniedMcpServers": [
     { "serverName": "Claude_Code_Remote" },
@@ -19,8 +31,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/etc/claude-code/scripts/effort-session-title.sh",
-            "timeout": 10
+            "command": "/etc/claude-code/scripts/session-shell-env.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/preload-mcp-skills.py",
+            "timeout": 30
           }
         ]
       }
@@ -30,7 +47,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/etc/claude-code/scripts/effort-session-title.sh",
+            "command": "/etc/claude-code/scripts/context-handoff.py",
             "timeout": 10
           }
         ]
@@ -53,33 +70,15 @@
             "command": "/etc/claude-code/scripts/strip-comments-precommit.py"
           }
         ]
-      },
-      {
-        "matcher": "mcp__flux__delete_kubernetes_resource|mcp__flux__apply_kubernetes_manifest",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/etc/claude-code/scripts/require-node-mutation-confirmation.sh"
-          }
-        ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__efforts__effort_select|mcp__efforts__effort_release",
         "hooks": [
           {
             "type": "command",
-            "command": "/etc/claude-code/scripts/record-effort-selection.sh"
-          }
-        ]
-      },
-      {
-        "matcher": "mcp__hearthbot__set_thread_resolved",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/etc/claude-code/scripts/remove-resolved-session.sh"
+            "command": "/etc/claude-code/scripts/context-handoff.py",
+            "timeout": 10
           }
         ]
       },
@@ -112,21 +111,6 @@
           {
             "type": "command",
             "command": "/etc/claude-code/scripts/git-resilience-flush.sh"
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/etc/claude-code/scripts/release-selected-effort.sh"
-          },
-          {
-            "type": "command",
-            "command": "/etc/claude-code/scripts/remove-resolved-session.sh",
-            "timeout": 30
           }
         ]
       }

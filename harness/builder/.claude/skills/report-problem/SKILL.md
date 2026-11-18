@@ -19,6 +19,3 @@ your own reasoning; the reasoning framing is what a `reasoning_extraction` refus
 on. If refused, reissue it asking for the facts and conclusion, not the reasoning that
 produced them. A session that can no longer respond at all is not lost: another session
 reads its transcript from its project directory and files the observation on its behalf.
-
-If the material is a whole conversation worth keeping rather than one problem, use
-`/capture-feedback` instead.
