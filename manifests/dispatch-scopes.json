@@ -8,7 +8,7 @@
     "target": {
       "cluster": "lands in the Kubernetes cluster.",
       "cloud": "lands at a cloud provider (Cloudflare, Google).",
-      "registry": "builds or changes a container image or Helm chart.",
+      "image": "builds or changes a container image or Helm chart.",
       "none": "design, planning or coordination, or work a person wants to steer in their own thread."
     }
   },
@@ -35,7 +35,7 @@
     },
     {
       "layer": "*",
-      "target": "registry",
+      "target": "image",
       "builder": "oci"
     },
     {
