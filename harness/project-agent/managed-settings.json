@@ -1,0 +1,69 @@
+{
+  "agent": "project-agent",
+  "model": "opus",
+  "autoCompactEnabled": false,
+  "alwaysThinkingEnabled": true,
+  "effortLevel": "high",
+  "autoMemoryEnabled": false,
+  "theme": "light",
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "Glob",
+      "Grep"
+    ]
+  },
+  "allowManagedPermissionRulesOnly": true,
+  "allowManagedHooksOnly": true,
+  "allowManagedMcpServersOnly": true,
+  "allowedMcpServers": [
+    { "serverUrl": "http://efforts.ssint-main-efforts.svc:8080/mcp/owner" },
+    { "serverUrl": "http://dispatch.ssint-main-coding:8080/mcp" },
+    { "serverUrl": "https://mcp.notion.com/*" }
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/session-start.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/session-start.py",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/context-handoff.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/context-handoff.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
