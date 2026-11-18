@@ -6,7 +6,7 @@
       "app": "software that does work people use, and its data, agents and jobs (Hermes, gbrain, Hindsight, collectors, agent harnesses)."
     },
     "target": {
-      "cluster": "lands in the Kubernetes cluster.",
+      "cluster": "lands in the Kubernetes cluster, including all code, manifests and configuration for hosting storage, processing and agents.",
       "cloud": "lands at a cloud provider (Cloudflare, Google).",
       "image": "builds or changes a container image or Helm chart.",
       "none": "design, planning or coordination, or work a person wants to steer in their own thread."
