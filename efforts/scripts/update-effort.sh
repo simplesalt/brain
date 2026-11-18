@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/lib-effort.sh"
 EFFORT_SCHEMA="$SCRIPT_DIR/effort_schema.py"
 
-USAGE="usage: update-effort.sh <owner/repo#N> [--status <Planning|Doing|Blocked|Review|Done|Paused|Deferred|Cancelled>] [--force] [--reconcile] [--assigned <bank>] [--title <text>] [--type <Feature|Bug|Analysis|Advisory>] [--parent <ref> | --no-parent] [--why <text>] [--what <text>] [--indicators <text>] [--gaps <text>] [--where <text>] [--facts <text>] [--unknowns <text>] [--how <text>] [--tags <text>] [--add-gap <text>] [--resolve-gap <id> [--note <text>]] [--cancel-gap <id> [--note <text>]] [--add-unknown <text>] [--resolve-unknown <id> [--note <text>]] [--cancel-unknown <id> [--note <text>]] [--add-fact <text> --evidence <ref>] [--add-indicator <text>] [--add-task <text> [--task-blockers <none|refs>] [--task-indicators <text>]] [--check-task <id>] [--cancel-task <id> [--note <text>]]"
+USAGE="usage: update-effort.sh <owner/repo#N> [--status <Planning|Doing|Blocked|Review|Done|Paused|Deferred|Cancelled>] [--force] [--reconcile] [--assigned <bank>] [--title <text>] [--type <Feature|Bug|Analysis|Advisory>] [--parent <ref> | --no-parent] [--why <text>] [--what <text>] [--indicators <text>] [--gaps <text>] [--where <text>] [--facts <text>] [--unknowns <text>] [--how <text>] [--tags <text>] [--add-gap <text>] [--resolve-gap <id> [--note <text>]] [--cancel-gap <id> [--note <text>]] [--add-unknown <text>] [--resolve-unknown <id> [--note <text>]] [--cancel-unknown <id> [--note <text>]] [--add-fact <text> --evidence <ref>] [--add-indicator <text>] [--add-task <text> [--task-blockers <none|refs>] [--task-indicators <text>]] [--check-task <id>] [--cancel-task <id> [--note <text>]] [--task-session <id> <session address>]"
 
 case "${1:-}" in
   -h|--help) echo "$USAGE"; exit 0 ;;
@@ -135,6 +135,7 @@ while [ $# -gt 0 ]; do
     --add-task)         push_op add-task "${2:?--add-task requires a value}"; shift 2 ;;
     --check-task)       push_op check-task "${2:?--check-task requires a value}"; shift 2 ;;
     --cancel-task)      push_op cancel-task "${2:?--cancel-task requires a value}"; shift 2 ;;
+    --task-session)     push_op task-session "${2:?--task-session requires a task id}"; OP_NOTE[$(last_op_idx)]="${3:?--task-session requires a session address}"; shift 3 ;;
     --note)             attach_note "${2:?--note requires a value}"; shift 2 ;;
     --evidence)         attach_evidence "${2:?--evidence requires a value}"; shift 2 ;;
     --task-blockers)    attach_task_blockers "${2:?--task-blockers requires a value}"; shift 2 ;;
@@ -477,6 +478,9 @@ if [ "$HAS_BODY_CHANGES" -eq 1 ]; then
         [ -n "$note" ] && CARGS+=(--note "$note")
         schema_call "${CARGS[@]}"
         ;;
+      task-session)
+        schema_call task-session --body-file "$ITEM_TMP" --id "$arg" --session "$note"
+        ;;
     esac
     RC=$?
     set -e
@@ -491,7 +495,7 @@ if [ "$HAS_BODY_CHANGES" -eq 1 ]; then
       add-unknown|resolve-unknown|cancel-unknown) mark_updated unknowns ;;
       add-fact) mark_updated facts ;;
       add-indicator) mark_updated indicators ;;
-      add-task|check-task|cancel-task) mark_updated how ;;
+      add-task|check-task|cancel-task|task-session) mark_updated how ;;
     esac
 
     i=$((i + 1))

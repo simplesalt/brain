@@ -194,6 +194,7 @@ configMapGenerator:
       - sync-deferred-parent.sh=efforts/scripts/sync-deferred-parent.sh
       - find-stalled-efforts.sh=efforts/scripts/find-stalled-efforts.sh
       - explain-blocked-effort.sh=efforts/scripts/explain-blocked-effort.sh
+      - held-efforts.sh=efforts/scripts/held-efforts.sh
   - name: gbrain-mark-review-script
     namespace: ssint-main-ai
     files:

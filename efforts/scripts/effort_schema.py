@@ -797,6 +797,66 @@ def cmd_item_close(args):
     sys.stdout.write(render(sections))
 
 
+TASK_SESSION_RE = re.compile(r'(?:^|; )session: (\S+)')
+TASK_FIELD_RE = re.compile(r'(?:^|; )(blockers|indicators): (.*?)(?=; (?:blockers|indicators|session|resolved|cancelled): |$)')
+
+
+def task_fields(trailing):
+    rest = (trailing or "").strip()
+    if rest.startswith(EMDASH):
+        rest = rest[len(EMDASH):].strip()
+    fields = {m.group(1): m.group(2).strip() for m in TASK_FIELD_RE.finditer(rest)}
+    m = TASK_SESSION_RE.search(rest)
+    return {
+        "blockers": fields.get("blockers", ""),
+        "indicators": fields.get("indicators", ""),
+        "session": m.group(1) if m else "",
+    }
+
+
+def set_task_session(body, task_id, address):
+    if not address or re.search(r'\s', address):
+        raise ValueError(f"session address '{address}' must be non-empty and contain no whitespace")
+    sections = parse(body)["sections"]
+    records = parse_section_lines("How", sections.get("How") or "")
+    target = next((r for r in records if r["kind"] == "item" and r["id"] == task_id), None)
+    if target is None:
+        raise ValueError(f"no task with id T{task_id} in How")
+    rest = (target.get("trailing") or "").strip()
+    if rest.startswith(EMDASH):
+        rest = rest[len(EMDASH):].strip()
+    entry = f"session: {address}"
+    if TASK_SESSION_RE.search(rest):
+        rest = TASK_SESSION_RE.sub(lambda m: m.group(0)[: -len(m.group(1))] + address, rest, count=1)
+    else:
+        rest = f"{rest}; {entry}" if rest else entry
+    target["trailing"] = f"{EMDASH} {rest}"
+    sections["How"] = render_section_from_records("How", records)
+    return render(sections)
+
+
+def tasks(body):
+    sections = parse(body)["sections"]
+    out = []
+    for r in parse_section_lines("How", sections.get("How") or ""):
+        if r["kind"] != "item" or r["id"] is None:
+            continue
+        out.append({"id": f"T{r['id']}", "state": r["state"], "text": r["text"], **task_fields(r["trailing"])})
+    return out
+
+
+def cmd_task_session(args):
+    try:
+        sys.stdout.write(set_task_session(read_file(args.body_file), args.id, args.session))
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_tasks(args):
+    print(json.dumps(tasks(read_file(args.body_file))))
+
+
 def cmd_has_evidence(args):
     sys.exit(0 if has_evidence(args.text) else 1)
 
@@ -894,6 +954,16 @@ def build_parser():
     p.add_argument("--state", required=True, choices=["x", "~"])
     p.add_argument("--note")
     p.set_defaults(func=cmd_item_close)
+
+    p = sub.add_parser("task-session")
+    p.add_argument("--body-file", required=True)
+    p.add_argument("--id", type=item_id_number, required=True)
+    p.add_argument("--session", required=True)
+    p.set_defaults(func=cmd_task_session)
+
+    p = sub.add_parser("tasks")
+    p.add_argument("--body-file", required=True)
+    p.set_defaults(func=cmd_tasks)
 
     p = sub.add_parser("has-evidence")
     p.add_argument("--text", required=True)

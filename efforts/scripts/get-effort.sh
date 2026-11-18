@@ -167,6 +167,11 @@ OPEN_DEFERRED_CHILDREN=$(echo "$CHILDREN" | jq '
 
 ITEM_ID=$(echo "$ITEM" | jq -r '.id // empty')
 
+TASKS_TMP=$(mktemp)
+printf '%s' "$BODY" > "$TASKS_TMP"
+TASKS=$(python3 "$SCRIPT_DIR/effort_schema.py" tasks --body-file "$TASKS_TMP" 2>/dev/null) || TASKS="[]"
+rm -f "$TASKS_TMP"
+
 jq -n \
   --arg ref "$REF_CANON" \
   --arg title "$TITLE" \
@@ -183,4 +188,5 @@ jq -n \
   --argjson children "$CHILDREN" \
   --argjson open_deferred_children "$OPEN_DEFERRED_CHILDREN" \
   --argjson on_board "$ON_BOARD" \
-  '{ref: $ref, title: $title, state: $state, status: $status, assigned: $assigned, in_use: $in_use, parent: $parent, blockers: $blockers, body: $body, open_children: $open_children, open_blockers: $open_blockers, item_id: $item_id, children: $children, open_deferred_children: $open_deferred_children, on_board: $on_board}'
+  --argjson tasks "$TASKS" \
+  '{ref: $ref, title: $title, state: $state, status: $status, assigned: $assigned, in_use: $in_use, parent: $parent, blockers: $blockers, body: $body, tasks: $tasks, open_children: $open_children, open_blockers: $open_blockers, item_id: $item_id, children: $children, open_deferred_children: $open_deferred_children, on_board: $on_board}'

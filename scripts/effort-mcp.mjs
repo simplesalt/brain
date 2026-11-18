@@ -7,9 +7,10 @@
 // (no shell) and returns stdout, or stderr as an isError result on a non-zero exit.
 //
 // Endpoints (Streamable HTTP, stateless, JSON responses):
-//   POST /mcp/coordinator  find, get, create, select, release, update, depend
-//   POST /mcp/doer         find, get
+//   POST /mcp/owner    find, get, create, select, release, held, update, depend (alias /mcp/coordinator)
+//   POST /mcp/builder  find, get (alias /mcp/doer)
 //   GET  /health
+// The reading guide goes out once per session as the initialize instructions.
 
 import http from 'node:http';
 import { spawn } from 'node:child_process';
@@ -58,7 +59,7 @@ function run(script, args, label, role) {
   };
   // Every simplesalt/projects issue is an Effort; the scripts add one to the board on first
   // use (simplesalt/projects#885). Doers never write, so they read such an issue as-is.
-  if (role !== 'coordinator') env.EFFORT_NO_ADOPT = '1';
+  if (role !== 'owner') env.EFFORT_NO_ADOPT = '1';
   if (label !== undefined) {
     const { host, session } = holderParts(label);
     env.EFFORT_HOLDER_HOST = host;
@@ -183,6 +184,7 @@ const TOOLS = {
         add_indicator: { anyOf: [S, { type: 'array', items: S }] },
         add_task: { type: 'object', properties: { text: S, blockers: { anyOf: [S, { type: 'array', items: S }] }, indicators: S }, required: ['text'] },
         check_task: { anyOf: [S, { type: 'integer' }] }, cancel_task: CLOSE,
+        task_session: { type: 'object', description: 'Record the bridge address of the session a How task was dispatched to; replaces an earlier one', properties: { id: { anyOf: [S, { type: 'integer' }] }, session: S }, required: ['id', 'session'] },
       },
       required: ['ref', 'session'],
     },
@@ -232,12 +234,24 @@ const TOOLS = {
               if (str(o.indicators) !== undefined && str(o.indicators) !== '') v.push('--task-indicators', str(o.indicators));
             }
             break;
+          case 'task_session':
+            for (const t of list(val)) {
+              if (!t || typeof t !== 'object') throw new UserError('error: task_session needs {id, session}');
+              v.push('--task-session', idOf(t, 'task-session'), need(t, 'session'));
+            }
+            break;
           case 'ref': case 'session': break;
           default: throw new UserError(`error: unknown argument '${k}'`);
         }
       }
       return v;
     },
+  },
+  effort_held: {
+    description: 'List the Efforts a session holds (In Use is its label), with title and status. Release each before the session hands off or ends.',
+    inputSchema: { type: 'object', properties: { session: SESSION }, required: ['session'] },
+    write: false,
+    argv: () => ['held-efforts.sh'],
   },
   effort_depend: {
     description: 'Add or remove a blocked-by edge between two Efforts (project-depend), with its refusals; reconciles the blocked Effort when the session holds it.',
@@ -256,9 +270,44 @@ const TOOLS = {
 };
 
 const ROLES = {
-  coordinator: Object.keys(TOOLS),
-  doer: ['effort_find', 'effort_get'],
+  owner: Object.keys(TOOLS),
+  builder: ['effort_find', 'effort_get'],
 };
+const ALIASES = { coordinator: 'owner', doer: 'builder' };
+const TITLED = new Set(['effort_select', 'effort_update']);
+
+const READING_GUIDE = `How to read an Effort (simplesalt/projects issue; effort_get returns it as JSON).
+
+- status is the board column: Planning (being designed), Doing (being delivered), Blocked, Review (delivered, awaiting verification), Done, Paused, Deferred (waiting on a child Effort), Cancelled.
+- assigned is the agent or person responsible; in_use is the session label currently holding the Effort, empty when free.
+- body has fixed sections in this order: Title, Assigned, Parent, Blockers, Why, What, Indicators, Gaps, Where, Facts, Unknowns, How, Tags. Why is the reason, What the desired end state, Indicators the observable signs it is reached, Where the systems and repos involved.
+- Items carry ids: G gaps (questions only the person can answer), U unknowns (questions research can answer), F facts (each with its evidence), I indicators, T tasks in How.
+- Checkbox marks: [ ] open, [x] resolved or done, [~] cancelled, [-] deferred to a child Effort. Text after " — " on an item is its metadata: resolved/cancelled notes, evidence, and for tasks "blockers: ...; indicators: ...; session: ...".
+- tasks lists the How items parsed: id, state, text, blockers, indicators, and session, the bridge address of the session the task was dispatched to (empty if not dispatched).
+- parent, blockers, children, open_children and open_blockers give the Effort's place in the tree; an open blocker or child keeps it from Done.
+- A Gap, Unknown or How item that names another Effort points at that Effort; read it with effort_get rather than guessing its state.`;
+
+const OWNER_GUIDE = `
+
+Owning Efforts (this endpoint):
+- Every write needs session: your session label. Select an Effort with effort_select before effort_update, effort_depend writes or effort_release; a held Effort is refused to every other session.
+- effort_select and effort_update return session_title ("#N name · Status"). Apply it as your session or thread title with your own rename tool each time it changes.
+- When you dispatch a How task to another session, record its bridge address with effort_update task_session {id, session}; it is shown on read.
+- Before you hand off or your work ends, call effort_held with your session label and effort_release each Effort it lists. Holds left by sessions that are gone are cleared by the lease sweep.`;
+
+const instructionsFor = (role) => (role === 'owner' ? READING_GUIDE + OWNER_GUIDE : READING_GUIDE);
+
+const TYPE_PREFIX = /^\[[^\[\]\s]+\]\s+/;
+async function sessionTitle(ref, role) {
+  const r = await run('get-effort.sh', [ref], undefined, role);
+  if (r.code !== 0) return undefined;
+  let d;
+  try { d = JSON.parse(r.out); } catch { return undefined; }
+  const num = String(d.ref ?? ref).split('#').pop();
+  const name = String(d.title ?? '').trim().replace(TYPE_PREFIX, '').trim();
+  if (!/^\d+$/.test(num) || !name || !d.status) return undefined;
+  return `#${num} ${name} · ${d.status}`;
+}
 
 async function callTool(role, name, args) {
   if (!ROLES[role].includes(name)) return errResult(`error: tool '${name}' is not available on the ${role} endpoint`);
@@ -278,7 +327,15 @@ async function callTool(role, name, args) {
   const out = r.out.trim(), err = r.err.trim();
   console.log(JSON.stringify({ at: new Date().toISOString(), role, tool: name, session: held ? a.session : undefined, ref: a.ref, code: r.code }));
   if (r.code !== 0) return errResult([err, out].filter(Boolean).join('\n') || `error: ${argv[0]} exited ${r.code}`);
-  const content = [{ type: 'text', text: out || '{}' }];
+  let text = out || '{}';
+  if (TITLED.has(name)) {
+    try {
+      const data = JSON.parse(text);
+      const title = await sessionTitle(data.ref ?? a.ref, role);
+      if (title && data && typeof data === 'object' && !Array.isArray(data)) text = JSON.stringify({ ...data, session_title: title });
+    } catch { /* keep the script output as-is */ }
+  }
+  const content = [{ type: 'text', text }];
   if (err) content.push({ type: 'text', text: err });
   return { content };
 }
@@ -295,7 +352,8 @@ async function handleRpc(role, msg) {
       return rpcOk(msg.id, {
         protocolVersion: msg.params?.protocolVersion ?? '2025-06-18',
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: `efforts-${role}`, version: '1.0.0' },
+        serverInfo: { name: `efforts-${role}`, version: '1.1.0' },
+        instructions: instructionsFor(role),
       });
     case 'ping':
       return rpcOk(msg.id, {});
@@ -319,9 +377,9 @@ function send(res, status, body) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/health') return send(res, 200, { ok: true });
-  const m = /^\/mcp\/(coordinator|doer)\/?$/.exec(url.pathname);
+  const m = /^\/mcp\/(owner|builder|coordinator|doer)\/?$/.exec(url.pathname);
   if (!m) return send(res, 404, { error: 'not found' });
-  const role = m[1];
+  const role = ALIASES[m[1]] ?? m[1];
   if (req.method === 'GET') { res.writeHead(405, { allow: 'POST' }); return res.end(); }
   if (req.method === 'DELETE') return send(res, 200, null);
   if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); return res.end(); }

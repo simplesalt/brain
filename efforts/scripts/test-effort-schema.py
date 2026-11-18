@@ -1709,5 +1709,58 @@ class AddTaskNamingADeferredChild(unittest.TestCase):
             self.assertEqual(es.parse(out)["sections"]["How"], f"- [ ] [T1] Carry out {CHILD_REF}")
 
 
+class TaskSessionAddress(unittest.TestCase):
+    HOW = (
+        "- [ ] [T1] Build it — blockers: none; indicators: it runs\n"
+        "- [x] [T2] Ship it — blockers: #5; indicators: a; b; resolved: done\n"
+        "- [ ] [T3] Legacy task"
+    )
+
+    def body(self):
+        return es.render({"Title": "T", "Assigned": "A", "Why": "w", "What": "w", "Indicators": "i",
+                          "Where": "w", "Tags": "t", "How": self.HOW})
+
+    def test_records_and_reads_a_session_on_an_open_task(self):
+        out = es.set_task_session(self.body(), 1, "bridge:cse_abc")
+        t1 = es.tasks(out)[0]
+        self.assertEqual(t1, {"id": "T1", "state": "open", "text": "Build it", "blockers": "none",
+                              "indicators": "it runs", "session": "bridge:cse_abc"})
+
+    def test_replaces_an_earlier_session(self):
+        out = es.set_task_session(es.set_task_session(self.body(), 1, "bridge:a"), 1, "bridge:b")
+        self.assertEqual(es.tasks(out)[0]["session"], "bridge:b")
+        self.assertEqual(out.count("session:"), 1)
+
+    def test_closed_task_keeps_its_note_and_indicators(self):
+        out = es.set_task_session(self.body(), 2, "bridge:x")
+        t2 = es.tasks(out)[1]
+        self.assertEqual((t2["state"], t2["indicators"], t2["session"]), ("closed", "a; b", "bridge:x"))
+        self.assertIn("resolved: done", out)
+
+    def test_legacy_task_gets_a_trailing_session(self):
+        out = es.set_task_session(self.body(), 3, "bridge:y")
+        self.assertIn("- [ ] [T3] Legacy task — session: bridge:y", out)
+        self.assertEqual(es.tasks(out)[2]["session"], "bridge:y")
+
+    def test_refuses_unknown_task_and_bad_address(self):
+        with self.assertRaises(ValueError):
+            es.set_task_session(self.body(), 9, "bridge:z")
+        with self.assertRaises(ValueError):
+            es.set_task_session(self.body(), 1, "two words")
+
+    def test_cli_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "b.md")
+            with open(path, "w") as f:
+                f.write(self.body())
+            rc, out, err = run_cli(["task-session", "--body-file", path, "--id", "T1", "--session", "bridge:q"])
+            self.assertEqual(rc, 0, err)
+            with open(path, "w") as f:
+                f.write(out)
+            rc, out, err = run_cli(["tasks", "--body-file", path])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(json.loads(out)[0]["session"], "bridge:q")
+
+
 if __name__ == "__main__":
     unittest.main()
