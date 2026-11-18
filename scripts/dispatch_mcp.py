@@ -185,14 +185,7 @@ def dispatch(args):
         return invalid("caller must be a bridge address starting 'bridge:'")
     if isinstance(hops, bool) or not isinstance(hops, int) or hops < 0:
         return invalid('hops must be a non-negative integer')
-    named = args.get('builder')
-    if named is not None:
-        key = named.strip().lower().removeprefix('ssint-build-') if isinstance(named, str) else None
-        if key not in BUILDERS:
-            return invalid(f"builder must be one of {', '.join(BUILDERS)} (or ssint-build-<name>)")
-        builder, route = key, {'route': 'named'}
-    else:
-        builder, route = pick_builder(text)
+    builder, route = pick_builder(text)
     addr, reason = post_dispatch(BUILDERS[builder], {'slug': slug, 'caller': caller, 'text': text, 'hops': hops})
     base = {'pod': builder, **{k: v for k, v in route.items() if v is not None}}
     if addr:
@@ -202,9 +195,8 @@ def dispatch(args):
 
 TOOL = {
     'name': 'dispatch',
-    'description': ("Start a new session on a builder pod and return that session's bridge address to message it. "
-                    "Name the builder (for example the Effort's assignee) and the task goes there; without one, "
-                    'the task text is classified and text that fits no builder goes to the projects pod. '
+    'description': ("Start a new session on the builder pod whose scope fits the task, and return that session's "
+                    'bridge address to message it. Text that fits no builder goes to the projects pod. '
                     'Keeps no state; a retry may start a second session.'),
     'inputSchema': {
         'type': 'object',
@@ -213,10 +205,6 @@ TOOL = {
             'slug': {'type': 'string', 'description': 'Short name for the new session, [a-z0-9-]{1,48}; it leads the session title.'},
             'caller': {'type': 'string', 'description': "The caller's own bridge address (starts 'bridge:'); the new session replies there."},
             'hops': {'type': 'integer', 'minimum': 0, 'description': 'How many dispatches led to the caller; 0 when a person started it.'},
-            'builder': {'type': 'string', 'enum': [*BUILDERS, *(f'ssint-build-{b}' for b in BUILDERS)],
-                        'description': "The builder that owns the work, such as the Effort's assignee "
-                                       "(ssint-build-oci or oci). When given, the task goes to that builder "
-                                       'and the text is not classified.'},
         },
         'required': ['text', 'slug', 'caller'],
         'additionalProperties': False,
