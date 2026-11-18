@@ -28,6 +28,7 @@ FALLBACK = REGISTRY['fallback']
 BUILDERS = REGISTRY['builders']
 QUESTIONS = REGISTRY['questions']
 TABLE = REGISTRY['table']
+AGENTS = REGISTRY['agents']
 if FALLBACK not in BUILDERS:
     raise SystemExit(f"fallback builder '{FALLBACK}' is not in the registry")
 for row in TABLE:
@@ -36,6 +37,8 @@ for row in TABLE:
     for q in ('layer', 'target'):
         if row[q] != '*' and row[q] not in QUESTIONS[q]:
             raise SystemExit(f"table row {row} uses unknown {q}")
+if set(AGENTS) != set(BUILDERS):
+    raise SystemExit('agents must describe exactly the builders')
 
 
 def router_prompt():
@@ -150,12 +153,14 @@ def post_dispatch(url, payload):
     try:
         status, doc = post_json(url, payload, DISPATCH_TIMEOUT)
     except Exception as e:
-        return None, f'endpoint unreachable: {err_text(e)}'
+        reason = err_text(e)
+        return (504 if reason == 'timeout' else 502), None, f'agent endpoint unreachable: {reason}'
     doc = doc if isinstance(doc, dict) else {}
     addr = doc.get('address')
-    if 200 <= status < 300 and isinstance(addr, str) and addr.startswith('bridge:'):
-        return addr, None
-    return None, str(doc.get('reason') or doc.get('error') or f'endpoint answered {status} with no address')
+    addr = addr if isinstance(addr, str) and addr.startswith('bridge:') else None
+    if 200 <= status < 300 and not addr:
+        return 502, None, f'agent endpoint answered {status} with no bridge address'
+    return status, addr, None if addr else str(doc.get('error') or doc.get('reason') or f'agent endpoint answered {status}')
 
 
 def dispatch(args):
@@ -168,46 +173,59 @@ def dispatch(args):
         'text_sha256': hashlib.sha256((text if isinstance(text, str) else '').encode()).hexdigest(),
     }
 
-    def finish(fields):
-        print(json.dumps({**log, **fields}), flush=True)
-        return fields
-
-    def invalid(reason):
-        return finish({'outcome': 'invalid', 'pod': None, 'address': None, 'reason': reason})
+    def finish(status, message, address=None, route=None):
+        print(json.dumps({**log, **(route or {}), 'status': status, 'address': address, 'log': message}), flush=True)
+        return {'status': status, 'log': message, 'address': address}
 
     if not isinstance(text, str) or not text.strip():
-        return invalid('text is required')
+        return finish(400, 'text is required')
     if len(text) > MAX_TEXT:
-        return invalid(f'text is over {MAX_TEXT} characters')
+        return finish(400, f'text is over {MAX_TEXT} characters')
     if not isinstance(slug, str) or not SLUG.match(slug):
-        return invalid('slug must match [a-z0-9-]{1,48}')
+        return finish(400, 'slug must match [a-z0-9-]{1,48}')
     if not isinstance(caller, str) or not caller.startswith('bridge:') or re.search(r'\s', caller):
-        return invalid("caller must be a bridge address starting 'bridge:'")
+        return finish(400, "caller must be a bridge address starting 'bridge:'")
     if isinstance(hops, bool) or not isinstance(hops, int) or hops < 0:
-        return invalid('hops must be a non-negative integer')
+        return finish(400, 'hops must be a non-negative integer')
     builder, route = pick_builder(text)
-    addr, reason = post_dispatch(BUILDERS[builder], {'slug': slug, 'caller': caller, 'text': text, 'hops': hops})
-    base = {'pod': builder, **{k: v for k, v in route.items() if v is not None}}
+    route = {'pod': builder, **{k: v for k, v in route.items() if v is not None}}
+    status, addr, reason = post_dispatch(BUILDERS[builder], {'slug': slug, 'caller': caller, 'text': text, 'hops': hops})
     if addr:
-        return finish({'outcome': 'dispatched', **base, 'address': addr})
-    return finish({'outcome': 'refused', **base, 'address': None, 'reason': reason})
+        return finish(status, f'assigned to {builder}; the new session will reply to {caller}', addr, route)
+    return finish(status, f'{builder} did not take the work: {reason}', None, route)
 
+
+AGENT_NAMES = {'basis': 'Basis', 'cloud-basis': 'Cloud-Basis', 'brain': 'Brain', 'oci': 'OCI', 'projects': 'Projects'}
 
 TOOL = {
     'name': 'dispatch',
-    'description': ("Start a new session on the builder pod whose scope fits the task, and return that session's "
-                    'bridge address to message it. Text that fits no builder goes to the projects pod. '
-                    'Keeps no state; a retry may start a second session.'),
+    'description': '\n'.join([
+        'Assign work to a new session. Available agents are',
+        *(f'- {AGENT_NAMES.get(name, name)}: {desc}' for name, desc in AGENTS.items()),
+        'Concisely describe what you need the agent to make true for your need to be met. '
+        'The agent knows best how to deliver it within its scope; omit any instructions or detail '
+        'unnecessary for completing the task.',
+        "Returns the agent endpoint's HTTP status, a log line, and the new session's bridge address.",
+    ]),
     'inputSchema': {
         'type': 'object',
         'properties': {
-            'text': {'type': 'string', 'description': 'The task, as plain text. The new session receives it as its prompt.'},
+            'text': {'type': 'string', 'description': 'What you need made true. The new session receives it as its prompt.'},
             'slug': {'type': 'string', 'description': 'Short name for the new session, [a-z0-9-]{1,48}; it leads the session title.'},
-            'caller': {'type': 'string', 'description': "The caller's own bridge address (starts 'bridge:'); the new session replies there."},
-            'hops': {'type': 'integer', 'minimum': 0, 'description': 'How many dispatches led to the caller; 0 when a person started it.'},
+            'caller': {'type': 'string', 'description': "Your own bridge address (starts 'bridge:'); the new session replies there."},
+            'hops': {'type': 'integer', 'minimum': 0, 'description': 'How many dispatches led to you; 0 when a person started you.'},
         },
         'required': ['text', 'slug', 'caller'],
         'additionalProperties': False,
+    },
+    'outputSchema': {
+        'type': 'object',
+        'properties': {
+            'status': {'type': 'integer', 'description': "HTTP status from the agent endpoint (400 for invalid input here, 502/504 if the endpoint was unreachable)."},
+            'log': {'type': 'string'},
+            'address': {'type': ['string', 'null'], 'description': "The new session's bridge address, or null if none started."},
+        },
+        'required': ['status', 'log', 'address'],
     },
 }
 
@@ -216,8 +234,8 @@ def call_tool(name, args):
     if name != 'dispatch':
         return {'content': [{'type': 'text', 'text': f'unknown tool: {name}'}], 'isError': True}
     r = dispatch(args)
-    out = {'content': [{'type': 'text', 'text': json.dumps(r)}]}
-    if r['outcome'] != 'dispatched':
+    out = {'content': [{'type': 'text', 'text': json.dumps(r)}], 'structuredContent': r}
+    if not 200 <= r['status'] < 300:
         out['isError'] = True
     return out
 
