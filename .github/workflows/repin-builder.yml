@@ -32,6 +32,7 @@ jobs:
         id: repin
         env:
           DRY_RUN: ${{ inputs.dry_run }}
+          BUILDER_VERSION_CEILING: "0.55.1"
         run: |
           set -euo pipefail
           arguments=()

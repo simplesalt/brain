@@ -51,11 +51,17 @@ def published_tags():
     return tags
 
 
-def newest_version(tags):
+def version_key(tag):
+    return tuple(int(part) for part in tag.split("."))
+
+
+def newest_version(tags, ceiling):
     plain = [tag for tag in tags if PLAIN_VERSION.match(tag)]
+    if ceiling:
+        plain = [tag for tag in plain if version_key(tag) < version_key(ceiling)]
     if not plain:
         raise SystemExit(f"no X.Y.Z tags published for {CHART_REPOSITORY}")
-    return max(plain, key=lambda tag: tuple(int(part) for part in tag.split(".")))
+    return max(plain, key=version_key)
 
 
 def builder_pins(path):
@@ -76,9 +82,13 @@ def write_pins(path, version):
 def main():
     parser = argparse.ArgumentParser(description="Repin every builder HelmRelease to the newest published builder chart.")
     parser.add_argument("--dry-run", action="store_true", help="print the moves without writing")
+    parser.add_argument("--below", default=os.environ.get("BUILDER_VERSION_CEILING", ""),
+                        help="ignore published versions at or above this X.Y.Z")
     args = parser.parse_args()
+    if args.below and not PLAIN_VERSION.match(args.below):
+        raise SystemExit(f"--below must be X.Y.Z, got {args.below!r}")
 
-    target = newest_version(published_tags())
+    target = newest_version(published_tags(), args.below)
     pins = {path: builder_pins(path) for path in MANIFEST_FILES}
     release_count = sum(len(found) for found in pins.values())
     if not release_count:
