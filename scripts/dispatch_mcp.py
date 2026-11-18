@@ -248,6 +248,14 @@ def rpc_err(i, code, message):
     return {'jsonrpc': '2.0', 'id': i, 'error': {'code': code, 'message': message}}
 
 
+REQUEST_GUIDE = """How to make a request through dispatch.
+
+- Name the Effort and the How task the request delivers (owner/repo#N, task id).
+- State the task's desired state concretely, as something that will be true when it is done, for example "this address gets a notice at least weekly if any cluster jobs are stuck".
+- Never include code, recipes, step-by-step instructions, per-task success measures or test cases. How to get there is the receiver's to decide.
+- Expect pushback with one of five reasons: overly prescriptive, against governance, breaks something the receiver owns, too big for one worker, or needs other agents. Answer by restating the desired state, narrowing or splitting it, or taking it elsewhere; do not argue the method.
+- Record the receiving session's address on the task once dispatch returns it."""
+
 def handle_rpc(msg):
     if not isinstance(msg, dict) or msg.get('jsonrpc') != '2.0' or not isinstance(msg.get('method'), str):
         return rpc_err(msg.get('id') if isinstance(msg, dict) else None, -32600, 'Invalid Request')
@@ -256,7 +264,8 @@ def handle_rpc(msg):
         return rpc_ok(i, {
             'protocolVersion': params.get('protocolVersion', '2025-06-18'),
             'capabilities': {'tools': {'listChanged': False}},
-            'serverInfo': {'name': 'dispatch', 'version': '2.0.0'},
+            'serverInfo': {'name': 'dispatch', 'version': '2.1.0'},
+            'instructions': REQUEST_GUIDE,
         })
     if method == 'ping':
         return rpc_ok(i, {})
