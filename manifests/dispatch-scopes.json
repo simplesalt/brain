@@ -54,8 +54,8 @@
   "agents": {
     "basis": "the cluster-wide base stack: operator installs (cert-manager, Kyverno, CloudNativePG, observability), Kyverno cluster and cleanup policies, and platform services shared by every namespace (the flux MCP, the logs API and logs MCP, alerting, cluster health checks).",
     "cloud-basis": "Crossplane and its Cloudflare and GCP providers; Cloudflare resources (DNS, tunnels, Access apps and policies, Workers, Zero Trust); Google Workspace and GCP resources; the cluster MCP connector's routes into the cluster; Kyverno policies that generate Crossplane resources.",
-    "brain": "AI app manifests via Flux (Hermes, gbrain, Hindsight, Big AGI, collectors and ingest jobs, model config); builder pod releases and their values (chart pins, MCP config); the Effort MCP and other app services in the ssint namespaces; image and chart pins for gbrain, hermes-agent and hindsight.",
-    "oci": "building and publishing container images (builder-sb, cred-rotator, cluster, gbrain, agentdb); the builder Helm chart and its releases; builder policy baked into every coding pod (managed settings, hooks, skills, agent prompts); node bootstrap and kube-vip.",
+    "brain": "AI app manifests via Flux (Hermes, gbrain, Hindsight, Big AGI, collectors and ingest jobs, model config); builder pod releases and their values (chart pins, MCP config); builder policy published as harness layers (managed settings, hooks, skills, agent prompts); the Effort MCP and other app services in the ssint namespaces; image and chart pins for gbrain, hermes-agent and hindsight.",
+    "oci": "building and publishing container images (builder-sb, cred-rotator, cluster, gbrain, agentdb); the builder Helm chart and its releases; node bootstrap and kube-vip.",
     "projects": "planning and coordinating cross-repo delivery; creating, splitting, updating and closing Efforts and their tasks; anything that fits no other agent."
   }
 }
