@@ -12,7 +12,7 @@ Arguments: an optional UTC end date `YYYY-MM-DD`. Default: yesterday (UTC). The 
 ## Where things are
 
 - Router: `scripts/dispatch_mcp.py` and `manifests/dispatch-scopes.json` in simplesalt/brain. The live router prompt is at `GET http://dispatch.ssint-main-coding:8080/prompt`. Read both before judging a route.
-- Records: every dispatch call and every misroute report writes one JSON line with `"level": "audit"` to the dispatch container's stdout. The cluster log store keeps them; read them through the logs MCP (`http://logs-mcp.cluster-main-observability:8080/mcp`, tool `entries`) with `namespace=eq.ssint-main-coding`, `container=eq.dispatch`, `message=like.*"level": "audit"*`, `at=gte.<start>` and `at=lt.<end>`, ordered by `at`. Records are complete from 2026-11-19; earlier weeks hold only refused calls.
+- Records: every dispatch call and every misroute report writes one JSON line with `"level": "validation"` to the dispatch container's stdout. The cluster log store keeps them; read them through the logs MCP (`http://logs-mcp.cluster-main-observability:8080/mcp`, tool `entries`) with `namespace=eq.ssint-main-coding`, `container=eq.dispatch`, `message=like.*"level": "validation"*`, `at=gte.<start>` and `at=lt.<end>`, ordered by `at`. Records are complete from 2026-11-19; earlier weeks hold only refused calls.
   - `event: dispatch` fields: `ts`, `caller`, `slug`, `hops`, `text`, `pod` (the agent it went to), `layer`, `target`, `route` (`table` or `fallback`, with `route_reason`), `model_answer`, `reasoning`, `served_model`, `provider`, `status` (the agent endpoint's HTTP status), `address` (the started session) and `log`.
   - `event: misroute` fields: `ts`, `address` (the session that received the work), `right_agent`, `reason`. Match it to its dispatch by `address`.
 - Tally (Notion, Team Dashboard › Dispatch misses), built like the Hermes misses tally:
@@ -21,7 +21,7 @@ Arguments: an optional UTC end date `YYYY-MM-DD`. Default: yesterday (UTC). The 
 
 ## Steps
 
-1. Load the week's audit records (none, or the log store down: say so and stop). Drop calls with `hops` above the hop limit that a person or a test sent on purpose (status 403 with a `route-test` style slug).
+1. Load the week's validation records (none, or the log store down: say so and stop). Drop calls with `hops` above the hop limit that a person or a test sent on purpose (status 403 with a `route-test` style slug).
 2. Find misroutes. Each of these is a miss:
    - a `misroute` record from the receiving agent (mark the Miss title "[receiver report]");
    - the same caller sends the same work again within a day with a different `pod`, after a session started on the first;

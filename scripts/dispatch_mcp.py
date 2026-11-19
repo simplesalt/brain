@@ -214,7 +214,7 @@ def dispatch(args):
     text, slug, caller, hops = args.get('text'), args.get('slug'), args.get('caller'), args.get('hops', 0)
     log = {
         'ts': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
-        'level': 'audit',
+        'level': 'validation',
         'event': 'dispatch',
         'caller': caller if isinstance(caller, str) else None,
         'slug': slug if isinstance(slug, str) else None,
@@ -289,7 +289,7 @@ def report_misroute(args):
         return {'status': 400, 'log': 'reason is required', 'address': None}
     if right is not None and right not in BUILDERS:
         return {'status': 400, 'log': f"right_agent must be one of {', '.join(BUILDERS)}", 'address': None}
-    print(json.dumps({'ts': datetime.now(timezone.utc).isoformat(timespec='milliseconds'), 'level': 'audit',
+    print(json.dumps({'ts': datetime.now(timezone.utc).isoformat(timespec='milliseconds'), 'level': 'validation',
                       'event': 'misroute', 'address': address, 'right_agent': right, 'reason': reason[:LOG_TEXT]}), flush=True)
     return {'status': 200, 'log': 'misroute recorded for the weekly dispatch review', 'address': None}
 
