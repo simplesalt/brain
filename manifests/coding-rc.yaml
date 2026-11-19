@@ -292,7 +292,7 @@ spec:
       images:
         - name: claude-code
           repository: ghcr.io/simplesalt/brain/harness/builder
-          digest: sha256:80c48a4ec30ae4a456cb2b7affefa0420d007cdac08143547930f39e74f31a03
+          digest: sha256:7db2b02d01988e9d0f22e9f97e8dbe64661095ad2cf2b86d5348d00ec1da472b
     agent:
       mission: >-
         Keep simplesalt's cloud platform (Cloudflare, Google Workspace and GCP) declared in the repo through Crossplane and reconciled by Flux, so every cloud resource the cluster and its apps depend on exists, is secured, and can be rebuilt from the repo.
