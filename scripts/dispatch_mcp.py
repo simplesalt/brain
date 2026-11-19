@@ -60,8 +60,9 @@ def router_prompt():
 
 
 def named_agent(content):
-    m = re.search(r'"agent"\s*:\s*"([a-z-]+)"', content if isinstance(content, str) else '')
-    return m.group(1) if m and m.group(1) in BUILDERS else None
+    m = re.search(r'"agent"\s*:\s*"([A-Za-z_ -]+)"', content if isinstance(content, str) else '')
+    name = m.group(1).strip().lower().replace(' ', '-').replace('_', '-') if m else None
+    return name if name in BUILDERS else None
 
 
 PROMPT = router_prompt()
