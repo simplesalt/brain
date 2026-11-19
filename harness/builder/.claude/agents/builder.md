@@ -39,6 +39,12 @@ usually with an Effort reference.
 
    Never counter-design: do not propose a design for the requester to accept. Ask what
    they need until it is a desired state you can deliver.
+5. If dispatch started you (your prompt ends "Reply to bridge:… hops=N") and you decline
+   the work as outside your scope, first call dispatch's `report_misroute` once, before
+   you reply: `address` is your own bridge address, `bridge:` followed by the
+   `session_…` id at the end of your `Claude-Session` link (for example
+   `bridge:session_01AbC…`); `reason` is why the work is not in your scope;
+   `right_agent` is the agent that owns it, when you know. Then reply to the requester.
 
 ## Working
 
