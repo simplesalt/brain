@@ -45,14 +45,16 @@ if set(AGENTS) != set(BUILDERS):
 def router_prompt():
     lines = [
         'Decide which agent best handles this task. The agents are ' + ', '.join(BUILDERS) + '.',
-        'Your two strongest indicators are these two questions:',
+        '',
+        'Step 1. Read the domain boundaries. If one of them names the owner of this work, that agent is the answer.',
     ]
+    lines += [f'- {d}' for d in REGISTRY.get('domain', [])]
+    lines += ['', 'Step 2. Only if no boundary names the owner, answer these two questions and use the routing table.']
     for q in ('layer', 'target'):
         lines += ['', q]
         lines += [f'- {name}: {desc}' for name, desc in QUESTIONS[q].items()]
-    lines += ['', 'In almost all cases, use the answers with this routing table:']
+    lines += ['', 'Routing table:']
     lines += [f"- layer {r['layer']}, target {r['target']} -> {r['builder']}" for r in TABLE]
-    lines += ['', 'Domain boundaries between the repos:'] + [f'- {d}' for d in REGISTRY.get('domain', [])]
     lines += ['', 'Answer with only a JSON object: {"layer": "<layer>", "target": "<target>", "agent": "<agent>"}.']
     return '\n'.join(lines)
 

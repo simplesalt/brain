@@ -48,11 +48,11 @@
     "App code is code. It is built into a container image and shipped with a Helm chart. Images and charts live in oci.",
     "The GitOps repos (basis, cloud-basis, brain) hold manifests and configuration only, deployed by Flux as written. They never hold app code.",
     "brain holds app manifests, builder pod releases and their values, and the configuration of agent environments: the harness layers (settings, hooks, skills, prompts, and small glue such as a bash alias that blocks sed).",
-    "basis holds the platform every app runs on inside the cluster. cloud-basis holds what lives at cloud providers, including Kyverno policies that generate cloud resources.",
+    "basis holds the platform every app runs on inside the cluster. cloud-basis holds platform resources at cloud providers, including Kyverno policies that generate cloud resources; an app's own cloud configuration (its DNS record, its access policy) stays with the app in brain.",
+    "oci builds and owns these products: builder-sb, cred-rotator, cluster, gbrain, agentdb. Each product's own code, image and Helm chart are oci work, including what the product does at runtime.",
     "projects plans and coordinates, and writes Efforts. It changes no repo.",
     "Requests may name a builder by its Helm release, such as build-cloud-basis or ssint-build-oci. Changing which chart version a builder release runs is a pin change in brain, not chart work.",
-    "Harness layers (builder, project, desktop) are brain's agent configuration. Building, publishing or changing a harness layer is layer app, target cluster.",
-    "When a domain boundary above names the owner, that owner wins over the routing table."
+    "Harness layers (builder, project, desktop) are brain's agent configuration. Building, publishing or changing a harness layer is layer app, target cluster."
   ],
   "builders": {
     "basis": "http://ssint-build-basis-dispatch:8080/dispatch",
