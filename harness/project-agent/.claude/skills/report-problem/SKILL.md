@@ -1,24 +1,28 @@
 ---
 name: report-problem
-description: Use when recording a problem, opportunity, unexpected outcome, or tracked result worth remembering but not worth scheduling as work, as a Hindsight observation.
+description: Use when recording a problem, opportunity, unexpected outcome, or tracked result worth remembering but not worth scheduling as work. Invoke it with the whole record as args (first line `<problem|opportunity|unexpected-outcome|tracked-result>: <title>`, then the details); a hook writes it to the pod's stdout as an error log line, where the logs MCP picks it up.
 ---
 
 <!-- agent-prompt -->
 
 
-search first: `hindsight-recall.sh <query> --types observation,world --tags observation`.
-if a matching observation exists, append your specifics to it:
-`<content> | hindsight-ingest.sh <same title> --append`
-else create a new one:
-`<content> | hindsight-ingest.sh <title> --tags observation,<workstream bank> --meta type=<problem|opportunity|unexpected-outcome|tracked-result> --meta workstream=<bank>`
+The record you passed as args is already written: a hook logged it to the pod's stdout
+as one JSON line with `"level": "error"`, `"logger": "agent-report"`, the skill name and
+your session label, before this text loaded. A denied call recorded nothing; its reason
+says what to fix, so invoke `/report-problem` again with the corrected args.
 
-Content on stdin is freeform, includes all details, and stays to about 10 lines.
+The args are the record:
+- First line: `<problem|opportunity|unexpected-outcome|tracked-result>: <title>`.
+- Then freeform, all details, about 10 lines: the workstream, evidence, sequence and
+  conclusion.
+
+Each invocation is one record; there is no append or search. To add to a record, invoke
+again with the same title and the new specifics.
 
 Write it as evidence, sequence, and conclusion — an external record, not an account of
 your own reasoning; the reasoning framing is what a `reasoning_extraction` refusal keys
 on. If refused, reissue it asking for the facts and conclusion, not the reasoning that
-produced them. A session that can no longer respond at all is not lost: another session
-reads its transcript from its project directory and files the observation on its behalf.
+produced them.
 
 If the material is a whole conversation worth keeping rather than one problem, use
 `/capture-feedback` instead.

@@ -1,30 +1,29 @@
 ---
 name: capture-feedback
-description: Use when the person says "record this conversation" or gives feedback worth keeping on the session as a whole, rather than a single problem — stores one transcript document plus a handful of distilled observations.
+description: Use when the person says "record this conversation" or gives feedback worth keeping on the session as a whole, rather than a single problem. Distill the session into at most five observations and invoke this skill once per observation with that observation as args (first line `<problem|opportunity|unexpected-outcome|tracked-result>: <title>`, then 3-10 lines); a hook writes each to the pod's stdout as an error log line, where the logs MCP picks it up.
 ---
 
 <!-- agent-prompt -->
 
 
-1. `capture-session.sh <title>` once, to store this session's transcript as a single
-   document. `$HINDSIGHT_BANK_ID` and `$CLAUDE_CODE_SESSION_ID` are picked up
-   automatically. Report the printed `document_id` and `memory_unit_count`.
-2. Distill the session into at most five observations: durable findings about how the
+The observation you passed as args is already written: a hook logged it to the pod's
+stdout as one JSON line with `"level": "error"`, `"logger": "agent-report"`, the skill
+name and your session label, before this text loaded. A denied call recorded nothing;
+its reason says what to fix, so invoke `/capture-feedback` again with the corrected args.
+
+1. Distill the session into at most five observations: durable findings about how the
    work went — a problem, opportunity, unexpected outcome, or tracked result — each
-   naming the piece of the system responsible and the proposed fix. Each observation is
-   3-10 lines. Write each as an external record of what happened and what was
-   concluded, not an account of your own reasoning — that framing is what a
-   `reasoning_extraction` refusal keys on.
-3. Ingest each observation separately:
-   `<content> | hindsight-ingest.sh <title> --tags observation,<workstream bank> --meta type=<problem|opportunity|unexpected-outcome|tracked-result> --meta workstream=<bank>`
-   (the bank's default `observation` strategy applies).
+   naming the piece of the system responsible and the proposed fix. Put the person's own
+   feedback, in their words, in the first one.
+2. Invoke `/capture-feedback` once per observation, with that observation as args:
+   - First line: `<problem|opportunity|unexpected-outcome|tracked-result>: <title>`.
+   - Then 3-10 lines, an external record of what happened and what was concluded, not
+     an account of your own reasoning — that framing is what a `reasoning_extraction`
+     refusal keys on.
+3. Tell the person how many observations were recorded and their titles.
 
-Never ingest the transcript itself through `hindsight-ingest.sh` — that is exactly the
-mechanical-noise failure this skill replaces. Never turn mechanical detail (JSONL
-structure, tool_use ids, message counts, restatements of the transcript) into an
-observation; it belongs in the transcript document from step 1 only.
+Never pass the transcript or mechanical detail (JSONL structure, tool_use ids, message
+counts, restatements of the transcript) as an observation.
 
-If a distillation or ingest is refused, reissue it asking for the facts and conclusion,
-not the reasoning that produced them. If the session can't respond at all, a peer
-session reads its transcript from the session's project directory and files the
-observations on its behalf.
+If a distillation is refused, reissue it asking for the facts and conclusion, not the
+reasoning that produced them.

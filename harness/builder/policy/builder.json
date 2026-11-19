@@ -70,6 +70,16 @@
             "command": "/etc/claude-code/scripts/strip-comments-precommit.py"
           }
         ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/record-to-stdout.py",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
