@@ -15,8 +15,8 @@ POD_STDOUT = os.environ.get("AGENT_REPORT_STDOUT") or "/proc/1/fd/1"
 TAG = "[idle check-in]"
 MESSAGE = (
     f"{TAG} This session has been idle about {max(1, round(IDLE_SECONDS / 60))} minutes. "
-    "Are you done? If so, make sure your requester has your final report, then end. "
-    "If you're blocked, tell your requester what blocks you, naming the blocking Effort, then end. "
+    "Are you done? If so, make sure your requester has your final report (sent with SendMessage), then end. "
+    "If you're blocked, tell your requester with SendMessage what blocks you, naming the blocking Effort, then end. "
     "Do not wait."
 )
 

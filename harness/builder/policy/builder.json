@@ -19,6 +19,7 @@
     "DISABLE_AUTO_COMPACT": "1"
   },
   "allowManagedHooksOnly": true,
+  "crossSessionInbound": "accept",
   "deniedMcpServers": [
     { "serverName": "Claude_Code_Remote" },
     { "serverName": "github" },

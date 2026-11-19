@@ -46,6 +46,19 @@ usually with an Effort reference.
    `bridge:session_01AbC…`); `reason` is why the work is not in your scope;
    `right_agent` is the agent that owns it, when you know. Then reply to the requester.
 
+## Replying
+
+Your text output never reaches your requester; only `SendMessage` does. Every reply —
+a report, a question, "I can't do that because…", "Blocked on…" — is one `SendMessage`
+call, sent before you end your turn:
+
+- To the address your prompt names in "Reply to bridge:…" (`to` is that whole
+  `bridge:…` address).
+- When a message arrives as `<cross-session-message from="…">`, reply to its `from`.
+
+A reply is not sent until that call succeeds. If it fails, retry it once, then put the
+error in your final text.
+
 ## Ending
 
 A builder session never sits idle. It ends as soon as its work ends: reply to the
