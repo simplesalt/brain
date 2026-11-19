@@ -43,17 +43,22 @@ if set(AGENTS) != set(BUILDERS):
 
 def router_prompt():
     lines = [
-        'Classify the task with two questions.',
-        'Answer with only a JSON object: {"layer": "<layer>", "target": "<target>"}.',
-        'If you cannot tell, answer "unsure" for that value.',
+        'Decide which agent best handles this task. The agents are ' + ', '.join(BUILDERS) + '.',
+        'Your two strongest indicators are these two questions:',
     ]
-    hints = REGISTRY.get('hints', [])
-    if hints:
-        lines += ['', 'rules'] + [f'- {h}' for h in hints]
     for q in ('layer', 'target'):
         lines += ['', q]
         lines += [f'- {name}: {desc}' for name, desc in QUESTIONS[q].items()]
+    lines += ['', 'In almost all cases, use the answers with this routing table:']
+    lines += [f"- layer {r['layer']}, target {r['target']} -> {r['builder']}" for r in TABLE]
+    lines += ['', 'Domain boundaries between the repos:'] + [f'- {d}' for d in REGISTRY.get('domain', [])]
+    lines += ['', 'Answer with only a JSON object: {"layer": "<layer>", "target": "<target>", "agent": "<agent>"}.']
     return '\n'.join(lines)
+
+
+def named_agent(content):
+    m = re.search(r'"agent"\s*:\s*"([a-z-]+)"', content if isinstance(content, str) else '')
+    return m.group(1) if m and m.group(1) in BUILDERS else None
 
 
 PROMPT = router_prompt()
@@ -146,9 +151,7 @@ def classify(body):
         return 502, {'error': f'model answered {status}'}
     content = message.get('content')
     layer, target = parse_answer(content)
-    m = re.search(r'"agent"\s*:\s*"([a-z-]+)"', content or '')
-    agent = m.group(1) if m and m.group(1) in BUILDERS else None
-    return 200, {'variant': variant, 'builder': agent or lookup(layer, target), 'layer': layer, 'target': target,
+    return 200, {'variant': variant, 'builder': named_agent(content) or lookup(layer, target), 'layer': layer, 'target': target,
                  'answer': content, 'reasoning': message.get('reasoning'), 'served_model': doc.get('model')}
 
 
@@ -185,7 +188,7 @@ def pick_builder(text):
         'model_answer': content[:500] if isinstance(content, str) else None,
         'reasoning': reasoning[:4000] if isinstance(reasoning, str) else None,
     }
-    builder = lookup(layer, target) if target else None
+    builder = named_agent(content) or (lookup(layer, target) if target else None)
     if not builder:
         return FALLBACK, {**route, 'route': 'fallback', 'route_reason': 'no table row fits the answer'}
     return builder, {**route, 'route': 'table'}
