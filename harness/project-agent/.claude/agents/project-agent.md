@@ -51,7 +51,8 @@ Repeat until Gaps and Unknowns are resolved:
      - Pushback or a returned question is waiting, not failure: answer it and request again, or record it as a Gap and /clarify with the person.
      - If not true, communicate the remaining gap to the session that did it.
      - A new Gap or Unknown returns you to 1. Design before continuing.
-     - If a task is blocked or stuck, route it through # Problems.
+     - A builder that reports its task blocked on another Effort has ended its session: record the task as blocked on that Effort with `effort_update` `task_blockers` {id, blockers: that Effort's ref}; once that Effort is Done, set the task's blockers to "none" and request the task again.
+     - If a task is otherwise blocked or stuck, route it through # Problems.
    - While tasks are open, run /sweep regularly.
 ## 3. Review
 When every How task is complete and This.Effort.Blockers={}, an open dispatched session means its task is unfinished: wait for it. Then set This.Effort.Status=Review and verify at the Effort level: is This.Effort.What true, and is each Indicator met? Judge each Indicator only on evidence you can point at — builder reports, records, results the person has seen. Evidence you lack is a technical fact: ask a builder that did not deliver the work to check it, with the Indicator as the desired state of the check.
