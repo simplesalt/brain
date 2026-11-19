@@ -20,6 +20,7 @@ MODEL_TIMEOUT = float(os.environ.get('MODEL_TIMEOUT_S', '15'))
 DISPATCH_TIMEOUT = float(os.environ.get('DISPATCH_TIMEOUT_S', '45'))
 MAX_BODY = 1 << 20
 MAX_TEXT = 20_000
+LOG_TEXT = 8000
 SLUG = re.compile(r'^[a-z0-9-]{1,48}$')
 
 with open(SCOPES_PATH, encoding='utf-8') as f:
@@ -213,9 +214,13 @@ def dispatch(args):
     text, slug, caller, hops = args.get('text'), args.get('slug'), args.get('caller'), args.get('hops', 0)
     log = {
         'ts': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+        'level': 'audit',
         'event': 'dispatch',
         'caller': caller if isinstance(caller, str) else None,
+        'slug': slug if isinstance(slug, str) else None,
+        'hops': hops if isinstance(hops, int) else None,
         'text_sha256': hashlib.sha256((text if isinstance(text, str) else '').encode()).hexdigest(),
+        'text': text[:LOG_TEXT] if isinstance(text, str) else None,
     }
 
     def finish(status, message, address=None, route=None):
@@ -275,10 +280,42 @@ TOOL = {
 }
 
 
+def report_misroute(args):
+    args = args if isinstance(args, dict) else {}
+    address, reason, right = args.get('address'), args.get('reason'), args.get('right_agent')
+    if not isinstance(address, str) or not address.startswith('bridge:') or re.search(r'\s', address):
+        return {'status': 400, 'log': "address must be your own bridge address starting 'bridge:'", 'address': None}
+    if not isinstance(reason, str) or not reason.strip():
+        return {'status': 400, 'log': 'reason is required', 'address': None}
+    if right is not None and right not in BUILDERS:
+        return {'status': 400, 'log': f"right_agent must be one of {', '.join(BUILDERS)}", 'address': None}
+    print(json.dumps({'ts': datetime.now(timezone.utc).isoformat(timespec='milliseconds'), 'level': 'audit',
+                      'event': 'misroute', 'address': address, 'right_agent': right, 'reason': reason[:LOG_TEXT]}), flush=True)
+    return {'status': 200, 'log': 'misroute recorded for the weekly dispatch review', 'address': None}
+
+
+MISROUTE_TOOL = {
+    'name': 'report_misroute',
+    'description': ('Record that dispatch gave you work outside your scope. Call it once, before you decline the work, '
+                    'with your own bridge address and why it is not yours. Recorded for the weekly dispatch review.'),
+    'inputSchema': {
+        'type': 'object',
+        'properties': {
+            'address': {'type': 'string', 'description': "Your own bridge address (starts 'bridge:'), the session dispatch started."},
+            'reason': {'type': 'string', 'description': 'Why the work is not in your scope.'},
+            'right_agent': {'type': 'string', 'enum': list(BUILDERS), 'description': 'The agent that should have it, if you know.'},
+        },
+        'required': ['address', 'reason'],
+        'additionalProperties': False,
+    },
+    'outputSchema': TOOL['outputSchema'],
+}
+
+
 def call_tool(name, args):
-    if name != 'dispatch':
+    if name not in ('dispatch', 'report_misroute'):
         return {'content': [{'type': 'text', 'text': f'unknown tool: {name}'}], 'isError': True}
-    r = dispatch(args)
+    r = dispatch(args) if name == 'dispatch' else report_misroute(args)
     out = {'content': [{'type': 'text', 'text': json.dumps(r)}], 'structuredContent': r}
     if not 200 <= r['status'] < 300:
         out['isError'] = True
@@ -315,7 +352,7 @@ def handle_rpc(msg):
     if method == 'ping':
         return rpc_ok(i, {})
     if method == 'tools/list':
-        return rpc_ok(i, {'tools': [TOOL]})
+        return rpc_ok(i, {'tools': [TOOL, MISROUTE_TOOL]})
     if method == 'tools/call':
         return rpc_ok(i, call_tool(params.get('name'), params.get('arguments')))
     if i is None:
