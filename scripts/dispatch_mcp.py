@@ -224,7 +224,7 @@ def dispatch(args):
     }
 
     def finish(status, message, address=None, route=None):
-        print(json.dumps({**log, **(route or {}), 'status': status, 'address': address, 'log': message}), flush=True)
+        print(json.dumps({**log, **(route or {}), 'status': status, 'address': address, 'result': message}), flush=True)
         return {'status': status, 'log': message, 'address': address}
 
     if not isinstance(text, str) or not text.strip():
