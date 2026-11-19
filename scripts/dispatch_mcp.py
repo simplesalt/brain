@@ -128,7 +128,8 @@ def pick_builder(text):
         status, doc = post_json(OPENROUTER_URL, {
             'model': MODEL,
             'temperature': 0,
-            'max_tokens': 400,
+            'max_tokens': 2000,
+            'reasoning': {'effort': 'low'},
             'messages': [{'role': 'system', 'content': PROMPT}, {'role': 'user', 'content': text}],
         }, MODEL_TIMEOUT, {'authorization': f'Bearer {key}'})
     except Exception as e:
@@ -136,16 +137,22 @@ def pick_builder(text):
     if status != 200:
         return FALLBACK, {**route, 'route': 'fallback', 'route_reason': f'model answered {status}'}
     try:
-        content = doc['choices'][0]['message']['content']
+        message = doc['choices'][0]['message']
     except (TypeError, KeyError, IndexError):
-        content = None
+        message = {}
+    message = message if isinstance(message, dict) else {}
+    content = message.get('content')
+    reasoning = message.get('reasoning')
     layer, target = parse_answer(content)
-    route = {'layer': layer, 'target': target}
+    route = {
+        'layer': layer, 'target': target,
+        'served_model': doc.get('model'), 'provider': doc.get('provider'),
+        'model_answer': content[:500] if isinstance(content, str) else None,
+        'reasoning': reasoning[:4000] if isinstance(reasoning, str) else None,
+    }
     builder = lookup(layer, target) if target else None
     if not builder:
-        answer = content[:200] if isinstance(content, str) else None
-        return FALLBACK, {**route, 'route': 'fallback', 'route_reason': 'no table row fits the answer',
-                          'model_answer': answer}
+        return FALLBACK, {**route, 'route': 'fallback', 'route_reason': 'no table row fits the answer'}
     return builder, {**route, 'route': 'table'}
 
 
