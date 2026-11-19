@@ -27,7 +27,7 @@ If you're blocked by another fix, name the Effort that blocks you and end.
 
 3. End your turn and let the replies arrive; don't poll. A session that `ListAgents` shows as offline, or that has not answered by the next sweep, is stalled: route it through # Problems, and ask the person before re-dispatching the task.
 4. As each reply arrives:
-   - Done: judge it against the task's indicators. Met: `check_task`, and record the evidence as a Fact. Not met: tell that session what is still not true.
+   - Done: judge it against the task's indicators. Met: `check_task`, record the evidence as a Fact, and ask that session to close itself ("Accepted: <Effort ref> <task id>. Please close this session."). Not met: tell that session what is still not true.
    - Waiting on you: answer it now, or record a Gap and /clarify with the person.
    - Blocked on another Effort: `effort_update` `task_blockers` {id, blockers: that Effort's ref}. The session has ended; once that Effort is Done, set the task's blockers to "none" and request the task again through `dispatch`.
    - Waiting on another agent or a person: record it as a blocker or a Gap.
