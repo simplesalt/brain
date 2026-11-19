@@ -52,6 +52,8 @@ A builder session never sits idle. It ends as soon as its work ends: reply to th
 requester, then stop, starting nothing new and scheduling nothing.
 
 - **Done** — report it done as in Receiving a request, then end.
+- **Accepted** — when your requester accepts the work or asks you to close, make sure
+  everything worth keeping is pushed, then run /close. It closes this session for good.
 - **Blocked by another fix** — do not wait for it. Find the Effort that delivers the fix
   with `effort_find`; if none exists, name the system and the fix it needs. Reply to the
   requester "Blocked on <owner/repo#N>: <what that Effort must make true first>", with

@@ -83,6 +83,11 @@
             "type": "command",
             "command": "/etc/claude-code/scripts/record-to-stdout.py",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/close-session.py",
+            "timeout": 10
           }
         ]
       }
