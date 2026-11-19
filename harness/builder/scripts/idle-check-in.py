@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import datetime
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import time
@@ -9,6 +11,7 @@ import uuid
 
 IDLE_SECONDS = int(os.environ.get("BUILDER_IDLE_CHECK_IN_SECONDS") or 1200)
 STATE_DIR = os.path.join(tempfile.gettempdir(), "idle-check-in")
+POD_STDOUT = os.environ.get("AGENT_REPORT_STDOUT") or "/proc/1/fd/1"
 TAG = "[idle check-in]"
 MESSAGE = (
     f"{TAG} This session has been idle about {max(1, round(IDLE_SECONDS / 60))} minutes. "
@@ -38,6 +41,23 @@ def read(path):
         return None
 
 
+def log_check_in(event):
+    record = {
+        "time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "level": "info",
+        "logger": "idle-check-in",
+        "session": (os.environ.get("HOSTNAME") or socket.gethostname()) + "/" + str(event.get("session_id") or ""),
+        "bank": os.environ.get("HINDSIGHT_BANK_ID") or "",
+        "idle_seconds": IDLE_SECONDS,
+        "msg": "idle check-in sent",
+    }
+    try:
+        with open(POD_STDOUT, "a") as out:
+            out.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
 def on_prompt(event, turn, checked):
     write(turn, uuid.uuid4().hex)
     if TAG not in str(event.get("prompt") or ""):
@@ -57,6 +77,7 @@ def on_stop(event, turn, checked):
     if read(turn) != token or os.path.exists(checked):
         return 0
     write(checked, token)
+    log_check_in(event)
     print(MESSAGE, file=sys.stderr)
     return 2
 
