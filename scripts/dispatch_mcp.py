@@ -117,6 +117,41 @@ def err_text(e):
     return str(e)
 
 
+EXPERIMENTS = {'live': PROMPT, **REGISTRY.get('experiments', {})}
+
+
+def classify(body):
+    body = body if isinstance(body, dict) else {}
+    text, variant = body.get('text'), body.get('variant')
+    if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
+        return 400, {'error': 'text is required'}
+    if variant not in EXPERIMENTS:
+        return 400, {'error': f"variant must be one of {', '.join(EXPERIMENTS)}"}
+    key = openrouter_key()
+    if not MODEL or not key:
+        return 503, {'error': 'no model or key'}
+    try:
+        status, doc = post_json(OPENROUTER_URL, {
+            'model': MODEL,
+            'temperature': 0,
+            'max_tokens': 2000,
+            'reasoning': {'effort': 'low'},
+            'messages': [{'role': 'system', 'content': EXPERIMENTS[variant]}, {'role': 'user', 'content': text}],
+        }, 60, {'authorization': f'Bearer {key}'})
+    except Exception as e:
+        return 502, {'error': err_text(e)}
+    try:
+        message = doc['choices'][0]['message']
+    except (TypeError, KeyError, IndexError):
+        return 502, {'error': f'model answered {status}'}
+    content = message.get('content')
+    layer, target = parse_answer(content)
+    m = re.search(r'"agent"\s*:\s*"([a-z-]+)"', content or '')
+    agent = m.group(1) if m and m.group(1) in BUILDERS else None
+    return 200, {'variant': variant, 'builder': agent or lookup(layer, target), 'layer': layer, 'target': target,
+                 'answer': content, 'reasoning': message.get('reasoning'), 'served_model': doc.get('model')}
+
+
 def pick_builder(text):
     route = {'layer': None, 'target': None}
     key = openrouter_key()
@@ -317,6 +352,15 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(200)
 
     def do_POST(self):
+        if self.path.split('?', 1)[0] == '/classify':
+            size = int(self.headers.get('content-length') or 0)
+            if size > MAX_BODY:
+                return self.send(413, {'error': 'request too large'})
+            try:
+                body = json.loads(self.rfile.read(size) or b'null')
+            except ValueError:
+                return self.send(400, {'error': 'body is not JSON'})
+            return self.send(*classify(body))
         if not re.fullmatch(r'/mcp/?', self.path.split('?', 1)[0]):
             return self.send(404, {'error': 'not found'})
         size = int(self.headers.get('content-length') or 0)
