@@ -51,7 +51,8 @@
     "basis holds the platform every app runs on inside the cluster. cloud-basis holds what lives at cloud providers, including Kyverno policies that generate cloud resources.",
     "projects plans and coordinates, and writes Efforts. It changes no repo.",
     "Requests may name a builder by its Helm release, such as build-cloud-basis or ssint-build-oci. Changing which chart version a builder release runs is a pin change in brain, not chart work.",
-    "brain publishes its harness layers to ghcr as OCI layers of configuration. Publishing or changing them is brain work, not an image."
+    "Harness layers (builder, project, desktop) are brain's agent configuration. Building, publishing or changing a harness layer is layer app, target cluster.",
+    "When a domain boundary above names the owner, that owner wins over the routing table."
   ],
   "builders": {
     "basis": "http://ssint-build-basis-dispatch:8080/dispatch",
