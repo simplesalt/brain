@@ -1,0 +1,130 @@
+[
+  {
+    "expect": "brain",
+    "text": "Hermes crashloops after the config change."
+  },
+  {
+    "expect": "brain",
+    "text": "Add a DNS record for the grammar app."
+  },
+  {
+    "expect": "basis",
+    "text": "Add a Kyverno cluster policy that sets default pod resource limits."
+  },
+  {
+    "expect": "brain",
+    "text": "Bump the gbrain pin to the latest release."
+  },
+  {
+    "expect": "cloud-basis",
+    "text": "Add a Kyverno policy that creates a Cloudflare CDN resource from a label on an app object."
+  },
+  {
+    "expect": "projects",
+    "text": "Plan next quarter's roadmap."
+  },
+  {
+    "expect": "oci",
+    "text": "List the files in the builder chart."
+  },
+  {
+    "expect": "brain",
+    "text": "Please change the agent harnesses so that: in the builder harness, every builder session has a skill for asking a clarifying question when a task is ambiguous, builder sessions are stopped from editing structured files with sed, and the builder agent prompt tells each builder to report back to whoever gave it the task when it finishes; in the project harness, the project agent only plans and delegates and never edits repos itself."
+  },
+  {
+    "expect": "brain",
+    "text": "The builder harness needs these changes (Effort simplesalt/projects#989): no approval gates; no Effort tracking hooks; one builder agent on latest Sonnet, compaction off; 75% context handoff; only report-problem skill; bash aliases work; no file access outside the repo."
+  },
+  {
+    "expect": "oci",
+    "text": "The builder image entrypoint fails to restore the bridge pointer after a restart. Make restarts keep the session environment."
+  },
+  {
+    "expect": "oci",
+    "text": "The builder image entrypoint fails to restore the bridge pointer after a restart (brain 9131682 reverted a workaround). Make restarts keep the session environment."
+  },
+  {
+    "expect": "brain",
+    "text": "Publish the builder harness folders as OCI layers to ghcr whenever they change."
+  },
+  {
+    "expect": "brain",
+    "text": "Move build-cloud-basis to builder chart 0.56.0."
+  },
+  {
+    "expect": "brain",
+    "text": "Put the Hindsight UI behind a Cloudflare Access policy for the team."
+  },
+  {
+    "expect": "brain",
+    "text": "Hindsight keeps running out of memory; give it enough to stay up."
+  },
+  {
+    "expect": "basis",
+    "text": "Upgrade the CloudNativePG operator to the latest release."
+  },
+  {
+    "expect": "brain",
+    "text": "Builder agents should have a skill that summarises a pull request."
+  },
+  {
+    "expect": "oci",
+    "text": "We need a container image for a new collector service."
+  },
+  {
+    "expect": "projects",
+    "text": "Write an Effort for moving gbrain onto agentdb."
+  },
+  {
+    "expect": "basis",
+    "text": "The flux MCP returns errors on large log queries."
+  },
+  {
+    "expect": "brain",
+    "text": "Move the cloud-basis builder's release to builder chart 0.56.0."
+  },
+  {
+    "expect": "brain",
+    "text": "Add a skill to the brain harness that lets builders ask for a review."
+  },
+  {
+    "expect": "brain",
+    "text": "Move build-cloud-basis to 0.56.0."
+  },
+  {
+    "expect": "brain",
+    "text": "Move build cloud basis to 0.56.0."
+  },
+  {
+    "expect": "brain",
+    "text": "Publish the project harness layer."
+  },
+  {
+    "expect": "brain",
+    "text": "Publish the desktop harness layer."
+  },
+  {
+    "expect": "brain",
+    "text": "Publish the builder harness layers."
+  },
+  {
+    "expect": "cloud-basis",
+    "text": "For Cloud-Basis (Crossplane, Cloudflare and GCP resources). Effort simplesalt/projects#994, task T5 (a live test). Make this true: the requester knows how many Crossplane providers are installed in the cluster. Reply with the number, then wait for the requester to accept."
+  },
+  {
+    "expect": "cloud-basis",
+    "text": "For the Cloud-Basis builder: Crossplane and its Cloudflare and GCP providers. Make this true: I know how many Crossplane providers are installed in the cluster and whether each is healthy. Reply with the list. (Effort simplesalt/projects#994 T5)"
+  },
+  {
+    "expect": "cloud-basis",
+    "text": "Agent: Cloud-Basis. Make this true: I know how many Cloudflare DNS zones the Crossplane Cloudflare provider manages. Reply with the number. (simplesalt/projects#994 T5)"
+  },
+  {
+    "expect": "oci",
+    "text": "Effort simplesalt/projects#978, How task T5 (agentdb Helm chart, simplesalt/oci). Desired state: installing the agentdb chart gives a release its database plus the two Python MCPs, admin and project, each usable by the callers granted it. A release keeps its project tool code in its own database unless its values name an MCP code OCI layer, in which case that code runs and code changes through the admin MCP are refused. Nothing in the release namespace can reach outside it, and the only way in is the two MCPs. The Go server and its generic and per-table data tools are gone."
+  },
+  {
+    "expect": "oci",
+    "text": "Effort simplesalt/projects#978, How task T7 (agentdb admin MCP, simplesalt/oci). Desired state: an agent that follows only the admin MCP's coaching ends up with project tools that work at call time against the data library as it really is, and with the recovery tools a project needs (what changed, restore, undo by work item), since recovery is reachable only through project tools."
+  }
+]
