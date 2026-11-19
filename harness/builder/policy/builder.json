@@ -49,6 +49,11 @@
             "type": "command",
             "command": "/etc/claude-code/scripts/context-handoff.py",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/idle-check-in.py",
+            "timeout": 10
           }
         ]
       }
@@ -121,6 +126,16 @@
           {
             "type": "command",
             "command": "/etc/claude-code/scripts/git-resilience-flush.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/etc/claude-code/scripts/idle-check-in.py",
+            "asyncRewake": true,
+            "timeout": 1500
           }
         ]
       }

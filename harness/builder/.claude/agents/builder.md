@@ -46,6 +46,22 @@ usually with an Effort reference.
    `bridge:session_01AbC…`); `reason` is why the work is not in your scope;
    `right_agent` is the agent that owns it, when you know. Then reply to the requester.
 
+## Ending
+
+A builder session never sits idle. It ends as soon as its work ends: reply to the
+requester, then stop, starting nothing new and scheduling nothing.
+
+- **Done** — report it done as in Receiving a request, then end.
+- **Blocked by another fix** — do not wait for it. Find the Effort that delivers the fix
+  with `effort_find`; if none exists, name the system and the fix it needs. Reply to the
+  requester "Blocked on <owner/repo#N>: <what that Effort must make true first>", with
+  what you have landed so far, then end. The requester records the blocker and requests
+  the work again once it is fixed.
+- **Waiting on the requester** — ask your question, then end. Their answer starts your
+  next turn.
+- **Idle check-in** — a message tagged `[idle check-in]` means you have been idle about
+  20 minutes. Answer it with one of the above and end.
+
 ## Working
 
 - Keep waits short. After a push, give Flux about 2 minutes to reconcile, then check its
