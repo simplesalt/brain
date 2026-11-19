@@ -48,10 +48,11 @@
     "App code is code. It is built into a container image and shipped with a Helm chart. Images and charts live in oci.",
     "The GitOps repos (basis, cloud-basis, brain) hold manifests and configuration only, deployed by Flux as written. They never hold app code.",
     "brain holds app manifests, builder pod releases and their values, and the configuration of agent environments: the harness layers (settings, hooks, skills, prompts, and small glue such as a bash alias that blocks sed).",
-    "basis holds the platform every app runs on inside the cluster, including shared platform services (the flux MCP, the logs API and logs MCP, alerting, cluster health checks). cloud-basis holds platform resources at cloud providers, including Kyverno policies that generate cloud resources; an app's own cloud configuration (its DNS record, its access policy) stays with the app in brain.",
+    "basis holds the platform every app runs on inside the cluster, including shared platform services (the flux MCP, the logs API and logs MCP, alerting, cluster health checks).",
+    "cloud-basis owns Crossplane and its Cloudflare and GCP providers (even though they run in the cluster), every Cloudflare, Google Workspace and GCP account-level resource (zones, tunnels, Zero Trust, projects), and Kyverno policies that generate cloud resources. Questions about these are cloud-basis work, except one app's own DNS record or access policy, which stays with that app in brain.",
     "oci builds and owns these products: builder-sb, cred-rotator, cluster, gbrain, agentdb. Each product's own code, image and Helm chart are oci work, including what the product does at runtime.",
     "projects plans and coordinates, and writes Efforts. It changes no repo.",
-    "Moving one of the builder releases (build-basis, build-cloud-basis, build-brain, build-oci, build-projects, also written with an ssint- prefix) to another chart version is a pin change in brain.",
+    "Moving a pinned version in the cluster is a pin change in brain: a builder release (build-basis, build-cloud-basis, build-brain, build-oci, build-projects, also with an ssint- prefix) to another chart version, or an app pin such as gbrain, hermes-agent or hindsight to another release.",
     "Harness layers (builder, project, desktop) are brain's agent configuration. Building, publishing or changing a harness layer is layer app, target cluster."
   ],
   "builders": {
