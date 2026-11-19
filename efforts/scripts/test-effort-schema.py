@@ -1762,5 +1762,52 @@ class TaskSessionAddress(unittest.TestCase):
             self.assertEqual(json.loads(out)[0]["session"], "bridge:q")
 
 
+class TaskBlockers(unittest.TestCase):
+    HOW = TaskSessionAddress.HOW + "\n- [ ] [T4] Wire it — blockers: T1; indicators: x; session: bridge:s"
+
+    def body(self):
+        return es.render({"Title": "T", "Assigned": "A", "Why": "w", "What": "w", "Indicators": "i",
+                          "Where": "w", "Tags": "t", "How": self.HOW})
+
+    def test_records_an_effort_blocker_on_an_open_task(self):
+        t1 = es.tasks(es.set_task_blockers(self.body(), 1, "simplesalt/projects#994"))[0]
+        self.assertEqual((t1["state"], t1["blockers"], t1["indicators"]), ("open", "simplesalt/projects#994", "it runs"))
+
+    def test_keeps_indicators_and_session(self):
+        out = es.set_task_blockers(self.body(), 4, "T1, simplesalt/oci#12")
+        t4 = es.tasks(out)[3]
+        self.assertEqual((t4["blockers"], t4["indicators"], t4["session"]),
+                         ("T1, simplesalt/oci#12", "x", "bridge:s"))
+        self.assertEqual(out.count("blockers: T1, simplesalt/oci#12"), 1)
+
+    def test_none_clears_and_closed_note_stays(self):
+        out = es.set_task_blockers(self.body(), 2, "none")
+        t2 = es.tasks(out)[1]
+        self.assertEqual((t2["state"], t2["blockers"], t2["indicators"]), ("closed", "none", "a; b"))
+        self.assertIn("resolved: done", out)
+
+    def test_legacy_task_gets_blockers(self):
+        out = es.set_task_blockers(self.body(), 3, "#7")
+        self.assertIn("- [ ] [T3] Legacy task — blockers: #7", out)
+
+    def test_refuses_unknown_task_and_bad_blockers(self):
+        for task, value in ((9, "#1"), (1, ""), (1, "waiting on oci"), (1, "none, #2")):
+            with self.assertRaises(ValueError):
+                es.set_task_blockers(self.body(), task, value)
+
+    def test_cli_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "b.md")
+            with open(path, "w") as f:
+                f.write(self.body())
+            rc, out, err = run_cli(["task-blockers", "--body-file", path, "--id", "T1", "--blockers", "simplesalt/projects#1"])
+            self.assertEqual(rc, 0, err)
+            with open(path, "w") as f:
+                f.write(out)
+            rc, out, err = run_cli(["tasks", "--body-file", path])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(json.loads(out)[0]["blockers"], "simplesalt/projects#1")
+
+
 if __name__ == "__main__":
     unittest.main()

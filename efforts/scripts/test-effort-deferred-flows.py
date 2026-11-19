@@ -340,6 +340,25 @@ class AddTaskTest(FlowCase):
         self.assertEqual(parent["status"], "Doing")
 
 
+class TaskBlockersTest(FlowCase):
+    def test_a_task_is_recorded_blocked_on_an_effort_and_cleared(self):
+        how = "\n".join([task(1, "Build it"), task(2, "Ship it")])
+        self.board.add(55, "Doing", in_use=HOLDER, body=render_body(How=how))
+        self.succeeded(self.board.run("update-effort.sh", 55, "--set-task-blockers", "T2", ref(56)))
+        lines = section(self.board.issue(55)["body"], "How").split("\n")
+        self.assertEqual(lines[1], f"- [ ] [T2] Ship it {DASH} blockers: {ref(56)}; indicators: done")
+        self.assertEqual(lines[0], task(1, "Build it"))
+        self.assertEqual(self.board.issue(55)["status"], "Doing")
+        self.succeeded(self.board.run("update-effort.sh", 55, "--set-task-blockers", "T2", "none"))
+        self.assertEqual(section(self.board.issue(55)["body"], "How").split("\n")[1], task(2, "Ship it"))
+
+    def test_a_blocker_that_is_not_a_ref_is_refused(self):
+        self.board.add(57, "Doing", in_use=HOLDER, body=render_body(How=task(1, "Build it")))
+        result = self.board.run("update-effort.sh", 57, "--set-task-blockers", "T1", "waiting on oci")
+        self.assertNotEqual(result.code, 0)
+        self.assertEqual(section(self.board.issue(57)["body"], "How"), task(1, "Build it"))
+
+
 class DependTest(FlowCase):
     def seed(self):
         self.board.add(60, "Doing", title="[Feature] Parent", in_use=OTHER_HOLDER)

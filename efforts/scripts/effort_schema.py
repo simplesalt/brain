@@ -835,6 +835,38 @@ def set_task_session(body, task_id, address):
     return render(sections)
 
 
+TASK_BLOCKER_REF_RE = re.compile(r'^(?:T\d+|(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#\d+)$')
+TASK_BLOCKERS_FIELD_RE = re.compile(r'(?:^|(?<=; ))blockers: .*?(?=; (?:indicators|session|resolved|cancelled): |$)')
+
+
+def set_task_blockers(body, task_id, blockers):
+    refs = [b.strip() for b in (blockers or "").split(",") if b.strip()]
+    if refs == ["none"]:
+        value = "none"
+    elif refs and all(TASK_BLOCKER_REF_RE.match(r) for r in refs):
+        value = ", ".join(refs)
+    else:
+        raise ValueError(
+            f"blockers '{blockers}' must be 'none' or a comma-separated list of task ids (T2) and Effort refs (owner/repo#N or #N)"
+        )
+    sections = parse(body)["sections"]
+    records = parse_section_lines("How", sections.get("How") or "")
+    target = next((r for r in records if r["kind"] == "item" and r["id"] == task_id), None)
+    if target is None:
+        raise ValueError(f"no task with id T{task_id} in How")
+    rest = (target.get("trailing") or "").strip()
+    if rest.startswith(EMDASH):
+        rest = rest[len(EMDASH):].strip()
+    entry = f"blockers: {value}"
+    if TASK_BLOCKERS_FIELD_RE.search(rest):
+        rest = TASK_BLOCKERS_FIELD_RE.sub(lambda m: entry, rest, count=1)
+    else:
+        rest = f"{entry}; {rest}" if rest else entry
+    target["trailing"] = f"{EMDASH} {rest}"
+    sections["How"] = render_section_from_records("How", records)
+    return render(sections)
+
+
 def tasks(body):
     sections = parse(body)["sections"]
     out = []
@@ -848,6 +880,14 @@ def tasks(body):
 def cmd_task_session(args):
     try:
         sys.stdout.write(set_task_session(read_file(args.body_file), args.id, args.session))
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_task_blockers(args):
+    try:
+        sys.stdout.write(set_task_blockers(read_file(args.body_file), args.id, args.blockers))
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -960,6 +1000,12 @@ def build_parser():
     p.add_argument("--id", type=item_id_number, required=True)
     p.add_argument("--session", required=True)
     p.set_defaults(func=cmd_task_session)
+
+    p = sub.add_parser("task-blockers")
+    p.add_argument("--body-file", required=True)
+    p.add_argument("--id", type=item_id_number, required=True)
+    p.add_argument("--blockers", required=True)
+    p.set_defaults(func=cmd_task_blockers)
 
     p = sub.add_parser("tasks")
     p.add_argument("--body-file", required=True)

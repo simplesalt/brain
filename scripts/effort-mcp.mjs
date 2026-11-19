@@ -185,6 +185,7 @@ const TOOLS = {
         add_task: { type: 'object', properties: { text: S, blockers: { anyOf: [S, { type: 'array', items: S }] }, indicators: S }, required: ['text'] },
         check_task: { anyOf: [S, { type: 'integer' }] }, cancel_task: CLOSE,
         task_session: { type: 'object', description: 'Record the bridge address of the session a How task was dispatched to; replaces an earlier one', properties: { id: { anyOf: [S, { type: 'integer' }] }, session: S }, required: ['id', 'session'] },
+        task_blockers: { type: 'object', description: 'Replace a How task\'s blockers: the Effort refs (owner/repo#N) or task ids that block it, or "none" once nothing does', properties: { id: { anyOf: [S, { type: 'integer' }] }, blockers: { anyOf: [S, { type: 'array', items: S }] } }, required: ['id', 'blockers'] },
       },
       required: ['ref', 'session'],
     },
@@ -240,6 +241,14 @@ const TOOLS = {
               v.push('--task-session', idOf(t, 'task-session'), need(t, 'session'));
             }
             break;
+          case 'task_blockers':
+            for (const t of list(val)) {
+              if (!t || typeof t !== 'object') throw new UserError('error: task_blockers needs {id, blockers}');
+              const b = Array.isArray(t.blockers) ? t.blockers.join(',') : str(t.blockers);
+              if (b === undefined || b.trim() === '') throw new UserError('error: task_blockers needs blockers: Effort refs, task ids or "none"');
+              v.push('--set-task-blockers', idOf(t, 'task-blockers'), b);
+            }
+            break;
           case 'ref': case 'session': break;
           default: throw new UserError(`error: unknown argument '${k}'`);
         }
@@ -293,6 +302,7 @@ Owning Efforts (this endpoint):
 - Every write needs session: your session label. Select an Effort with effort_select before effort_update, effort_depend writes or effort_release; a held Effort is refused to every other session.
 - effort_select and effort_update return session_title ("#N name · Status"). Apply it as your session or thread title with your own rename tool each time it changes.
 - When you dispatch a How task to another session, record its bridge address with effort_update task_session {id, session}; it is shown on read.
+- When a task's session reports it blocked by another Effort, record that with effort_update task_blockers {id, blockers: "<owner/repo#N>"}; set blockers "none" once that Effort is done.
 - Before you hand off or your work ends, call effort_held with your session label and effort_release each Effort it lists. Holds left by sessions that are gone are cleared by the lease sweep.`;
 
 const instructionsFor = (role) => (role === 'owner' ? READING_GUIDE + OWNER_GUIDE : READING_GUIDE);
