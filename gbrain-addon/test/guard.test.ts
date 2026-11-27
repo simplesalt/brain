@@ -125,7 +125,9 @@ describe('guard http', () => {
       return new Response(`event: message\ndata: ${JSON.stringify(payload)}\n\n`, { headers: { 'content-type': 'text/event-stream', 'mcp-session-id': 's1' } });
     }
     const name = body.params?.name;
-    const result = name === 'search' ? { results: [{ slug: 'notes/old' }, { slug: 'notes/new' }] } : { ok: true };
+    const result = name === 'search' ? { results: [{ slug: 'notes/old' }, { slug: 'notes/new' }] }
+      : name === 'whois' ? { query: 'Jane', query_kind: 'name', matches: [{ slug: 'people/jane', source_id: 'default', title: 'Jane', type: 'person', match: 'title' }, { slug: 'people/jane-2', source_id: 'default', title: 'Jane', type: 'person', match: 'title' }], ambiguous: true }
+      : { ok: true };
     const content = name === 'list_pages'
       ? [{ type: 'text', text: JSON.stringify([{ slug: 'notes/old', source_id: 'default' }, { slug: 'notes/new', source_id: 'default' }]) }, { type: 'text', text: 'Showing 2 pages.' }]
       : [{ type: 'text', text: JSON.stringify(result) }];
@@ -182,6 +184,17 @@ describe('guard http', () => {
     expect(JSON.parse(all.result.content[0].text).results).toHaveLength(2);
     expect(calls.every(c => c.body.params.arguments.include_deleted === undefined)).toBe(true);
     await tool('withdraw_page_mark', { slug: 'notes/old' });
+  });
+  test('a flagged page is left out of whois matches, visible with include_deleted', async () => {
+    expect(await decide('whois', { query: 'Jane', include_deleted: true }, mem.store, 'default', 'p')).toEqual({ action: 'forward', args: { query: 'Jane' }, filter: false });
+    await tool('mark_page_for_deletion', { slug: 'people/jane', reason: 'dup' });
+    calls.length = 0;
+    const w = await (await tool('whois', { query: 'Jane' })).json();
+    expect(JSON.parse(w.result.content[0].text).matches.map((m: { slug: string }) => m.slug)).toEqual(['people/jane-2']);
+    const all = await (await tool('whois', { query: 'Jane', include_deleted: true })).json();
+    expect(JSON.parse(all.result.content[0].text).matches).toHaveLength(2);
+    expect(calls.every(c => c.body.params.arguments.include_deleted === undefined)).toBe(true);
+    await tool('withdraw_page_mark', { slug: 'people/jane' });
   });
   test('a filtered read answers in SSE when gbrain answered in SSE, and in JSON when gbrain did', async () => {
     const sse = (async (_url: string, init: RequestInit) => {

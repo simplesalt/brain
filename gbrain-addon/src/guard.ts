@@ -3,7 +3,7 @@ import type { BrainEngine } from 'gbrain/engine';
 export const MAX_GUARD_BODY_BYTES = 8 * 1024 * 1024;
 export const REFUSED_OPTIONS = ['allow_shrink', 'force', 'allow_empty', 'drop_timeline'] as const;
 export const REFUSED_TOOLS = ['delete_page', 'put_pages', 'begin_page_upload'] as const;
-export const FILTERED_READ_TOOLS = ['get_page', 'search', 'query', 'list_pages', 'resolve_slugs', 'get_backlinks', 'find_experts', 'chronicle_day'] as const;
+export const FILTERED_READ_TOOLS = ['get_page', 'search', 'query', 'list_pages', 'resolve_slugs', 'get_backlinks', 'find_experts', 'chronicle_day', 'whois'] as const;
 
 export interface StoredPage {
   bytes: number;
