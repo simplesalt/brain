@@ -396,7 +396,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-rehearsal-runner-20261027f
+  name: gbrain-rehearsal-runner-20261127a
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -589,7 +589,8 @@ spec:
                 esac
 
                 cat > /work/mcp.ts <<'EOF'
-              const [name, argsJson = "{}", label = "", expr = ""] = process.argv.slice(2);
+              const [name, argsRaw = "{}", label = "", expr = ""] = process.argv.slice(2);
+              const argsJson = argsRaw.startsWith("@") ? await Bun.file(argsRaw.slice(1)).text() : argsRaw;
               const url = process.env.GBRAIN_MCP_URL as string;
               const token = process.env.GBRAIN_REMOTE_TOKEN as string;
 
@@ -686,13 +687,22 @@ spec:
                 done
                 echo "bearer MCP answering"
 
-                section "U1. gbrain --version (expect 0.60.214)"
+                section "U1. gbrain --version (expect 0.60.467.0)"
                 V="$($GBRAIN --version 2>&1)"; echo "$V"
-                case "$V" in *0.60.214*) chk "version is 0.60.214" PASS ;; *) chk "version is 0.60.214" FAIL ;; esac
+                case "$V" in *0.60.467.0*) chk "version is 0.60.467.0" PASS ;; *) chk "version is 0.60.467.0" FAIL ;; esac
 
-                section "U2. config version row (expect 242)"
+                section "U2. config version row (expect 276)"
                 V="$(qv "SELECT value FROM config WHERE key = 'version'")"; echo "config version = $V"
-                if [ "$V" = "242" ]; then chk "schema version 242" PASS; else chk "schema version 242" FAIL; fi
+                if [ "$V" = "276" ]; then chk "schema version 276" PASS; else chk "schema version 276" FAIL; fi
+
+                section "U2b. database role and RLS (v275)"
+                q "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
+                V="$(qv "SELECT (rolsuper OR rolbypassrls)::text FROM pg_roles WHERE rolname = current_user")"
+                if [ "$V" = "true" ]; then chk "role is superuser or bypassrls" PASS; else chk "role is superuser or bypassrls" FAIL; fi
+                q "SELECT tableowner, count(*) AS tables FROM pg_tables WHERE schemaname = 'public' GROUP BY tableowner"
+                q "SELECT count(*) FILTER (WHERE c.relrowsecurity) AS rls_on, count(*) FILTER (WHERE c.relforcerowsecurity) AS rls_forced, count(*) AS tables FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r'"
+                q "SELECT key, value FROM config WHERE key IN ('versions.segmented_max_per_page', 'versions.segmented_max_pinned_bytes', 'purge.retention_hours', 'mcp.inline_body_bytes')"
+                q "SELECT status, count(*) FROM persistence_requests GROUP BY status ORDER BY status"
 
                 section "U3. config readback"
                 cfg mcp.publish_advisor true
@@ -724,24 +734,22 @@ spec:
                 V="$(qv "SELECT count(*) FROM config WHERE key = 'sync.repo_path' AND coalesce(value, '') <> ''")"; echo "sync.repo_path rows with a value = $V"
                 if [ "$V" = "0" ]; then chk "sync.repo_path unset" PASS; else chk "sync.repo_path unset" FAIL; fi
 
-                section "U5. repair dry runs, apply, counts"
+                section "U5. repair dry runs, counts"
                 echo "before: chunks=$(qv "SELECT count(*) FROM content_chunks") embedded=$(qv "SELECT count(embedding) FROM content_chunks") timeline=$(qv "SELECT count(*) FROM timeline_entries")"
                 run $GBRAIN repair safe-chunks
                 run $GBRAIN repair timeline
-                run $GBRAIN repair safe-chunks --apply $RUNNER_REPAIR_ARGS
-                run $GBRAIN repair timeline --apply $RUNNER_REPAIR_ARGS
                 echo "startup effects re-chunk pages and leave vectors stale; the runbook step that embeds them is gbrain embed --stale"
                 echo "before embed --stale: chunks=$(qv "SELECT count(*) FROM content_chunks") embedded=$(qv "SELECT count(embedding) FROM content_chunks")"
                 run $GBRAIN embed --stale --yes --max-usd 1
                 C="$(qv "SELECT count(*) FROM content_chunks")"; EM="$(qv "SELECT count(embedding) FROM content_chunks")"
                 echo "after embed --stale --yes --max-usd 1: chunks=$C embedded=$EM"
                 C="$(qv "SELECT count(*) FROM content_chunks")"; E="$(qv "SELECT count(embedding) FROM content_chunks")"; T="$(qv "SELECT count(*) FROM timeline_entries")"
-                echo "after: chunks=$C embedded=$E timeline=$T (restore baseline: 1490 chunks, 358 timeline entries)"
+                echo "after: chunks=$C embedded=$E timeline=$T (restore baseline: 1845 chunks, 509 timeline entries)"
                 if [ "$C" = "$E" ]; then chk "every chunk embedded after repairs" PASS; else chk "every chunk embedded after repairs" FAIL; fi
                 TO="$(qv "SELECT count(*) FROM timeline_entries t JOIN pages p ON p.id = t.page_id WHERE p.slug NOT LIKE 'notes/upgrade-rehearsal-%' AND coalesce(t.source, '') <> 'markdown'")"
                 TM="$(qv "SELECT count(*) FROM timeline_entries t JOIN pages p ON p.id = t.page_id WHERE p.slug NOT LIKE 'notes/upgrade-rehearsal-%' AND t.source = 'markdown'")"
-                echo "timeline rows: total=$T, non-markdown outside scratch pages=$TO, markdown-sourced outside scratch pages=$TM (baseline 358 total; startup materializes markdown timelines into rows)"
-                if [ "$TO" -ge 358 ] 2>/dev/null || [ "$((TO + TM))" -ge 358 ] 2>/dev/null; then chk "no original timeline row lost (>= 358 outside scratch pages)" PASS; else chk "no original timeline row lost (>= 358 outside scratch pages, got $((TO + TM)))" FAIL; fi
+                echo "timeline rows: total=$T, non-markdown outside scratch pages=$TO, markdown-sourced outside scratch pages=$TM (baseline 509 total; startup materializes markdown timelines into rows)"
+                if [ "$TO" -ge 509 ] 2>/dev/null || [ "$((TO + TM))" -ge 509 ] 2>/dev/null; then chk "no original timeline row lost (>= 509 outside scratch pages)" PASS; else chk "no original timeline row lost (>= 509 outside scratch pages, got $((TO + TM)))" FAIL; fi
 
                 section "U6. live pages below chunker_version 4 (expect 0)"
                 V="$(qv "SELECT count(*) FROM pages WHERE deleted_at IS NULL AND chunker_version < 4")"; echo "pages below chunker 4 = $V"
@@ -764,12 +772,33 @@ spec:
                 TS="notes/upgrade-rehearsal-${RUNNER_RUN_ID:-none}"
                 BODY='{"slug":"'"$TS"'","content":"---\ntype: note\ntitle: Upgrade rehearsal check\n---\n\nScratch page written by the rehearsal runner."}'
                 mc put_page "$BODY" "put_page create ok" '!isError'
-                mc put_page "$BODY" "put_page without revision -> revision_conflict" 'isError && (r?.error === "revision_conflict" || r?.write_error === "revision_conflict")'
+                mc put_page "$BODY" "put_page without revision -> revision_required" 'isError && JSON.stringify(r).includes("revision_required")'
                 mc get_page '{"slug":"'"$TS"'"}' "get_page returns a revision" '!isError && !!pick("revision")'
                 REV="$(bun -e 'const r = JSON.parse(require("fs").readFileSync("/work/last.json", "utf8")); const f = (o, k) => o && typeof o === "object" ? (k in o ? o[k] : Object.values(o).map((v) => f(v, k)).find((x) => x !== undefined)) : undefined; console.log(f(r, "revision") ?? "")')"
                 echo "revision read: $REV"
                 BODY2='{"slug":"'"$TS"'","expected_revision":"'"$REV"'","content":"---\ntype: note\ntitle: Upgrade rehearsal check\n---\n\nScratch page, second write with the expected revision."}'
                 mc put_page "$BODY2" "put_page with expected_revision ok" '!isError'
+                BODY3='{"slug":"'"$TS"'","force":true,"content":"---\ntype: note\ntitle: Upgrade rehearsal check\n---\n\nScratch page, third write with force."}'
+                mc put_page "$BODY3" "put_page with force ok (small page)" '!isError'
+
+                section "U9b. 467 writer contracts (366.0 slug hyphen run, 231.0 large pages)"
+                mc put_page '{"slug":"notes/upgrade-rehearsal--hyphen-run","content":"---\ntype: note\ntitle: Hyphen run\n---\n\nmust be refused"}' "new slug with a hyphen run refused slug_hyphen_run" 'isError && JSON.stringify(r).includes("slug_hyphen_run")'
+                TL="notes/upgrade-rehearsal-large-${RUNNER_RUN_ID:-none}"
+                export TL
+                bun -e '
+                  const line = "Rehearsal large page paragraph for the v0.60.467.0 writer contract checks, repeated to pass 256 KB.\n";
+                  const body = "---\ntype: note\ntitle: Upgrade rehearsal large page\n---\n\n# Large\n\n" + line.repeat(3200);
+                  await Bun.write("/work/large.json", JSON.stringify({ slug: process.env.TL, content: body }));
+                  await Bun.write("/work/large-force.json", JSON.stringify({ slug: process.env.TL, force: true, content: body + "forced rewrite\n" }));
+                  console.log("large body bytes: " + Buffer.byteLength(body));
+                '
+                mc put_page @/work/large.json "large page (>256 KB) create ok" '!isError'
+                mc get_page '{"slug":"'"$TL"'"}' "get_page on a large page returns an outline or window" '!isError && /outline|window/.test(JSON.stringify(Object.keys(r ?? {}))) && JSON.stringify(r).length < 262144'
+                LREV="$(bun -e 'const r = JSON.parse(require("fs").readFileSync("/work/last.json", "utf8")); const f = (o, k) => o && typeof o === "object" ? (k in o ? o[k] : Object.values(o).map((v) => f(v, k)).find((x) => x !== undefined)) : undefined; console.log(f(r, "revision") ?? "")')"
+                echo "large page revision read: $LREV"
+                mc put_page @/work/large-force.json "force without expected_revision on a large page refused" 'isError'
+                mc put_page '{"slug":"'"$TL"'","expected_revision":"'"$LREV"'","content":"---\ntype: note\ntitle: Upgrade rehearsal large page\n---\n\nshrunk"}' "rewrite under half of a large page refused page_shrink_refused" 'isError && JSON.stringify(r).includes("page_shrink_refused")'
+                V="$(qv "SELECT octet_length(compiled_truth) FROM pages WHERE slug = '$TL' AND deleted_at IS NULL")"; echo "large page stored bytes after refusals = $V"
 
                 section "U10. add_timeline_entry round trip incl. a Dux Soup shaped entry"
                 mc add_timeline_entry '{"slug":"'"$TS"'","date":"2026-10-27","summary":"Rehearsal plain entry","detail":"plain detail","source":"rehearsal:plain"}' "add_timeline_entry plain ok" '!isError'
@@ -796,6 +825,11 @@ spec:
                   console.log("doctor status=" + (j.status ?? "n/a") + " health_score=" + (j.health_score ?? "n/a") + " checks=" + JSON.stringify(by));
                   for (const c of checks) if (c.status && c.status !== "ok" && c.status !== "pass") console.log("  " + c.status + ": " + c.name + " - " + String(c.message ?? "").slice(0, 200));
                   console.log("CHECK doctor json parses: PASS");
+                  for (const n of ["rls", "persistence_request_indexes", "unbound_source", "bun_runtime"]) {
+                    const c = checks.find((x) => x.name === n);
+                    console.log("doctor " + n + ": " + (c ? c.status + " - " + String(c.message ?? "").slice(0, 200) : "absent"));
+                    if (n !== "bun_runtime") console.log("CHECK doctor " + n + " ok: " + (c && (c.status === "ok" || c.status === "pass") ? "PASS" : "FAIL"));
+                  }
                 '
                 V="$(qv "SELECT count(*) FROM access_tokens WHERE name = 'hermes-mcp' AND revoked_at IS NULL")"; echo "active hermes-mcp token rows = $V"
                 if [ "$V" -ge 1 ] 2>/dev/null; then chk "hermes-mcp bearer present (startup log line 'hermes-mcp bearer asserted' is in the gbrain-rehearsal pod log)" PASS; else chk "hermes-mcp bearer present" FAIL; fi
@@ -921,7 +955,7 @@ spec:
             - name: RUNNER_MODE
               value: upgrade
             - name: RUNNER_RUN_ID
-              value: "20261027f"
+              value: "20261127a"
             - name: RUNNER_WAIT_ITERATIONS
               value: "480"
             - name: GBRAIN_MCP_URL
