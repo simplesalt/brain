@@ -87,6 +87,29 @@ check('withdraw_page_mark restores it', !r.isError && r.body?.withdrawn === 1, r
 r = await call('get_page', { slug: note });
 check('get_page reads it again after the withdrawal', !r.isError, { slug: r.body?.slug });
 
+const person = `people/guard-rehearsal-whois-${T}`;
+const who = `Guard Rehearsal Whois ${T}`;
+const whoisSlugs = async (extra = {}) => {
+  const w = await call('whois', { query: who, types: ['person'], ...extra });
+  return { isError: w.isError, slugs: (w.body?.matches ?? []).map(m => m.slug), body: w.body };
+};
+const whoisDef = list.result.tools.find(t => t.name === 'whois');
+check('tools/list offers whois with include_deleted', whoisDef?.inputSchema?.properties?.include_deleted?.type === 'boolean', whoisDef?.inputSchema?.properties ?? null);
+r = await call('put_page', { slug: person, content: `---\ntype: person\ntitle: ${who}\n---\n\n# ${who}\n\nA person page for the guard whois rehearsal.\n` });
+check('put_page creates a person page for whois', !r.isError, r.body?.status ?? r.body);
+let w = await whoisSlugs();
+check('whois finds the person page by its title', !w.isError && w.slugs.includes(person), w.body);
+r = await call('mark_page_for_deletion', { slug: person, reason: 'guard whois rehearsal test' });
+check('mark_page_for_deletion marks the person page', !r.isError && r.body?.status === 'marked', r.body);
+w = await whoisSlugs();
+check('whois through the guard leaves out the marked page', !w.isError && !w.slugs.includes(person), w.body);
+w = await whoisSlugs({ include_deleted: true });
+check('whois with include_deleted shows the marked page', !w.isError && w.slugs.includes(person), w.body);
+r = await call('withdraw_page_mark', { slug: person });
+check('withdraw_page_mark restores the person page', !r.isError && r.body?.withdrawn === 1, r.body);
+w = await whoisSlugs();
+check('whois finds the person page again after the withdrawal', !w.isError && w.slugs.includes(person), w.body);
+
 const failed = results.filter(x => !x.ok);
 console.log(`SUMMARY: ${results.length - failed.length}/${results.length} pass${failed.length ? '; failed: ' + failed.map(x => x.label).join('; ') : ''}`);
 server.stop();
