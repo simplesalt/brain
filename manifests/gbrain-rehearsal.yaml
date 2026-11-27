@@ -75,7 +75,7 @@ metadata:
     env: main
     capability: ai
 spec:
-  replicas: 0
+  replicas: 1
   strategy:
     type: Recreate
   selector:
@@ -84,7 +84,7 @@ spec:
   template:
     metadata:
       annotations:
-        simplesalt.company/restart-epoch: "6"
+        simplesalt.company/restart-epoch: "7"
       labels:
         app: gbrain-rehearsal
         entity: ssint
@@ -123,7 +123,7 @@ spec:
               memory: 128Mi
       containers:
         - name: gbrain
-          image: ghcr.io/simplesalt/oci/gbrain:claude-project-thread-jsh22s@sha256:790372d524ace0ab427db222c3d0cf94eb09031e8c468be42105d7d5e83b24cd
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:6f49a433b8dca298804698f3558dee2ee08f425e97465c4f0be1a68d3be33738
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -288,7 +288,7 @@ spec:
             limits:
               memory: 2Gi
         - name: autopilot
-          image: ghcr.io/simplesalt/oci/gbrain:claude-project-thread-jsh22s@sha256:790372d524ace0ab427db222c3d0cf94eb09031e8c468be42105d7d5e83b24cd
+          image: ghcr.io/simplesalt/oci/gbrain:main@sha256:6f49a433b8dca298804698f3558dee2ee08f425e97465c4f0be1a68d3be33738
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
