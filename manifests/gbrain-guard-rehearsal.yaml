@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gbrain-guard-rehearsal-4
+  name: gbrain-guard-rehearsal-5
   namespace: ssint-main-ai
   labels:
     entity: ssint
@@ -9,6 +9,7 @@ metadata:
     capability: ai
   annotations:
     kustomize.toolkit.fluxcd.io/force: enabled
+    kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   activeDeadlineSeconds: 600
   backoffLimit: 0
@@ -37,8 +38,11 @@ spec:
           args:
             - |
               set -e
+              until wget -q -O /dev/null http://gbrain-rehearsal:3131/health; do echo "waiting for gbrain-rehearsal"; sleep 5; done
+              echo "HEALTH $(wget -q -O - http://gbrain-rehearsal:3131/health)"
               mkdir -p /addon/src
               cp /addon-src/src--guard.ts /addon/src/guard.ts
+              echo "GUARD $(sha256sum /addon/src/guard.ts) $(grep 'FILTERED_READ_TOOLS =' /addon/src/guard.ts)"
               cd /addon && bun /test/gbrain-guard-rehearsal-test.mjs
           env:
             - name: DATABASE_URL
